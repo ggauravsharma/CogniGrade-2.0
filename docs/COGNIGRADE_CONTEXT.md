@@ -22,11 +22,10 @@ couple provider concepts into routes, schemas, the DB, or the frontend.
 Full read-only audit. Key confirmed findings, none of which are fixed yet
 except where noted:
 
-- **C1** `grade_question_with_diagram` uploads only the *student's* images and
-  inserts them into both the marking-scheme and the student-answer prompt slots;
-  the marking-scheme images are loaded from the DB and never sent
-  (`geminiAPI.py:656-658, 665-666, 693, 697`). Diagram questions are graded
-  against the student's own drawing.
+- **C1 — FIXED** in Correctness Foundation v1. Was: `grade_question_with_diagram`
+  uploaded only the *student's* images and spliced them into both the
+  marking-scheme and the student-answer prompt slots, so diagram questions were
+  graded against the student's own drawing.
 - **C6** `examStats.py:548` sums only non-NULL marks and then stamps
   `status="graded"`, so a failed grading silently scores zero.
 - **C7** `marks_obtained` (×2) and `Question.max_marks` are `Integer` while the
@@ -68,6 +67,37 @@ assignments, submissions.
   helpers `assert_enrollment_manageable`, `assert_announcement_in_classroom`,
   `assert_assignment_access`, `assert_submission_access`.
 - 83 tests (47 v1 + 36 v2), all passing.
+
+### Correctness Foundation v1 — DONE
+Diagram/table grading reference bug (audit C1).
+
+- **Old behaviour:** one `uploaded_files` list held only the STUDENT's table and
+  diagram images and was spliced into *both* the marking-scheme slot and the
+  student-answer slot. Marking-scheme images were read from the DB and never
+  uploaded. The grader compared a diagram against itself.
+- **New contract:** `backend/grading/evidence.py` — a provider-neutral
+  `GradingEvidence` / `ImageSet` structure with two separately-named sides
+  (`reference_images`, `student_images`). There is no longer a single variable
+  that could land in both slots. It holds plain paths and text only: no Gemini,
+  FastAPI or SQLAlchemy types, so it is the shape a future `GradingProvider`
+  input would take. It is NOT that interface yet.
+- Two independent upload batches (`reference_uploads`, `student_uploads`),
+  each image uploaded exactly once, order stable (text, tables, diagrams).
+  Prompt slots are labelled `[REFERENCE / MARKING SCHEME IMAGES]` and
+  `[STUDENT ANSWER IMAGES]`, emitted only when files exist.
+- A missing reference image stays missing; it is never back-filled with the
+  student's image.
+- Asymmetry, deliberate: student *text* images are not re-attached because they
+  already became `answer_text` upstream. Marking-scheme text images ARE
+  attached, because the endpoint that would turn them into text
+  (`process_marking_scheme_text_image`) is broken (C10).
+- Crash paths on this route fixed at the same time: `len(None)` / iterating a
+  None image field, `entry['img_path']` inside the upload error handler (path is
+  a string), and blind unpacking of `asyncio.gather(return_exceptions=True)`
+  results. The question is now resolved before any upload work.
+- 114 tests (83 security + 31 grading). The two request-assembly regressions
+  were verified to FAIL against the previous implementation.
+
 
 ---
 
@@ -114,6 +144,13 @@ until their own remediation phase.
 - `peopleManagement.remove_student` calls `db.delete(...)` without `await`, so
   the removal does not happen while the endpoint reports success. That route is
   in any case shadowed — see below.
+- Still open in the grading path after Correctness v1: free-text `Grade:` /
+  `Reason:` parsing (a parse failure skips the DB write and leaves NULL);
+  `examStats.py:548` treating NULL as zero and still stamping `status="graded"`;
+  integer marks columns; grading is serial, one Gemini call per question;
+  uploaded Gemini files are never deleted (`upload_file` used, `delete_file`
+  never) — a diagram/table call now uploads reference + student images per
+  question and none are cleaned up.
 - **Four duplicate route paths.** The first router registered in `main.py` wins:
   `POST /classes/join-class` (classes.py wins), `POST` and `PUT`
   `/classes/{class_id}/announcements[/{id}]` (classes.py wins),
@@ -165,6 +202,7 @@ rectification for photographed sheets). Their `results/` and
 
 ## Next approved phase
 
-Not yet approved. Recommended: **Phase 1 correctness**, starting with the
-diagram-grading bug (C1) and the silent-mark-loss path (C6/C7), since those
-produce wrong marks with no attacker involved.
+Not yet approved. Recommended next: **structured grading output** — replace the
+free-text `Grade:` / `Reason:` parsing with a schema-validated result and make a
+parse failure an explicit error rather than a silent NULL, which is the
+remaining half of the wrong-marks problem (C6/C7).

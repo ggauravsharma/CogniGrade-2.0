@@ -21,6 +21,7 @@ from backend.models.files import AnswerScript, Material, FileTypeEnum
 from backend.models.users import User
 from backend.utils.security import get_current_user_required
 from backend.models.tables import QuestionResponse, Question
+from backend.grading.evidence import build_grading_evidence
 from backend.auth.policies import (
     ExamContext,
     assert_exam_manager,
@@ -654,68 +655,101 @@ async def grade_question_with_diagram(
             QuestionResponse.student_id == student_id
         ))
         qr = result.scalars().first()
-        student_answer = qr.answer_text if qr else None
-        ans_table_images = json.loads(qr.ans_table_images) if (qr and qr.ans_table_images) else None
-        ans_diagram_images = json.loads(qr.ans_diagram_images) if (qr and qr.ans_diagram_images) else None
-        
-        if (not student_answer and len(ans_table_images) == 0 and len(ans_diagram_images) == 0):
-            raise HTTPException(status_code=400, detail="Missing required parameters. Provide student_answer and at least one of ideal_answer or marking_scheme.")
-        
-        async def upload_file(entry):
-            try:
-                uploaded_file = await asyncio.to_thread(
-                    genai.upload_file,
-                    path=entry,
-                    display_name=os.path.basename(entry)
-                )
-                print(f"Successfully uploaded: {entry} -> {uploaded_file.name}")
-                return entry, uploaded_file
-            except Exception as e:
-                logger.error(f"Error uploading file {entry['img_path']}: {str(e)}", exc_info=True)
-                return None
 
-        tasks = [upload_file(table) for table in ans_table_images] + [upload_file(diagram) for diagram in ans_diagram_images]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        uploaded_files = [(entry, uploaded_file) for entry, uploaded_file in results if entry is not None]
-        
+        # The question must be resolved BEFORE any upload work. The previous
+        # order uploaded images first and only then discovered the question was
+        # missing, and it dereferenced question.ms_* before the None check.
         result = await db.execute(select(Question).where(
             Question.id == question_id,
             Question.exam_id == exam_id
         ))
         question = result.scalars().first()
-        ms_table_images = json.loads(question.ms_table_images) if (question and question.ms_table_images) else None
-        ms_diagram_images = json.loads(question.ms_diagram_images) if (question and question.ms_diagram_images) else None
-        
         if not question:
-            print("\n\n\nOH NOOOOOOO ERROR \n\n\n")
             raise HTTPException(status_code=404, detail="Question not found.")
-        
-        def check_image_presence(diagram_images, table_images):
-            image_present = True
-            table_present = False
-            diagram_present = False
-            if diagram_images and table_images and (len(diagram_images) * len(table_images)) != 0:
-                diagram_present = True
-                table_present = True
-            elif diagram_images and (len(diagram_images) != 0):
-                diagram_present = True
-            elif table_images and (len(table_images) != 0):
-                table_present = True
-            else:
-                image_present = False
-            return image_present, table_present, diagram_present
 
-        ans_image_present, ans_table_present, ans_diagram_present = check_image_presence(ans_diagram_images, ans_table_images)
-        ms_image_present, ms_table_present, ms_diagram_present = check_image_presence(ms_diagram_images, ms_table_images)
+        # Reference and student evidence are assembled into ONE immutable,
+        # provider-neutral structure with two clearly separated sides. There is
+        # no longer a single image list that could be spliced into both the
+        # marking-scheme slot and the student-answer slot of the prompt.
+        evidence = build_grading_evidence(
+            question=question,
+            question_response=qr,
+            ideal_answer=ideal_answer,
+            marking_scheme=marking_scheme,
+        )
+        student_answer = evidence.student_answer_text
+
+        if not evidence.has_student_evidence:
+            raise HTTPException(status_code=400, detail="Missing required parameters. Provide student_answer and at least one of ideal_answer or marking_scheme.")
+
+        async def _upload_one(path: str):
+            """Upload one local image. Returns (path, handle), or None on failure."""
+            try:
+                uploaded_file = await asyncio.to_thread(
+                    genai.upload_file,
+                    path=path,
+                    display_name=os.path.basename(path)
+                )
+                return path, uploaded_file
+            except Exception as e:
+                # `path` is a string. The previous handler indexed it as
+                # entry['img_path'], which raised inside the error handler and
+                # masked the original upload failure.
+                logger.error("Error uploading file %s: %s", path, e, exc_info=True)
+                return None
+
+        async def upload_all(paths):
+            """Upload a list of paths, preserving order and dropping failures."""
+            if not paths:
+                return []
+            results = await asyncio.gather(
+                *(_upload_one(p) for p in paths), return_exceptions=True
+            )
+            handles = []
+            for item in results:
+                # gather(return_exceptions=True) can yield an Exception, and
+                # _upload_one can yield None. The previous code unpacked every
+                # result blindly and raised TypeError on either.
+                if isinstance(item, BaseException) or item is None:
+                    continue
+                handles.append(item)
+            return handles
+
+        # Two independent upload batches. They are never combined.
+        reference_uploads = await upload_all(evidence.reference_images.all_paths)
+        student_uploads = await upload_all(evidence.student_images.all_paths)
+
+        reference_files = [f for (_, f) in reference_uploads]
+        student_files = [f for (_, f) in student_uploads]
+
+        # Labels are attached only when files are present, so an absent
+        # marking-scheme image costs no extra tokens and, critically, is never
+        # back-filled with the student's own image.
+        reference_parts = (
+            ["[REFERENCE / MARKING SCHEME IMAGES]"] + reference_files
+            if reference_files else []
+        )
+        student_parts = (
+            ["[STUDENT ANSWER IMAGES]"] + student_files
+            if student_files else []
+        )
+        # Presence and wording now come from the evidence structure itself,
+        # so the description of what is attached can never disagree with the
+        # files actually attached. The previous helper initialised
+        # image_present=True and derived both sides from separate variables.
+        ms_image_present = evidence.reference_images.has_any
+        ans_image_present = evidence.student_images.has_any
+        ms_attached = evidence.reference_images.descriptor()
+        ans_attached = evidence.student_images.descriptor()
 
         if (marking_scheme or ms_image_present) and ideal_answer:
             prompt_content = [f"""Question: {question.text}
 
-This is the correct marking scheme: {f'{marking_scheme}, with' if marking_scheme else "look at"} {f" the attached {'diagrams and tables' if ms_diagram_present and ms_table_present else 'diagrams' if ms_diagram_present else 'table' if ms_table_present else ''}" if ms_image_present else ""}"""] + [f for (_, f) in uploaded_files] + [f"""
+This is the correct marking scheme: {f'{marking_scheme}, with' if marking_scheme else "look at"} {f" the attached {ms_attached}" if ms_image_present else ""}"""] + reference_parts + [f"""
 
 Ideal Answer: {ideal_answer}
 
-Grade the following student answer: {f'{student_answer}, with' if student_answer else "look at"} {f" the attached {'diagrams and tables' if ans_diagram_present and ans_table_present else 'diagrams' if ans_diagram_present else 'table' if ans_table_present else ''}" if ans_image_present else ""}"""] + [f for (_, f) in uploaded_files] + [f"""
+Grade the following student answer: {f'{student_answer}, with' if student_answer else "look at"} {f" the attached {ans_attached}" if ans_image_present else ""}"""] + student_parts + [f"""
 
 If the marking scheme doesn't specify mark distribution, grade proportionally based on the level of correctness—giving higher marks for more accurate and complete answers, and lower marks for partially correct or incomplete ones. Don't be too strict, nor too lenient.
 
@@ -729,9 +763,9 @@ Make sure this output format is exactly followed, that is, the overall Grade: fo
         elif (marking_scheme or ms_image_present):
             prompt_content = [f"""Question: {question.text}
 
-This is the correct marking scheme: {f'{marking_scheme}, with' if marking_scheme else "look at"} {f" the attached {'diagrams and tables' if ms_diagram_present and ms_table_present else 'diagrams' if ms_diagram_present else 'table' if ms_table_present else ''}" if ms_image_present else ""}"""] + [f for (_, f) in uploaded_files] + [f"""
+This is the correct marking scheme: {f'{marking_scheme}, with' if marking_scheme else "look at"} {f" the attached {ms_attached}" if ms_image_present else ""}"""] + reference_parts + [f"""
 
-Grade the following student answer: {f'{student_answer}, with' if student_answer else "look at"} {f" the attached {'diagrams and tables' if ans_diagram_present and ans_table_present else 'diagrams' if ans_diagram_present else 'table' if ans_table_present else ''}" if ans_image_present else ""}"""] + [f for (_, f) in uploaded_files] + [f"""
+Grade the following student answer: {f'{student_answer}, with' if student_answer else "look at"} {f" the attached {ans_attached}" if ans_image_present else ""}"""] + student_parts + [f"""
 
 If the marking scheme doesn't specify mark distribution, grade proportionally based on the level of correctness—giving higher marks for more accurate and complete answers, and lower marks for partially correct or incomplete ones. Don't be too strict, nor too lenient.
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       
@@ -747,7 +781,7 @@ Make sure this output format is exactly followed, that is, the overall Grade: fo
 
 Ideal Answer: {ideal_answer}
 
-Grade the following student answer: {f'{student_answer}, with' if student_answer else "look at"} {f" the attached {'diagrams and tables' if ans_diagram_present and ans_table_present else 'diagrams' if ans_diagram_present else 'table' if ans_table_present else ''}" if ans_image_present else ""}"""] + [f for (_, f) in uploaded_files] + [f"""
+Grade the following student answer: {f'{student_answer}, with' if student_answer else "look at"} {f" the attached {ans_attached}" if ans_image_present else ""}"""] + student_parts + [f"""
 
 Give marks proportionally based on the level of correctness—giving higher marks for more accurate and complete answers, and lower marks for partially correct or incomplete ones. Don't be too strict, nor too lenient.
 
@@ -761,7 +795,7 @@ Make sure this output format is exactly followed, that is, the overall Grade: fo
         else:
             prompt_content = [f"""Question: {question.text}
 
-Grade the following student answer: {f'{student_answer}, with' if student_answer else "look at"} {f" the attached {'diagrams and tables' if ans_diagram_present and ans_table_present else 'diagrams' if ans_diagram_present else 'table' if ans_table_present else ''}" if ans_image_present else ""}"""] + [f for (_, f) in uploaded_files] + [f"""
+Grade the following student answer: {f'{student_answer}, with' if student_answer else "look at"} {f" the attached {ans_attached}" if ans_image_present else ""}"""] + student_parts + [f"""
 
 Give marks proportionally based on the level of correctness—giving higher marks for more accurate and complete answers, and lower marks for partially correct or incomplete ones. Don't be too strict, nor too lenient.
                                                                                                                                                                                                                                                                                                                                                  
