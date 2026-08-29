@@ -11,6 +11,11 @@ from backend.models.tables import Exam, ExamResult, Enrollment, Question, Questi
 from backend.models.files import AnswerScript
 from backend.models.users import User
 from backend.utils.security import get_current_user_required
+from backend.grading.aggregation import (
+    ExamResultStatus,
+    aggregate_student_result,
+    log_incomplete,
+)
 from backend.auth.policies import (
     ExamContext,
     require_exam_manager,
@@ -59,20 +64,33 @@ async def get_exam_stats(exam_id: int,
         result = result.scalars().first()
         total_marks = result.marks_obtained if result and result.marks_obtained is not None else 0
         percentage = round((total_marks / exam.points_possible) * 100, 2) if exam.points_possible else 0
+        # A result with an incomplete grading run does carry a running total, but
+        # that total is partial. It is reported to the professor (progress is
+        # useful) and flagged, never counted as a finished script.
+        status = result.status if result else ExamResultStatus.PENDING
+        is_final = status in ExamResultStatus.FINAL
         students.append({
             "id": student.id,
             "email": student.email,
             "name": student.full_name,
             "roll": getattr(student, "entry_number", None),
             "total_marks": total_marks,
-            "percentage": percentage
+            "percentage": percentage,
+            "status": status,
+            "is_final": is_final
         })
-        if result and result.marks_obtained is not None:
+        if is_final:
             graded_scripts += 1
         total_answer_scripts += 1
 
+    # The distribution is a claim about achieved scores, so a partial total must
+    # not enter it -- it would understate the cohort and move the mean.
     buckets = [0] * (exam.points_possible*2 + 1)
+    excluded_from_distribution = 0
     for s in students:
+        if not s["is_final"]:
+            excluded_from_distribution += 1
+            continue
         bucket = int(s["total_marks"]*2)
         buckets[bucket] += 1
     distribution = {
@@ -83,7 +101,8 @@ async def get_exam_stats(exam_id: int,
     return JSONResponse({
         "students": students,
         "grading_progress": grading_progress,
-        "marks_distribution": distribution
+        "marks_distribution": distribution,
+        "excluded_from_distribution": excluded_from_distribution
     })
 
 # ---------------------------------------------------------------------------
@@ -593,27 +612,48 @@ async def add_exam_result_internal(exam_id: int, student_id: int, db: AsyncSessi
         QuestionResponse.question_id.in_(question_ids)
     ))
     responses = result.scalars().all()
-    total_marks = sum(r.marks_obtained for r in responses if r.marks_obtained is not None)
-    print(f"Total Marks for Student {student_id}: {total_marks}")
+
+    # A response whose grading produced no validated mark carries None. The old
+    # sum filtered those out, which made a provider failure contribute exactly
+    # zero while the result was still stamped "graded" (audit C6). Completeness
+    # is now decided deterministically before anything is finalised.
+    aggregation = aggregate_student_result(
+        expected_question_ids=question_ids,
+        responses=responses,
+    )
+    total_marks = aggregation.total_score
+
     result = await db.execute(select(ExamResult).where(
         ExamResult.exam_id == exam_id,
         ExamResult.student_id == student_id
     ))
     exam_result = result.scalars().first()
-    
+    previous_status = exam_result.status if exam_result else None
+
+    if not aggregation.complete:
+        log_incomplete(
+            aggregation, exam_id=exam_id, student_id=student_id,
+            previous_status=previous_status,
+        )
+
+    # The running total is still recorded so partial progress is visible, but
+    # graded_at is set only on a final result: a timestamp means "this is the
+    # student's grade", and an incomplete run has not earned one.
+    graded_at = datetime.now(timezone.utc) if aggregation.complete else None
+
     if exam_result:
         exam_result.marks_obtained = total_marks
   #      exam_result.graded_by = current_user.id
-        exam_result.graded_at = datetime.now(timezone.utc)
-        exam_result.status = "graded"
+        exam_result.graded_at = graded_at
+        exam_result.status = aggregation.status
     else:
         exam_result = ExamResult(
             exam_id=exam_id,
             student_id=student_id,
             marks_obtained=total_marks,
    #         graded_by=current_user.id,
-            graded_at=datetime.now(timezone.utc),
-            status="graded"
+            graded_at=graded_at,
+            status=aggregation.status
         )
         db.add(exam_result)
     
@@ -624,7 +664,12 @@ async def add_exam_result_internal(exam_id: int, student_id: int, db: AsyncSessi
         "result": {
             "student_id": student_id,
             "marks_obtained": total_marks,
-            "graded_at": exam_result.graded_at.isoformat()
+            "status": aggregation.status,
+            "complete": aggregation.complete,
+            "is_final": aggregation.is_final,
+            "graded_count": aggregation.graded_count,
+            "ungraded_question_ids": aggregation.ungraded_question_ids,
+            "graded_at": exam_result.graded_at.isoformat() if exam_result.graded_at else None
         }
     })
 
@@ -668,7 +713,11 @@ async def get_student_question_details(
 async def get_student_submission_status(
     exam_id: int,
     db: AsyncSession = Depends(get_db),
-    ctx: ExamContext = Depends(require_exam_manager),
+    # Participant, not manager: this endpoint returns ONLY the caller's own row
+    # (student_id == current_user.id), and its sole caller is the student-facing
+    # edit page. Security Foundation v1 gated it on require_exam_manager, which
+    # made it 403 for exactly the students it exists to serve.
+    ctx: ExamContext = Depends(require_exam_participant),
     current_user: User = Depends(get_current_user_required),
 ):
     q = select(ExamResult.status).where(
@@ -680,6 +729,8 @@ async def get_student_submission_status(
 
     if status is None:
         # no submission record yet
-        return {"status": "pending"}
+        return {"status": ExamResultStatus.PENDING, "is_final": False}
 
-    return {"status": status}
+    # is_final is derived, so a caller never has to hardcode which status
+    # strings mean "this is really the student's grade".
+    return {"status": status, "is_final": status in ExamResultStatus.FINAL}

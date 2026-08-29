@@ -26,8 +26,9 @@ except where noted:
   uploaded only the *student's* images and spliced them into both the
   marking-scheme and the student-answer prompt slots, so diagram questions were
   graded against the student's own drawing.
-- **C6** `examStats.py:548` sums only non-NULL marks and then stamps
-  `status="graded"`, so a failed grading silently scores zero.
+- **C6 — FIXED** in Correctness Foundation v3. Was:
+  `add_exam_result_internal` summed only non-NULL marks and then stamped
+  `status="graded"`, so a failed grading silently scored zero.
 - **C7** `marks_obtained` (×2) and `Question.max_marks` are `Integer` while the
   grader emits `float`. No Alembic migrations exist; schema comes from
   `Base.metadata.create_all`, which cannot alter existing columns.
@@ -98,7 +99,6 @@ Diagram/table grading reference bug (audit C1).
 - 114 tests (83 security + 31 grading). The two request-assembly regressions
   were verified to FAIL against the previous implementation.
 
-
 ### Correctness Foundation v2 — DONE
 Structured grading result; the free-text parser is gone.
 
@@ -129,7 +129,51 @@ Structured grading result; the free-text parser is gone.
   the mark it nulled before re-grading, so a failed re-evaluation is
   non-destructive.
 - 183 tests (114 + 69).
+### Correctness Foundation v3 — DONE
+Exam aggregation and grading-failure state (audit C6).
 
+- **Old behaviour:** `add_exam_result_internal` did
+  `sum(r.marks_obtained for r in responses if r.marks_obtained is not None)` and
+  then set `status = "graded"` unconditionally. The filter looks defensive but
+  is the bug: a question whose grading failed has NO mark by design (Correctness
+  v2), was skipped by the sum, therefore contributed exactly zero, and the exam
+  was still declared graded. A provider failure became a student's score.
+- **New contract:** `backend/grading/aggregation.py` — `ExamResultStatus`,
+  `AggregationResult(total_score, complete, graded_count, ungraded_question_ids,
+  questions_without_response)` with derived `.status` / `.is_final`, and
+  `aggregate_student_result()`. Provider-neutral: no SDK, FastAPI, SQLAlchemy or
+  `backend.models` import (asserted by a token-level test). Reads rows by
+  duck-typing `question_id` / `marks_obtained`.
+- **Completeness rule:** a result is final when every question response that
+  EXISTS carries a validated mark. `marks_obtained = 0` is a grade and counts;
+  only `None` blocks. A question with NO response row is reported in
+  `questions_without_response` but does NOT block — the database cannot tell
+  "the student skipped it" from "grading failed", and blocking would make any
+  exam with an unattempted question permanently unfinalisable.
+- **New status `"grading_incomplete"`.** `ExamResult.status` is a Text column,
+  so no migration. It is recomputed from facts on every aggregation, never
+  latched: filling the missing mark (`drop_question`, `give_full_marks`, a
+  successful re-grade — all of which already call `add_exam_result_internal`)
+  promotes it back to `graded`, and a later failure demotes it again.
+- `graded_at` is set ONLY on a final result. A timestamp asserts "this is the
+  student's grade"; an incomplete run has not earned one.
+- Partial totals are preserved and reported, never presented as final:
+  * student `submission_status` returns `is_final`; `student-edit.htm` gained a
+    `grading_incomplete` branch that shows a non-final notice and neither opens
+    the script page nor re-enters the crop flow;
+  * the `classes.py` classwork card returns `score: None` plus `status` and
+    `is_final` when not final, so a partial total cannot reach a student as
+    their score;
+  * the professor dashboard reports per-student `status` / `is_final`, counts
+    only final results in `grading_progress`, EXCLUDES non-final totals from
+    `marks_distribution` (reporting `excluded_from_distribution`), flags the row
+    "partial", and adds a Finalised column to the CSV export.
+- **Also fixed here:** `GET /exams/{id}/submission_status` was gated on
+  `require_exam_manager` by Security Foundation v1, which 403'd exactly the
+  students it exists to serve (it only ever returns the caller's own row). Now
+  `require_exam_participant`, with a regression test.
+- 206 tests (183 + 23). Five of the new tests were verified to FAIL against
+  bb536cd.
 
 ---
 
@@ -176,17 +220,23 @@ until their own remediation phase.
 - `peopleManagement.remove_student` calls `db.delete(...)` without `await`, so
   the removal does not happen while the endpoint reports success. That route is
   in any case shadowed — see below.
-- Still open in the grading path after Correctness v2: **C6** —
-  `add_exam_result_internal` sums only non-NULL marks and still stamps
-  `status="graded"`, so a question whose provider response failed validation
-  (and therefore has NO mark, by design) is counted as a zero contribution.
-  `grade_exam_logic` now returns `graded_count` / `failed_count` /
-  `failed_questions` and logs them; nothing consumes that signal yet — wiring
-  it into aggregation and exam status is the next task. Also still open:
-  integer marks columns; grading is serial, one Gemini call per question;
-  uploaded Gemini files are never deleted (`upload_file` used, `delete_file`
-  never) — a diagram/table call now uploads reference + student images per
-  question and none are cleaned up.
+- Still open in the grading path after Correctness v3: **C7** integer marks
+  columns (needs Alembic — `create_all` cannot alter them, so a fractional
+  score is still truncated on write); grading is serial, one provider call
+  per question; uploaded Gemini files are never deleted (`upload_file` used,
+  `delete_file` never) — a diagram/table call uploads reference + student
+  images per question and none are cleaned up.
+- `grade_exam_logic` returns `graded_count` / `failed_count` /
+  `failed_questions`. Aggregation does NOT read that return value: it derives
+  completeness from the persisted marks instead, so a crashed or partially
+  executed grading run is caught just as well as a politely reported one. The
+  return value is still useful for surfacing WHY a question failed, which no
+  UI does yet.
+- `tasks.py` advances the exam to stage 7 after grading regardless of outcome.
+  That is correct as it stands — stage 7 is "grading started", an exam-wide
+  workflow marker, and result release is gated per student by
+  `ExamResult.status` — but it means the exam stage alone never signals
+  trouble.
 - **Four duplicate route paths.** The first router registered in `main.py` wins:
   `POST /classes/join-class` (classes.py wins), `POST` and `PUT`
   `/classes/{class_id}/announcements[/{id}]` (classes.py wins),
@@ -214,7 +264,7 @@ authorization rather than token signing. The Gemini SDK is stubbed only when the
 real package is absent, and the stub raises if any test reaches a model.
 
 ```
-.venv-test/Scripts/python.exe -m pytest -q      # 83 passed
+.venv-test/Scripts/python.exe -m pytest -q      # 206 passed
 ```
 
 `backend/requirements-dev.txt` holds test-only dependencies; production
@@ -238,8 +288,14 @@ rectification for photographed sheets). Their `results/` and
 
 ## Next approved phase
 
-Not yet approved. Recommended next: **C6 — exam aggregation and status**.
-Grading failures are now explicit and carry per-question status, but
-`add_exam_result_internal` still treats a missing mark as zero and stamps the
-exam "graded". That is the last step where a provider failure can still become
-a student's score.
+Not yet approved. Recommended next: **C7 — numeric mark columns**, which now
+blocks the rest of the grading path. `GradingResult.score` is a float and
+aggregation sums floats, but `QuestionResponse.marks_obtained`,
+`ExamResult.marks_obtained` and `Question.max_marks` are still `Integer`, so
+half marks are truncated on write. Fixing it requires introducing Alembic, since
+the schema comes from `Base.metadata.create_all`, which cannot alter a column.
+That is a migration-infrastructure phase, not a one-line change.
+
+After that: nothing in the UI explains WHY a question failed grading.
+`grade_exam_logic` already returns `failed_questions`, and the professor
+dashboard now has a place to put it.

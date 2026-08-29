@@ -25,6 +25,7 @@ from backend.auth.policies import (
     require_classroom_participant,
 )
 from backend.models.tables import Exam, ExamResult, Query  # Added ExamResult for classwork endpoint
+from backend.grading.aggregation import ExamResultStatus
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["classes"])
@@ -1484,9 +1485,16 @@ async def get_class_classwork(
                 user_result_obj = result.scalars().first()
                 
                 if user_result_obj:
+                    # A running total from an incomplete grading run must never
+                    # reach a student as "your score". The status is reported so
+                    # the UI can say why, but the score itself stays absent
+                    # until the result is final.
+                    result_is_final = user_result_obj.status in ExamResultStatus.FINAL
                     user_result = {
                         "id": user_result_obj.id,
-                        "score": user_result_obj.marks_obtained,
+                        "score": user_result_obj.marks_obtained if result_is_final else None,
+                        "status": user_result_obj.status,
+                        "is_final": result_is_final,
                         "feedback": user_result_obj.feedback,
                         "graded_at": user_result_obj.graded_at.isoformat() if user_result_obj.graded_at else None
                     }
