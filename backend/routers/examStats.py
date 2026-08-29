@@ -284,6 +284,7 @@ async def send_for_reevaluation(
     response = result.scalars().first()
     if not response:
         raise HTTPException(status_code=404, detail="Response not found")
+    previous_marks = response.marks_obtained
     response.marks_obtained = None
     response.reasoning = "Sent for re-evaluation"
     await db.commit()
@@ -301,8 +302,18 @@ async def send_for_reevaluation(
         "ideal_answer": question.ideal_answer,
         "marking_scheme": question.ideal_marking_scheme
     }, db, current_user)
-    response.marks_obtained = result.get("grade")
-    response.reasoning = result.get("reasoning")
+    if result.get("status") == "graded":
+        response.marks_obtained = result.get("grade")
+        response.reasoning = result.get("reasoning")
+    else:
+        # Provider failure: restore the mark this route nulled before
+        # re-grading, so a failed re-evaluation is non-destructive rather than
+        # leaving a NULL that aggregation would later count as zero.
+        response.marks_obtained = previous_marks
+        response.reasoning = (
+            f"Re-evaluation failed to produce a valid grade "
+            f"({result.get('error_code', 'unknown')}). Previous marks restored."
+        )
     await db.commit()
     await add_exam_result_internal(exam_id, student_id, db) #, current_user)
     return {"message": "Sent for re-evaluation and exam result updated"}
@@ -341,6 +352,7 @@ async def send_all_for_reevaluation(
             )
 
         # 2b. mark it as pending re‑evaluation
+        previous_marks = response.marks_obtained
         response.marks_obtained = None
         response.reasoning = "Sent for re-evaluation"
         await db.commit()
@@ -361,9 +373,16 @@ async def send_all_for_reevaluation(
             "marking_scheme": question.ideal_marking_scheme
         }, db, current_user)
 
-        # 2e. update with the new grade
-        response.marks_obtained = grade.get("grade")
-        response.reasoning = grade.get("reasoning")
+        # 2e. update with the new grade, only if the provider produced one
+        if grade.get("status") == "graded":
+            response.marks_obtained = grade.get("grade")
+            response.reasoning = grade.get("reasoning")
+        else:
+            response.marks_obtained = previous_marks
+            response.reasoning = (
+                f"Re-evaluation failed to produce a valid grade "
+                f"({grade.get('error_code', 'unknown')}). Previous marks restored."
+            )
         await db.commit()
 
     # 3. update the overall exam result once all questions are done
@@ -420,6 +439,7 @@ async def reevaluate_question_for_all_students(
             continue  # Skip if no response exists
 
         # 3b. Mark for re-evaluation
+        previous_marks = response.marks_obtained
         response.marks_obtained = None
         response.reasoning = "Sent for re-evaluation"
         await db.commit()
@@ -439,9 +459,16 @@ async def reevaluate_question_for_all_students(
             "marking_scheme": question.ideal_marking_scheme
         }, db, current_user)
 
-        # 3d. Save results
-        response.marks_obtained = grade.get("grade")
-        response.reasoning = grade.get("reasoning")
+        # 3d. Save results, only if the provider produced a valid grade
+        if grade.get("status") == "graded":
+            response.marks_obtained = grade.get("grade")
+            response.reasoning = grade.get("reasoning")
+        else:
+            response.marks_obtained = previous_marks
+            response.reasoning = (
+                f"Re-evaluation failed to produce a valid grade "
+                f"({grade.get('error_code', 'unknown')}). Previous marks restored."
+            )
         await db.commit()
 
         # 3e. Update exam result for student

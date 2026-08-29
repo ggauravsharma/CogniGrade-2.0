@@ -99,6 +99,38 @@ Diagram/table grading reference bug (audit C1).
   were verified to FAIL against the previous implementation.
 
 
+### Correctness Foundation v2 — DONE
+Structured grading result; the free-text parser is gone.
+
+- **Old behaviour:** two byte-identical copies of a `Grade:` / `Reason:` text
+  parser with `except ValueError: pass`. Every malformed response produced
+  `grade = None`, the DB write was skipped, and the caller could not tell that
+  apart from "not graded yet". Re-evaluation wrote that `None` straight over a
+  student's existing marks. `float("nan")` parsed fine and PASSED the range
+  check, because `nan < 0` and `nan > max` are both False.
+- **New contract:** `backend/grading/result.py` — `GradingResult(score: float,
+  reason: str, max_marks)`, `build_grading_result()` for deterministic
+  validation, `parse_grading_response()` for strict JSON decoding, and
+  `GradingResponseError(code, message, raw)`. Provider-neutral: no SDK,
+  FastAPI or SQLAlchemy import (asserted by a token-level test).
+- Score is a float so partial credit (0.5, 1.5, 2.25) is representable in the
+  domain even though the DB columns are still Integer (C7 still open).
+- Bounds enforced in code, not trusted to the model: `0 <= score <= max_marks`.
+  An overshoot within `SCORE_EPSILON` (1e-6) snaps to max; anything beyond is
+  an explicit failure, never a silent clamp. NaN/Inf/bool/non-numeric rejected.
+- Provider request now asks for `response_mime_type="application/json"` and a
+  one-line output instruction. No SDK-specific `response_schema` object is
+  passed: the pinned google-generativeai 0.8.4 takes the mime type as a plain
+  string, while `response_schema` expects a version-specific type. The decoder
+  is strict about the JSON but tolerant of fences/prose wrapping.
+- Both grading routes and all three re-evaluation call sites now share one
+  conversion path. Failure returns `{"status": "grading_failed", "grade": None,
+  "error_code": ...}`; re-evaluation checks status before writing and RESTORES
+  the mark it nulled before re-grading, so a failed re-evaluation is
+  non-destructive.
+- 183 tests (114 + 69).
+
+
 ---
 
 ## Authorization model
@@ -144,9 +176,13 @@ until their own remediation phase.
 - `peopleManagement.remove_student` calls `db.delete(...)` without `await`, so
   the removal does not happen while the endpoint reports success. That route is
   in any case shadowed — see below.
-- Still open in the grading path after Correctness v1: free-text `Grade:` /
-  `Reason:` parsing (a parse failure skips the DB write and leaves NULL);
-  `examStats.py:548` treating NULL as zero and still stamping `status="graded"`;
+- Still open in the grading path after Correctness v2: **C6** —
+  `add_exam_result_internal` sums only non-NULL marks and still stamps
+  `status="graded"`, so a question whose provider response failed validation
+  (and therefore has NO mark, by design) is counted as a zero contribution.
+  `grade_exam_logic` now returns `graded_count` / `failed_count` /
+  `failed_questions` and logs them; nothing consumes that signal yet — wiring
+  it into aggregation and exam status is the next task. Also still open:
   integer marks columns; grading is serial, one Gemini call per question;
   uploaded Gemini files are never deleted (`upload_file` used, `delete_file`
   never) — a diagram/table call now uploads reference + student images per
@@ -202,7 +238,8 @@ rectification for photographed sheets). Their `results/` and
 
 ## Next approved phase
 
-Not yet approved. Recommended next: **structured grading output** — replace the
-free-text `Grade:` / `Reason:` parsing with a schema-validated result and make a
-parse failure an explicit error rather than a silent NULL, which is the
-remaining half of the wrong-marks problem (C6/C7).
+Not yet approved. Recommended next: **C6 — exam aggregation and status**.
+Grading failures are now explicit and carry per-question status, but
+`add_exam_result_internal` still treats a missing mark as zero and stamps the
+exam "graded". That is the last step where a provider failure can still become
+a student's score.

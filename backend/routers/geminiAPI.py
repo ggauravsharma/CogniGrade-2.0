@@ -22,6 +22,11 @@ from backend.models.users import User
 from backend.utils.security import get_current_user_required
 from backend.models.tables import QuestionResponse, Question
 from backend.grading.evidence import build_grading_evidence
+from backend.grading.result import (
+    GradingResponseError,
+    output_instruction,
+    parse_grading_response,
+)
 from backend.auth.policies import (
     ExamContext,
     assert_exam_manager,
@@ -519,6 +524,107 @@ Example output:
 
 #     return {"results": results}
 
+# ---------------------------------------------------------------------------
+# grading provider boundary
+# ---------------------------------------------------------------------------
+#
+# Everything Gemini-specific about producing a grade lives in these two
+# helpers. They turn a provider response into a provider-neutral GradingResult
+# (or raise GradingResponseError). No caller re-implements parsing, so the two
+# grading routes and re-evaluation cannot drift apart again.
+
+# Ask the provider for a bare JSON body. Only the mime type is requested, not
+# an SDK-specific Schema object: the pinned google-generativeai 0.8.4 accepts
+# response_mime_type as a plain string, whereas response_schema expects an
+# SDK-specific type whose exact form varies by version. The decoder in
+# backend/grading/result.py is strict about the JSON it gets but tolerant about
+# wrapping, so a provider that ignores the mime-type hint still yields either a
+# valid result or an explicit failure -- never a silent None.
+GRADING_GENERATION_CONFIG = {
+    "response_mime_type": "application/json",
+    "temperature": 0,
+}
+
+
+def _provider_response_text(response) -> str:
+    """Read the text body defensively.
+
+    `response.text` raises on a blocked or empty candidate rather than
+    returning None, and the previous code did `"Grade:" in result_text`
+    directly, turning that into an opaque 500.
+    """
+    try:
+        text = response.text
+    except Exception as exc:  # noqa: BLE001 - provider raises assorted types
+        raise GradingResponseError(
+            "empty_response", f"provider returned no usable text: {exc}"
+        )
+    return text or ""
+
+
+async def _grade_with_provider(prompt_content, *, max_marks):
+    """Run one grading call and validate the response.
+
+    Returns (GradingResult, raw_text). Raises GradingResponseError if the
+    response cannot be validated.
+    """
+    model = get_model()
+    response = await asyncio.to_thread(
+        model.generate_content,
+        prompt_content,
+        generation_config=GRADING_GENERATION_CONFIG,
+    )
+    raw_text = _provider_response_text(response)
+    return parse_grading_response(raw_text, max_marks=max_marks), raw_text
+
+
+async def _persist_and_report(
+    *, db, question_id, student_id, exam_id, result, raw_text
+):
+    """Write a VALIDATED result, then report it in the route's dict shape.
+
+    Only reached when a GradingResult exists, so a malformed provider response
+    can never overwrite a student's marks.
+    """
+    if question_id and student_id and exam_id:
+        found = await db.execute(select(QuestionResponse).where(
+            QuestionResponse.question_id == question_id,
+            QuestionResponse.student_id == student_id
+        ))
+        existing_response = found.scalars().first()
+        if existing_response:
+            existing_response.marks_obtained = result.score
+            existing_response.reasoning = result.reason
+            await db.commit()
+    return {
+        "status": "graded",
+        "grade": result.score,
+        "reasoning": result.reason,
+        "raw_response": raw_text,
+    }
+
+
+def _grading_failure(exc: GradingResponseError, *, question_id, student_id):
+    """The explicit failure shape returned to callers.
+
+    `grade` is None AND `status` is "grading_failed", so a caller that checks
+    status cannot mistake a provider failure for a zero. Callers that write
+    marks must check status; see examStats re-evaluation.
+    """
+    logger.error(
+        "grading failed: code=%s question_id=%s student_id=%s detail=%s",
+        exc.code, question_id, student_id, exc.message,
+    )
+    return {
+        "status": "grading_failed",
+        "grade": None,
+        "reasoning": None,
+        "error_code": exc.code,
+        "error": exc.message,
+        "raw_response": exc.raw,
+    }
+
+
 @router.post("/grade-question")
 async def grade_question(
     request: dict,
@@ -561,9 +667,7 @@ Based on these, grade the following student answer: {student_answer}
 If the marking scheme doesn't specify mark distribution, grade proportionally based on the level of correctness—giving higher marks for more accurate and complete answers, and lower marks for partially correct or incomplete ones. Don't be too strict, nor too lenient.
 
 Maximum Marks Possible: {question.max_marks}.
-Output Format:
-Grade: X
-Reason: Some Text"""
+{output_instruction(question.max_marks)}"""
         elif marking_scheme:
             prompt = f"""Question: {question.text}
 
@@ -574,9 +678,7 @@ Grade the following student answer: {student_answer}
 If the marking scheme doesn't specify mark distribution, grade proportionally based on the level of correctness—giving higher marks for more accurate and complete answers, and lower marks for partially correct or incomplete ones. Don't be too strict, nor too lenient.
 
 Maximum Marks Possible: {question.max_marks}.
-Output Format:
-Grade: X
-Reason: Some Text"""
+{output_instruction(question.max_marks)}"""
         elif ideal_answer:
             prompt = f"""Question: {question.text}
 
@@ -587,45 +689,20 @@ Grade the following student answer: {student_answer}
 Grade proportionally based on the level of correctness—giving higher marks for more accurate and complete answers, and lower marks for partially correct or incomplete ones. Don't be too strict, nor too lenient.
 
 Maximum Marks Possible: {question.max_marks}.
-Output Format:
-Grade: X/{question.max_marks}, where X is the marks secured.
-Reason: Some Text"""
+{output_instruction(question.max_marks)}"""
         
-        model = get_model()
-        response = await asyncio.to_thread(model.generate_content, prompt)
-        result_text = response.text
-        
-        grade = None
-        reason = ""
-        if "Grade:" in result_text:
-            grade_line = [line for line in result_text.split('\n') if "Grade:" in line][0]
-            grade_str = grade_line.split("Grade:")[1].strip()
-            try:
-                fraction = grade_str.split()[0]
-                numerator = fraction.split('/')[0]
-                grade = float(numerator)
-            except ValueError:
-                pass
+        try:
+            result, raw_text = await _grade_with_provider(
+                prompt, max_marks=question.max_marks
+            )
+        except GradingResponseError as exc:
+            # An unparseable provider response is a FAILURE, never a zero.
+            return _grading_failure(exc, question_id=question_id, student_id=student_id)
 
-        if "Reason:" in result_text:
-            reason_parts = result_text.split("Reason:")
-            if len(reason_parts) > 1:
-                reason = reason_parts[1].strip()
-        if grade is not None and (grade < 0 or grade > question.max_marks):
-            grade = None
-        
-        if question_id and student_id and exam_id and grade is not None:
-            result = await db.execute(select(QuestionResponse).where(
-                QuestionResponse.question_id == question_id,
-                QuestionResponse.student_id == student_id
-            ))
-            existing_response = result.scalars().first()
-            if existing_response:
-                existing_response.marks_obtained = grade
-                existing_response.reasoning = reason
-                await db.commit()
-        
-        return {"grade": grade, "reasoning": reason, "raw_response": result_text}
+        return await _persist_and_report(
+            db=db, question_id=question_id, student_id=student_id, exam_id=exam_id,
+            result=result, raw_text=raw_text,
+        )
         
     except Exception as e:
         logger.error(f"Error in grade_question: {str(e)}", exc_info=True)
@@ -754,12 +831,7 @@ Grade the following student answer: {f'{student_answer}, with' if student_answer
 If the marking scheme doesn't specify mark distribution, grade proportionally based on the level of correctness—giving higher marks for more accurate and complete answers, and lower marks for partially correct or incomplete ones. Don't be too strict, nor too lenient.
 
 Maximum Marks Possible: {question.max_marks}.
-Output Format:
-Grade: X
-Reason: Some Text
-
-Make sure this output format is exactly followed, that is, the overall Grade: for the question should be exactly be in the first line of your response, and then the Reason can be from second line onwards.
-"""]
+{output_instruction(question.max_marks)}"""]
         elif (marking_scheme or ms_image_present):
             prompt_content = [f"""Question: {question.text}
 
@@ -770,12 +842,7 @@ Grade the following student answer: {f'{student_answer}, with' if student_answer
 If the marking scheme doesn't specify mark distribution, grade proportionally based on the level of correctness—giving higher marks for more accurate and complete answers, and lower marks for partially correct or incomplete ones. Don't be too strict, nor too lenient.
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       
 Maximum Marks Possible: {question.max_marks}.
-Output Format:
-Grade: X
-Reason: Some Text
-
-Make sure this output format is exactly followed, that is, the overall Grade: for the question should be exactly be in the first line of your response, and then the Reason can be from second line onwards.
-"""]
+{output_instruction(question.max_marks)}"""]
         elif ideal_answer:
             prompt_content = [f"""Question: {question.text}
 
@@ -786,12 +853,7 @@ Grade the following student answer: {f'{student_answer}, with' if student_answer
 Give marks proportionally based on the level of correctness—giving higher marks for more accurate and complete answers, and lower marks for partially correct or incomplete ones. Don't be too strict, nor too lenient.
 
 Maximum Marks Possible: {question.max_marks}.
-Output Format:
-Grade: X/{question.max_marks}, where X is the marks secured.
-Reason: Some Text
-
-Make sure this output format is exactly followed, that is, the overall Grade: for the question should be exactly be in the first line of your response, and then the Reason can be from second line onwards.
-"""]
+{output_instruction(question.max_marks)}"""]
         else:
             prompt_content = [f"""Question: {question.text}
 
@@ -801,50 +863,20 @@ Give marks proportionally based on the level of correctness—giving higher mark
                                                                                                                                                                                                                                                                                                                                                  
 Maximum Marks Possible: {question.max_marks}.
 
-Output Format:
-Grade: X/{question.max_marks}, where X is the marks secured.
-Reason: Some Text
+{output_instruction(question.max_marks)}"""]
 
-Make sure this output format is exactly followed, that is, the overall Grade: for the question should be exactly be in the first line of your response, and then the Reason can be from second line onwards.
-"""]
+        try:
+            result, raw_text = await _grade_with_provider(
+                prompt_content, max_marks=question.max_marks
+            )
+        except GradingResponseError as exc:
+            # An unparseable provider response is a FAILURE, never a zero.
+            return _grading_failure(exc, question_id=question_id, student_id=student_id)
 
-        model = get_model()
-        response = await asyncio.to_thread(model.generate_content, prompt_content)
-        result_text = response.text
-        
-        print("Question Num: ", question.question_number, "\nAns: ", result_text)
-        
-        grade = None
-        reason = ""
-        if "Grade:" in result_text:
-            grade_line = [line for line in result_text.split('\n') if "Grade:" in line][0]
-            grade_str = grade_line.split("Grade:")[1].strip()
-            try:
-                fraction = grade_str.split()[0]
-                numerator = fraction.split('/')[0]
-                grade = float(numerator)
-            except ValueError:
-                pass
-
-        if "Reason:" in result_text:
-            reason_parts = result_text.split("Reason:")
-            if len(reason_parts) > 1:
-                reason = reason_parts[1].strip()
-        if grade is not None and (grade < 0 or grade > question.max_marks):
-            grade = None
-        
-        if question_id and student_id and exam_id and grade is not None:
-            result = await db.execute(select(QuestionResponse).where(
-                QuestionResponse.question_id == question_id,
-                QuestionResponse.student_id == student_id
-            ))
-            existing_response = result.scalars().first()
-            if existing_response:
-                existing_response.marks_obtained = grade
-                existing_response.reasoning = reason
-                await db.commit()
-        
-        return {"grade": grade, "reasoning": reason, "raw_response": result_text}
+        return await _persist_and_report(
+            db=db, question_id=question_id, student_id=student_id, exam_id=exam_id,
+            result=result, raw_text=raw_text,
+        )
         
     except Exception as e:
         logger.error(f"Error in grade_question: {str(e)}", exc_info=True)
@@ -1264,13 +1296,35 @@ async def grade_exam_logic(exam_id: int, student_id: int, db: AsyncSession):
         grade_res = await grade_question_with_diagram(req, db, None)  # No current_user needed
         results.append({
             "question_number": question.question_number,
+            "question_id": question.id,
+            "status": grade_res.get("status"),
             "grade": grade_res["grade"],
             "reasoning": grade_res["reasoning"],
+            "error_code": grade_res.get("error_code"),
             "raw": grade_res["raw_response"]
         })
+
+    # A question whose provider response could not be validated has NO mark in
+    # the database -- deliberately, so a failure is never scored as zero. That
+    # NULL is still summed as a zero contribution by add_exam_result_internal,
+    # and the exam is still stamped "graded" (audit C6). This summary carries
+    # the per-question status so that the aggregation fix has the signal it
+    # needs; nothing consumes `failed_questions` yet.
+    failed_questions = [r for r in results if r.get("status") != "graded"]
+    if failed_questions:
+        logger.error(
+            "grading incomplete for exam_id=%s student_id=%s: %s of %s questions "
+            "failed validation (%s)",
+            exam_id, student_id, len(failed_questions), len(results),
+            [(r["question_number"], r.get("error_code")) for r in failed_questions],
+        )
+
     return {
         "exam_id": exam_id,
         "student_id": student_id,
+        "graded_count": len(results) - len(failed_questions),
+        "failed_count": len(failed_questions),
+        "failed_questions": failed_questions,
         "results": results
     }
 

@@ -282,9 +282,10 @@ async def test_student_files_never_reach_the_reference_slot(monkeypatch, tmp_pat
     captured = {}
 
     class FakeModel:
-        def generate_content(self, prompt_content):
+        def generate_content(self, prompt_content, generation_config=None):
             captured["prompt_content"] = prompt_content
-            return SimpleNamespace(text="Grade: 5\nReason: ok")
+            captured["generation_config"] = generation_config
+            return SimpleNamespace(text='{"score": 5, "reason": "ok"}')
 
     monkeypatch.setattr(geminiAPI.genai, "upload_file", fake_upload, raising=False)
     monkeypatch.setattr(geminiAPI, "get_model", lambda: FakeModel())
@@ -365,9 +366,10 @@ async def test_missing_reference_leaves_reference_slot_absent(monkeypatch, tmp_p
     captured = {}
 
     class FakeModel:
-        def generate_content(self, prompt_content):
+        def generate_content(self, prompt_content, generation_config=None):
             captured["prompt_content"] = prompt_content
-            return SimpleNamespace(text="Grade: 1\nReason: ok")
+            captured["generation_config"] = generation_config
+            return SimpleNamespace(text='{"score": 1, "reason": "ok"}')
 
     monkeypatch.setattr(geminiAPI, "get_model", lambda: FakeModel())
 
