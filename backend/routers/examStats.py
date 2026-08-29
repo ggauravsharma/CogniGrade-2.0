@@ -11,6 +11,14 @@ from backend.models.tables import Exam, ExamResult, Enrollment, Question, Questi
 from backend.models.files import AnswerScript
 from backend.models.users import User
 from backend.utils.security import get_current_user_required
+from backend.auth.policies import (
+    ExamContext,
+    require_exam_manager,
+    require_exam_participant,
+    require_question_access_for_student,
+    require_question_in_exam,
+    require_self_or_exam_manager,
+)
 from backend.routers.geminiAPI import grade_question, grade_question_with_diagram, extract_single_answer_text
 import re
 
@@ -19,6 +27,7 @@ router = APIRouter(tags=["exam-stats"])
 @router.get("/exams/{exam_id}/stats")
 async def get_exam_stats(exam_id: int,
                         db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_exam_manager),
                         current_user: User = Depends(get_current_user_required)):
     if not current_user.is_professor:
         raise HTTPException(status_code=403, detail="Access denied")
@@ -119,6 +128,7 @@ async def edit_marks(
     student_id: int,
     payload: dict,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_question_in_exam),
     current_user: User = Depends(get_current_user_required)
 ):
     """
@@ -158,6 +168,7 @@ async def get_student_evaluation(
     exam_id: int,
     student_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_self_or_exam_manager),
     current_user: User = Depends(get_current_user_required)
 ):
     result = await db.execute(select(Question).where(Question.exam_id == exam_id))
@@ -193,6 +204,7 @@ async def update_question(
     question_id: int,
     update_data: dict,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_question_in_exam),
     current_user: User = Depends(get_current_user_required)
 ):
     result = await db.execute(select(Question).where(
@@ -227,6 +239,7 @@ async def update_student_response(
     student_id: int,
     update_data: dict,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_question_in_exam),
     current_user: User = Depends(get_current_user_required)
 ):
     result = await db.execute(select(QuestionResponse).where(
@@ -260,6 +273,7 @@ async def send_for_reevaluation(
     question_id: int,
     student_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_question_in_exam),
     current_user: User = Depends(get_current_user_required)
 ):  
     print("CALLED")
@@ -299,6 +313,7 @@ async def send_all_for_reevaluation(
     exam_id: int,
     student_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_exam_manager),
     current_user: User = Depends(get_current_user_required)
 ):
     # 1. fetch all questions for this exam
@@ -362,6 +377,7 @@ async def reevaluate_question_for_all_students(
     exam_id: int,
     question_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_question_in_exam),
     current_user: User = Depends(get_current_user_required)
 ):
     # 1. Fetch the question and its exam
@@ -437,6 +453,7 @@ async def reevaluate_question_for_all_students(
 async def get_question_metrics(
     exam_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_exam_manager),
     current_user: User = Depends(get_current_user_required)
 ):
     result = await db.execute(select(Question).where(Question.exam_id == exam_id))
@@ -464,6 +481,7 @@ async def drop_question(
     exam_id: int,
     question_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_question_in_exam),
     current_user: User = Depends(get_current_user_required)
 ):
     result = await db.execute(select(QuestionResponse).where(QuestionResponse.question_id == question_id))
@@ -483,6 +501,7 @@ async def give_full_marks(
     exam_id: int,
     question_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_question_in_exam),
     current_user: User = Depends(get_current_user_required)
 ):
     result = await db.execute(select(Question).where(Question.id == question_id))
@@ -505,6 +524,7 @@ async def give_full_marks(
 async def get_grading_status(
     exam_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_exam_manager),
     current_user: User = Depends(get_current_user_required)
 ):
     from sqlalchemy import func
@@ -527,6 +547,7 @@ async def add_exam_result(
     exam_id: int,
     student_id: Optional[int] = Form(None),
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_exam_manager),
     current_user: User = Depends(get_current_user_required)
 ):
     student_id = student_id or current_user.id
@@ -586,6 +607,7 @@ async def get_student_question_details(
     student_id: int,
     question_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_question_access_for_student),
     current_user: User = Depends(get_current_user_required)
 ):
     result = await db.execute(select(Exam).where(Exam.id == exam_id))
@@ -619,6 +641,7 @@ async def get_student_question_details(
 async def get_student_submission_status(
     exam_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_exam_manager),
     current_user: User = Depends(get_current_user_required),
 ):
     q = select(ExamResult.status).where(

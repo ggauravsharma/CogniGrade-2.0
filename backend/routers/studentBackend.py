@@ -2,19 +2,25 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession     # ASYNC
 from sqlalchemy.future import select
 
+import logging
+
 from backend.database import get_db
 from backend.models.users import User
 from backend.models.files import Material, AnswerScript, FileTypeEnum
 from backend.utils.security import get_current_user_required
+from backend.auth.policies import ExamContext, require_exam_participant
 from backend.models.tables import QuestionResponse, Question  # Ensure Question is imported
 import re
 import json
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/student", tags=["studentBackend"])
 
 @router.get("/exam/{exam_id}/available-documents")
 async def available_documents(
     exam_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_exam_participant),
     current_user: User = Depends(get_current_user_required)
 ):
     """
@@ -54,6 +60,7 @@ async def get_document(
     exam_id: int,
     doc_type: str,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_exam_participant),
     current_user: User = Depends(get_current_user_required)
 ):
     """
@@ -72,6 +79,16 @@ async def get_document(
         if not document:
             raise HTTPException(status_code=404, detail="Answer Script not found.")
     elif doc_type_norm in ["question_paper", "solution_script", "marking_scheme"]:
+        # The marking scheme and the solution script reveal the expected answers.
+        # Enrolment is enough to read the question paper; these two are
+        # manager-only. Without this an enrolled student could read the
+        # marking scheme for an exam they are about to sit.
+        if doc_type_norm in ("solution_script", "marking_scheme") and not ctx.is_manager:
+            logger.warning(
+                "authz denied: student requested %s (user_id=%s exam_id=%s)",
+                doc_type_norm, current_user.id, exam_id,
+            )
+            raise HTTPException(status_code=403, detail="Not authorized")
         mapping = {
             "question_paper": FileTypeEnum.question_paper,
             "solution_script": FileTypeEnum.solution_script,
@@ -98,6 +115,7 @@ async def create_student_response(
     exam_id: int,
     response_data: dict,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_exam_participant),
     current_user: User = Depends(get_current_user_required)
 ):
     """Create or update a student's response to a question"""
@@ -147,6 +165,7 @@ def strip_markdown(text: str) -> str:
 async def get_exam_evaluation(
     exam_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_exam_participant),
     current_user: User = Depends(get_current_user_required)
 ):
     """
@@ -223,6 +242,7 @@ async def post_query(
     exam_id: int,
     query_data: dict,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_exam_participant),
     current_user: User = Depends(get_current_user_required)
 ):
     """

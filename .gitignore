@@ -10,3 +10,9 @@ backend/__pycache__/
 backend/routers/__pycache__/
 backend/models/__pycache__/
 **/__pycache__/
+
+# Local-only experiment inputs (student answer sheets). Never commit.
+experiment-data/
+
+# Local test virtualenv (created for the backend test suite).
+.venv-test/

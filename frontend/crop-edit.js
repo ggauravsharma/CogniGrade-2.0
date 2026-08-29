@@ -208,9 +208,15 @@ async function load_pdf_in_cropper(examId) {
             })
             .then(data => {
               if (data.file_path) {
-                data.file_path = "/api/" + data.file_path.replace("./", "");
-                fetch(data.file_path)
-                  .then(response => response.arrayBuffer())
+                // Uploaded files are no longer served by a public StaticFiles
+                // mount. Fetch through the authorized endpoint, addressed by
+                // exam + document type rather than by filesystem path.
+                const fileUrl = `/protected-files/exam/${examId}/document/${document_type}`;
+                authFetch(fileUrl)
+                  .then(response => {
+                    if (!response.ok) throw new Error("Not authorized to view this document.");
+                    return response.arrayBuffer();
+                  })
                   .then(arrayBuffer => loadPDF(arrayBuffer))
                   .catch(err => { console.error("Error fetching PDF:", err); alert("Failed to load PDF."); });
               } else {

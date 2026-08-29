@@ -11,20 +11,30 @@ from pydantic import BaseModel
 import logging
 
 from backend.database import get_db
-from backend.models.tables import Classroom, Enrollment
+from backend.models.tables import Classroom, Enrollment, Role
 from backend.models.users import User
 from backend.utils.security import get_current_user_required
+from backend.auth.policies import (
+    ClassroomContext,
+    assert_enrollment_manageable,
+    require_classroom_participant,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["pplManagement"])
 
 @router.get("/classes/{class_id}/people")
-async def get_class_people(class_id: int, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user_required)):
-    result = await db.execute(select(Classroom).where(Classroom.id == class_id))
-    classroom = result.scalars().first()
-    if not classroom:
-        raise HTTPException(status_code=404, detail="Class not found")
-    
+async def get_class_people(
+    class_id: int,
+    db: AsyncSession = Depends(get_db),
+    ctx: ClassroomContext = Depends(require_classroom_participant),
+    current_user: User = Depends(get_current_user_required),
+):
+    # Membership is required: this endpoint previously had NO authorization at
+    # all, so any authenticated user could enumerate the full roster (names and
+    # user ids) of any classroom in the database.
+    classroom = ctx.classroom
+
     # Prepare professor info
     professor = {
         "user_id": classroom.owner_id,
@@ -66,33 +76,23 @@ async def get_class_people(class_id: int, db: AsyncSession = Depends(get_db), cu
 
 @router.post("/enrollments/{enrollment_id}/remove")
 async def remove_student(enrollment_id: int, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user_required)):
-    result = await db.execute(select(Enrollment).where(Enrollment.id == enrollment_id))
-    enrollment = result.scalars().first()
-    if not enrollment:
-        raise HTTPException(status_code=404, detail="Enrollment not found")
-    
-    result = await db.execute(select(Classroom).where(Classroom.id == enrollment.classroom_id))
-    classroom = result.scalars().first()
-    if not classroom:
-        raise HTTPException(status_code=404, detail="Class not found")
-    
-    # Authorization: Professors can remove any student.
-    # TAs can only remove enrollments where the role is "student".
-    if current_user.is_professor:
-        authorized = True
-    else:
-        result = await db.execute(select(Enrollment).where(
-            Enrollment.classroom_id == classroom.id,
-            Enrollment.student_id == current_user.id,
-            Enrollment.status == "accepted",
-            Enrollment.role == "ta"
-        ))
-        ta_enrollment = result.scalars().first()
-        authorized = bool(ta_enrollment and enrollment.role == "student")
-    
-    if not authorized:
+    # Authorization is resolved against the enrolment's OWN classroom.
+    # Previously `current_user.is_professor` alone granted access, which let a
+    # professor of any classroom remove members from every other classroom.
+    enrollment, ctx = await assert_enrollment_manageable(
+        enrollment_id, current_user, db, require_owner=False
+    )
+    classroom = ctx.classroom
+
+    # Existing product rule preserved: a TA may only remove plain students,
+    # while the classroom owner may remove anyone.
+    if not ctx.is_owner and enrollment.role != Role.STUDENT:
+        logger.warning(
+            "authz denied: TA attempted to remove a non-student enrolment "
+            "(user_id=%s enrollment_id=%s)", current_user.id, enrollment_id
+        )
         raise HTTPException(status_code=403, detail="Not authorized to remove this student")
-    
+
     student_id = enrollment.student_id
     db.delete(enrollment)
     await db.commit()
@@ -103,14 +103,15 @@ async def remove_student(enrollment_id: int, db: AsyncSession = Depends(get_db),
 
 @router.post("/enrollments/{enrollment_id}/make-ta")
 async def make_ta(enrollment_id: int, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user_required)):
-    if not current_user.is_professor:
-        raise HTTPException(status_code=403, detail="Only professors can promote students to TA")
-    
-    result = await db.execute(select(Enrollment).where(Enrollment.id == enrollment_id))
-    enrollment = result.scalars().first()
-    if not enrollment:
-        raise HTTPException(status_code=404, detail="Enrollment not found")
-    
+    # OWNER-ONLY, scoped to the enrolment's own classroom. Promoting a member
+    # to TA grants them MANAGER rights over that classroom, so this must not
+    # itself be a manager-level action. Previously the global is_professor flag
+    # was sufficient, which allowed a professor of any classroom to grant TA
+    # rights inside any other classroom.
+    enrollment, ctx = await assert_enrollment_manageable(
+        enrollment_id, current_user, db, require_owner=True
+    )
+
     if enrollment.role != "student":
         raise HTTPException(status_code=400, detail="Enrollment is not a student")
     
@@ -120,14 +121,11 @@ async def make_ta(enrollment_id: int, db: AsyncSession = Depends(get_db), curren
 
 @router.post("/enrollments/{enrollment_id}/make-student")
 async def make_student(enrollment_id: int, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user_required)):
-    if not current_user.is_professor:
-        raise HTTPException(status_code=403, detail="Only professors can demote TAs to student")
-    
-    result = await db.execute(select(Enrollment).where(Enrollment.id == enrollment_id))
-    enrollment = result.scalars().first()
-    if not enrollment:
-        raise HTTPException(status_code=404, detail="Enrollment not found")
-    
+    # OWNER-ONLY, scoped to the enrolment's own classroom (see make_ta).
+    enrollment, ctx = await assert_enrollment_manageable(
+        enrollment_id, current_user, db, require_owner=True
+    )
+
     if enrollment.role != "ta":
         raise HTTPException(status_code=400, detail="Enrollment is not a TA")
     

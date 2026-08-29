@@ -13,6 +13,13 @@ from backend.database import get_db
 from backend.models.tables import Announcement, Classroom, Enrollment, Query
 from backend.models.users import User
 from backend.utils.security import get_current_user_required
+from backend.auth.policies import (
+    ClassroomContext,
+    assert_announcement_in_classroom,
+    require_announcement_in_classroom,
+    require_classroom_manager,
+    require_classroom_participant,
+)
 from backend.models.notifications import Notification, NotificationType
     
 router = APIRouter(tags=["announcements"])
@@ -22,6 +29,7 @@ logger = logging.getLogger(__name__)
 async def get_class_announcements(
     class_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ClassroomContext = Depends(require_classroom_participant),
     current_user: User = Depends(get_current_user_required)
 ):
     # Verify class exists and user has access
@@ -74,6 +82,7 @@ async def create_announcement(
     title: str = Form(...),
     content: str = Form(...),
     db: AsyncSession = Depends(get_db),
+    ctx: ClassroomContext = Depends(require_classroom_manager),
     current_user: User = Depends(get_current_user_required)
 ):
     # Verify class exists and user has access
@@ -150,6 +159,7 @@ async def update_announcement(
     announcement_id: int,
     content: str = Form(...),
     db: AsyncSession = Depends(get_db),
+    ctx: ClassroomContext = Depends(require_announcement_in_classroom),
     current_user: User = Depends(get_current_user_required)
 ):
     # Verify class exists
@@ -185,6 +195,7 @@ async def delete_announcement(
     class_id: int,
     announcement_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ClassroomContext = Depends(require_announcement_in_classroom),
     current_user: User = Depends(get_current_user_required)
 ):
     # Verify class exists

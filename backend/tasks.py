@@ -5,7 +5,7 @@ from backend.database import AsyncSessionLocal
 from backend.models.users import User
 from backend.routers.geminiAPI import process_answer_text_images_logic, grade_exam_logic
 from backend.routers.examStats import add_exam_result_internal
-from backend.routers.exams import update_exam_stage
+from backend.routers.exams import set_exam_stage
 import os
 from dotenv import load_dotenv
 load_dotenv()
@@ -33,4 +33,4 @@ async def _process_and_grade(exam_id: int, student_id: int):
         await process_answer_text_images_logic(exam_id, student_id, db)
         await grade_exam_logic(exam_id, student_id, db)
         await add_exam_result_internal(exam_id, student_id, db)
-        await update_exam_stage(exam_id, 7, db)
+        await set_exam_stage(exam_id, 7, db)

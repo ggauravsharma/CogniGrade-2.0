@@ -16,6 +16,14 @@ from backend.database import get_db
 from backend.models.tables import Classroom, Enrollment, Assignment, Submission, Announcement
 from backend.models.users import User
 from backend.utils.security import get_current_user_required
+from backend.auth.policies import (
+    ClassroomContext,
+    assert_assignment_access,
+    assert_submission_access,
+    require_announcement_in_classroom,
+    require_classroom_manager,
+    require_classroom_participant,
+)
 from backend.models.tables import Exam, ExamResult, Query  # Added ExamResult for classwork endpoint
 
 logger = logging.getLogger(__name__)
@@ -189,7 +197,7 @@ async def join_class(class_code: str = Form(...), db: AsyncSession = Depends(get
         return JSONResponse(status_code=500, content={"success": False, "error": "An error occurred while joining the class"})
 
 @router.post("/classes/{class_id}/assignments")
-async def create_assignment(class_id: int, assignment: AssignmentCreate, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user_required)):
+async def create_assignment(class_id: int, assignment: AssignmentCreate, db: AsyncSession = Depends(get_db), ctx: ClassroomContext = Depends(require_classroom_manager), current_user: User = Depends(get_current_user_required)):
     try:
         # Check if class exists
         result = await db.execute(select(Classroom).where(
@@ -323,6 +331,11 @@ async def get_my_submission(
 ):
     """Get current user's submission for an assignment"""
     try:
+        # AUTHORIZATION: classroom membership is resolved from the assignment
+        # itself. Without this an outsider could submit to, or read a
+        # submission in, a classroom they are not enrolled in.
+        await assert_assignment_access(assignment_id, current_user, db)
+
         # Fetch the assignment
         result = await db.execute(select(Assignment).where(
             Assignment.id == assignment_id
@@ -609,6 +622,11 @@ async def submit_assignment_file(
 ):
     """Submit an assignment with a file attachment"""
     try:
+        # AUTHORIZATION: classroom membership is resolved from the assignment
+        # itself. Without this an outsider could submit to, or read a
+        # submission in, a classroom they are not enrolled in.
+        await assert_assignment_access(assignment_id, current_user, db)
+
         # Check if assignment exists
         result = await db.execute(select(Assignment).where(
             Assignment.id == assignment_id
@@ -693,6 +711,11 @@ async def unsubmit_assignment(
     current_user: User = Depends(get_current_user_required)
 ):
     try:
+        # AUTHORIZATION: classroom membership is resolved from the assignment
+        # itself. Without this an outsider could submit to, or read a
+        # submission in, a classroom they are not enrolled in.
+        await assert_assignment_access(assignment_id, current_user, db)
+
         # Find the assignment
         result = await db.execute(select(Assignment).where(
             Assignment.id == assignment_id
@@ -760,6 +783,11 @@ async def grade_submission(
 ):
     """Grade a submission"""
     try:
+        # AUTHORIZATION: no class_id in the path, so resolve the classroom from
+        # the submission itself. Previously `current_user.is_professor` alone
+        # was accepted, letting any professor grade in any classroom.
+        await assert_submission_access(submission_id, current_user, db, manager_only=True)
+
         result = await db.execute(select(Submission).where(Submission.id == submission_id))
         submission = result.scalars().first()
         if not submission:
@@ -817,7 +845,7 @@ async def grade_submission(
         raise HTTPException(status_code=500, detail="An error occurred while grading the submission")
 
 @router.post("/classes/{class_id}/announcements")
-async def create_announcement(class_id: int, announcement: AnnouncementCreate, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user_required)):
+async def create_announcement(class_id: int, announcement: AnnouncementCreate, db: AsyncSession = Depends(get_db), ctx: ClassroomContext = Depends(require_classroom_manager), current_user: User = Depends(get_current_user_required)):
     try:
         result = await db.execute(select(Classroom).where(Classroom.id == class_id))
         classroom = result.scalars().first()
@@ -866,6 +894,7 @@ async def update_announcement(
     announcement_id: int, 
     announcement: AnnouncementCreate, 
     db: AsyncSession = Depends(get_db), 
+    ctx: ClassroomContext = Depends(require_announcement_in_classroom),
     current_user: User = Depends(get_current_user_required)
 ):
     try:
@@ -920,7 +949,7 @@ async def update_announcement(
         raise HTTPException(status_code=500, detail="An error occurred while updating the announcement")
 
 @router.get("/classes/{class_id}")
-async def view_class(class_id: int, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user_required)):
+async def view_class(class_id: int, db: AsyncSession = Depends(get_db), ctx: ClassroomContext = Depends(require_classroom_participant), current_user: User = Depends(get_current_user_required)):
     try:
         result = await db.execute(select(Classroom).where(Classroom.id == class_id))
         classroom = result.scalars().first()
@@ -1056,6 +1085,7 @@ async def view_class(class_id: int, db: AsyncSession = Depends(get_db), current_
 async def get_class_members(
     class_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ClassroomContext = Depends(require_classroom_participant),
     current_user: User = Depends(get_current_user_required)
 ):
     """Get all members (teachers and students) of a class"""
@@ -1143,6 +1173,7 @@ async def get_announcement_queries(
     class_id: int,
     announcement_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ClassroomContext = Depends(require_classroom_participant),
     current_user: User = Depends(get_current_user_required)
 ):
     """Get queries (comments) for a specific announcement"""
@@ -1236,6 +1267,7 @@ async def create_query(
     class_id: int,
     query: QueryCreate,
     db: AsyncSession = Depends(get_db),
+    ctx: ClassroomContext = Depends(require_classroom_participant),
     current_user: User = Depends(get_current_user_required)
 ):
     """Create a new query (comment) for a class"""
@@ -1337,6 +1369,7 @@ async def create_query(
 async def get_class_classwork(
     class_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ClassroomContext = Depends(require_classroom_participant),
     current_user: User = Depends(get_current_user_required)
 ):
     """Get all classwork (assignments and exams) for a class"""

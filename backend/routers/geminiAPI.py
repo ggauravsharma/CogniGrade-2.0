@@ -21,6 +21,11 @@ from backend.models.files import AnswerScript, Material, FileTypeEnum
 from backend.models.users import User
 from backend.utils.security import get_current_user_required
 from backend.models.tables import QuestionResponse, Question
+from backend.auth.policies import (
+    ExamContext,
+    assert_exam_manager,
+    require_exam_manager,
+)
 
 api_keys = []
 i = 1
@@ -91,6 +96,9 @@ async def upload_and_extract(
     current_user: User = Depends(get_current_user_required)
 ):
     results = []
+    # AUTHORIZATION: exam_id is a form field, so this is an imperative check.
+    # Uploading and extracting exam documents is a manager-only action.
+    await assert_exam_manager(exam_id, current_user, db)
     try:
         file_type_enum = FileTypeEnum(file_type)
     except ValueError:
@@ -336,6 +344,9 @@ async def extract_question_labels(
     build full prefix hierarchy, and insert into Questions.part_labels.
     """
     results = []
+    # AUTHORIZATION: exam_id is a form field; label extraction rewrites the
+    # exam's question structure and is manager-only.
+    await assert_exam_manager(exam_id, current_user, db)
     for file in files:
         fid = str(uuid.uuid4())
         file_path = os.path.join(UPLOAD_DIRECTORY, f"{fid}_{file.filename}")
@@ -520,7 +531,12 @@ async def grade_question(
         exam_id = request.get("exam_id")
         student_id = request.get("student_id")
         question_id = request.get("question_id")
-        
+
+        # AUTHORIZATION: exam_id arrives in the request body, so this cannot
+        # be a path-parameter dependency. Grading is a manager-only action.
+        if current_user is not None:
+            await assert_exam_manager(exam_id, current_user, db)
+
         if not student_answer or (not ideal_answer and not marking_scheme):
             raise HTTPException(status_code=400, detail="Missing required parameters. Provide student_answer and at least one of ideal_answer or marking_scheme.")
         
@@ -627,7 +643,12 @@ async def grade_question_with_diagram(
         exam_id = request.get("exam_id")
         student_id = request.get("student_id")
         question_id = request.get("question_id")
-        
+
+        # AUTHORIZATION: exam_id arrives in the request body, so this cannot
+        # be a path-parameter dependency. Grading is a manager-only action.
+        if current_user is not None:
+            await assert_exam_manager(exam_id, current_user, db)
+
         result = await db.execute(select(QuestionResponse).where(
             QuestionResponse.question_id == question_id,
             QuestionResponse.student_id == student_id
@@ -1028,6 +1049,7 @@ Separate each question with a blank line.
 async def process_answer_text_image(
     exam_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_exam_manager),
     current_user: User = Depends(get_current_user_required)
 ):
     await process_answer_text_images_logic(exam_id, current_user.id, db)
@@ -1039,6 +1061,7 @@ async def process_answer_text_image(
 async def process_marking_scheme_text_image(
     exam_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_exam_manager),
     current_user: User = Depends(get_current_user_required)
 ):
     """
@@ -1221,6 +1244,7 @@ async def grade_exam_logic(exam_id: int, student_id: int, db: AsyncSession):
 async def grade_exam(
     exam_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_exam_manager),
     current_user: User = Depends(get_current_user_required)
 ):
     result = await grade_exam_logic(exam_id, current_user.id, db)

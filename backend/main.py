@@ -8,6 +8,7 @@ import logging
 
 from backend.database import engine, get_db, Base
 from backend.routers import auth, classes, enrollments, notifications, announcements, exams, geminiAPI, studentBackend, peopleManagement, examStats, user_routes, studentEdit, routingTasks
+from backend.auth import files as protected_files
 from backend.config import settings
 
 from fastapi.staticfiles import StaticFiles
@@ -33,9 +34,15 @@ app = FastAPI(title=settings.PROJECT_NAME, version=settings.PROJECT_VERSION, lif
 # Serve static files with HTML support (so index.html is served as the default)
 # app.mount("/static", StaticFiles(directory="frontend", html=True), name="static")         ### NOT IN DEPLOYMENT
 
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+# SECURITY: "/uploads" was previously mounted as StaticFiles, which served every
+# answer script, marking scheme and cropped answer image to anyone who knew a
+# URL, with no authentication. Uploaded files are now served exclusively through
+# backend.auth.files, which authorizes the caller against the owning exam and
+# resolves the path from the database rather than from the request.
+# Do not re-add a StaticFiles mount over ./uploads.
 
 # Mount profile pictures directory
+os.makedirs("profile_pictures", exist_ok=True)
 app.mount("/profile_pictures", StaticFiles(directory="profile_pictures"), name="profile_pictures")
 
 # Add CORS middleware
@@ -61,8 +68,9 @@ app.include_router(peopleManagement.router)
 app.include_router(studentBackend.router)
 app.include_router(examStats.router)  
 app.include_router(studentEdit.router)  
-app.include_router(user_routes.router)  
+app.include_router(user_routes.router)
 app.include_router(routingTasks.router)
+app.include_router(protected_files.router)
 
 @app.get("/")
 async def root(request: Request):

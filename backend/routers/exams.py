@@ -16,6 +16,11 @@ from backend.models.tables import Exam, Classroom, Enrollment, Question, Questio
 from backend.models.files import AnswerScript, Material, FileTypeEnum
 from backend.models.users import User
 from backend.utils.security import get_current_user_required
+from backend.auth.policies import (
+    ExamContext,
+    require_exam_manager,
+    require_exam_participant,
+)
 from backend.models.notifications import Notification, NotificationType
 
 UPLOAD_DIRECTORY = "./uploads"
@@ -25,25 +30,44 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["exams"])
 
 @router.get("/exams/{exam_id}/stage")
-async def get_exam_stage(exam_id: int, db: AsyncSession = Depends(get_db)):
+async def get_exam_stage(
+    exam_id: int,
+    db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_exam_participant),
+):
     result = await db.execute(select(Exam).where(Exam.id == exam_id))
     exam = result.scalars().first()
     if not exam:
         raise HTTPException(status_code=404, detail="Exam not found")
     return {"exam_stage": exam.exam_stage}
 
-@router.post("/exams/{exam_id}/stage")
-async def update_exam_stage(exam_id: int, exam_stage: int, db: AsyncSession = Depends(get_db)):
+async def set_exam_stage(exam_id: int, exam_stage: int, db: AsyncSession):
+    """Core stage transition, callable from background jobs.
+
+    Kept separate from the HTTP route so that the Celery task does not have to
+    invoke a route handler whose signature carries FastAPI Depends defaults.
+    Authorization is the ROUTE's responsibility; the background job already runs
+    on behalf of an authorized enqueue request.
+    """
     result = await db.execute(select(Exam).where(Exam.id == exam_id))
     exam = result.scalars().first()
     if not exam:
         raise HTTPException(status_code=404, detail="Exam not found")
-    
+
     exam.exam_stage = exam_stage
     await db.commit()
     await db.refresh(exam)
-
     return {"message": "Exam stage updated successfully", "exam_stage": exam.exam_stage}
+
+
+@router.post("/exams/{exam_id}/stage")
+async def update_exam_stage(
+    exam_id: int,
+    exam_stage: int,
+    db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_exam_manager),
+):
+    return await set_exam_stage(exam_id, exam_stage, db)
 
 @router.patch("/exam/update-extracted-text")
 async def update_extracted_text(
@@ -498,7 +522,8 @@ class UpdatesPayload(BaseModel):
 async def update_question_parts(
     exam_id: int,
     payload: UpdatesPayload,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_exam_manager),
 ):
     for update in payload.updates:
         result = await db.execute(select(Question).where(

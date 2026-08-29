@@ -3,6 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.database import get_db
 from backend.models.users import User
 from backend.utils.security import get_current_user_required
+from backend.auth.policies import ExamContext, require_exam_participant
 from backend.tasks import process_and_grade_exam
 
 router = APIRouter(tags=["routing-tasks"])
@@ -11,6 +12,7 @@ router = APIRouter(tags=["routing-tasks"])
 async def enqueue_processing(
     exam_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_exam_participant),
     current_user: User = Depends(get_current_user_required)
 ):
     """

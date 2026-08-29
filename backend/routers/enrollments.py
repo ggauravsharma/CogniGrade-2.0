@@ -9,6 +9,11 @@ from backend.models.tables import Classroom, Enrollment
 from backend.models.users import User
 from backend.models.notifications import Notification, NotificationType
 from backend.utils.security import get_current_user_required
+from backend.auth.policies import (
+    ClassroomContext,
+    assert_enrollment_manageable,
+    require_classroom_owner,
+)
 
 router = APIRouter(tags=["enrollments"])
 
@@ -61,12 +66,10 @@ async def join_class(class_code: str = Form(...), role: str = Form("student"), d
     return JSONResponse({"success": True, "message": "Enrollment request submitted"})
 
 @router.get("/enrollments/manage/{class_id}")
-async def manage_enrollments(class_id: int, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user_required)):
-    result = await db.execute(select(Classroom).where(Classroom.id == class_id))
-    classroom = result.scalars().first()
-    if not classroom or classroom.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    
+async def manage_enrollments(class_id: int, db: AsyncSession = Depends(get_db), ctx: ClassroomContext = Depends(require_classroom_owner), current_user: User = Depends(get_current_user_required)):
+    # Owner-only, preserving the pre-existing semantics of this route.
+    classroom = ctx.classroom
+
     result = await db.execute(select(Enrollment).where(
         Enrollment.classroom_id == class_id,
         Enrollment.status == "pending"
@@ -100,16 +103,13 @@ async def manage_enrollments(class_id: int, db: AsyncSession = Depends(get_db), 
 
 @router.post("/enrollments/{enrollment_id}/accept")
 async def accept_enrollment(enrollment_id: int, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user_required)):
-    result = await db.execute(select(Enrollment).where(Enrollment.id == enrollment_id))
-    enrollment = result.scalars().first()
-    if not enrollment:
-        raise HTTPException(status_code=404, detail="Enrollment not found")
-    
-    result = await db.execute(select(Classroom).where(Classroom.id == enrollment.classroom_id))
-    classroom = result.scalars().first()
-    if not classroom or classroom.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    
+    # Cross-resource integrity: the classroom is resolved from the enrolment
+    # itself, and ownership is checked against THAT classroom.
+    enrollment, ctx = await assert_enrollment_manageable(
+        enrollment_id, current_user, db, require_owner=True
+    )
+    classroom = ctx.classroom
+
     enrollment.status = "accepted"
     await db.commit()
     
@@ -130,16 +130,13 @@ async def accept_enrollment(enrollment_id: int, db: AsyncSession = Depends(get_d
 
 @router.post("/enrollments/{enrollment_id}/reject")
 async def reject_enrollment(enrollment_id: int, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user_required)):
-    result = await db.execute(select(Enrollment).where(Enrollment.id == enrollment_id))
-    enrollment = result.scalars().first()
-    if not enrollment:
-        raise HTTPException(status_code=404, detail="Enrollment not found")
-    
-    result = await db.execute(select(Classroom).where(Classroom.id == enrollment.classroom_id))
-    classroom = result.scalars().first()
-    if not classroom or classroom.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    
+    # Cross-resource integrity: the classroom is resolved from the enrolment
+    # itself, and ownership is checked against THAT classroom.
+    enrollment, ctx = await assert_enrollment_manageable(
+        enrollment_id, current_user, db, require_owner=True
+    )
+    classroom = ctx.classroom
+
     enrollment.status = "rejected"
     await db.commit()
     
@@ -159,16 +156,13 @@ async def reject_enrollment(enrollment_id: int, db: AsyncSession = Depends(get_d
 
 @router.post("/enrollments/{enrollment_id}/remove")
 async def remove_student(enrollment_id: int, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user_required)):
-    result = await db.execute(select(Enrollment).where(Enrollment.id == enrollment_id))
-    enrollment = result.scalars().first()
-    if not enrollment:
-        raise HTTPException(status_code=404, detail="Enrollment not found")
-    
-    result = await db.execute(select(Classroom).where(Classroom.id == enrollment.classroom_id))
-    classroom = result.scalars().first()
-    if not classroom or classroom.owner_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    
+    # Cross-resource integrity: the classroom is resolved from the enrolment
+    # itself, and ownership is checked against THAT classroom.
+    enrollment, ctx = await assert_enrollment_manageable(
+        enrollment_id, current_user, db, require_owner=True
+    )
+    classroom = ctx.classroom
+
     student_id = enrollment.student_id
     await db.delete(enrollment)
     await db.commit()
