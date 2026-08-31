@@ -294,11 +294,14 @@ async def client(session_factory, world):
     app.dependency_overrides[get_current_user_required] = _override_user
 
     # raise_app_exceptions=False so that a crash INSIDE a handler comes back as
-    # a 500 response instead of propagating into the test. Two endpoints in this
-    # repository crash at runtime for reasons unrelated to authorization
-    # (see the report: a lazy relationship loaded in async context, and a
-    # synchronous db.query on an AsyncSession). Those must not mask the
-    # authorization assertions, which are about 401/403 only.
+    # a 500 response instead of propagating into the test, keeping the
+    # authorization assertions (401/403) independent of handler faults.
+    #
+    # This used to be load-bearing: two endpoints crashed at runtime for reasons
+    # unrelated to authorization -- a lazy relationship loaded in async context
+    # and a synchronous db.query on an AsyncSession. Both are fixed in Backend
+    # Reliability v1 and are now asserted to return 200; see
+    # test_backend_reliability.py.
     transport = ASGITransport(app=app, raise_app_exceptions=False)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c

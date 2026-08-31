@@ -22,6 +22,7 @@ from backend.models.users import User
 from backend.utils.security import get_current_user_required
 from backend.models.tables import QuestionResponse, Question
 from backend.grading.evidence import build_grading_evidence
+from backend.grading.failure import UNEXPECTED_ERROR
 from backend.grading.result import (
     GradingResponseError,
     output_instruction,
@@ -332,6 +333,8 @@ If Q has parts, nest them under Q:
                     await db.commit()
                     await db.refresh(new_answer)
                     results.append({"filename": file.filename, "text": extracted_text})
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Error processing file {file.filename}: {str(e)}", exc_info=True)
             results.append({"filename": file.filename, "error": str(e)})
@@ -595,6 +598,11 @@ async def _persist_and_report(
         if existing_response:
             existing_response.marks_obtained = result.score
             existing_response.reasoning = result.reason
+            # A valid mark and a failure code are mutually exclusive by
+            # construction: clearing it in the same transaction as the write is
+            # what makes a retry self-healing, and is why no stale failure can
+            # outlive the failure it described.
+            existing_response.grading_error_code = None
             await db.commit()
     return {
         "status": "graded",
@@ -602,6 +610,32 @@ async def _persist_and_report(
         "reasoning": result.reason,
         "raw_response": raw_text,
     }
+
+
+async def _record_grading_failure(db, *, question_id, student_id, error_code):
+    """Persist WHY this response has no mark, so a professor can be told.
+
+    Best effort by design: the caller is already on a failure path, and losing
+    the diagnostic must never turn a reported grading failure into a 500. The
+    mark itself is untouched -- a failure never writes a score, and in
+    particular never writes a zero (audit C6/D).
+    """
+    if not (question_id and student_id):
+        return
+    try:
+        found = await db.execute(select(QuestionResponse).where(
+            QuestionResponse.question_id == question_id,
+            QuestionResponse.student_id == student_id
+        ))
+        response = found.scalars().first()
+        if response is not None:
+            response.grading_error_code = error_code
+            await db.commit()
+    except Exception:
+        logger.exception(
+            "could not record grading failure code for question_id=%s student_id=%s",
+            question_id, student_id,
+        )
 
 
 def _grading_failure(exc: GradingResponseError, *, question_id, student_id):
@@ -697,6 +731,9 @@ Maximum Marks Possible: {question.max_marks}.
             )
         except GradingResponseError as exc:
             # An unparseable provider response is a FAILURE, never a zero.
+            await _record_grading_failure(
+                db, question_id=question_id, student_id=student_id, error_code=exc.code
+            )
             return _grading_failure(exc, question_id=question_id, student_id=student_id)
 
         return await _persist_and_report(
@@ -704,8 +741,21 @@ Maximum Marks Possible: {question.max_marks}.
             result=result, raw_text=raw_text,
         )
         
+    except HTTPException:
+        # A deliberate 403/404 raised above (question missing, caller not a
+        # manager) must keep its status instead of being reported as a server
+        # fault by the handler below.
+        raise
     except Exception as e:
         logger.error(f"Error in grade_question: {str(e)}", exc_info=True)
+        # The exam-wide run must be able to say WHICH question died, so record
+        # a generic code before propagating. The detail stays in the log.
+        await _record_grading_failure(
+            db,
+            question_id=request.get("question_id"),
+            student_id=request.get("student_id"),
+            error_code=UNEXPECTED_ERROR,
+        )
         raise HTTPException(status_code=500, detail=f"Error grading question: {str(e)}")
 
 @router.post("/grade-question-with-diagram")
@@ -871,6 +921,9 @@ Maximum Marks Possible: {question.max_marks}.
             )
         except GradingResponseError as exc:
             # An unparseable provider response is a FAILURE, never a zero.
+            await _record_grading_failure(
+                db, question_id=question_id, student_id=student_id, error_code=exc.code
+            )
             return _grading_failure(exc, question_id=question_id, student_id=student_id)
 
         return await _persist_and_report(
@@ -878,8 +931,21 @@ Maximum Marks Possible: {question.max_marks}.
             result=result, raw_text=raw_text,
         )
         
+    except HTTPException:
+        # A deliberate 403/404 raised above (question missing, caller not a
+        # manager) must keep its status instead of being reported as a server
+        # fault by the handler below.
+        raise
     except Exception as e:
         logger.error(f"Error in grade_question: {str(e)}", exc_info=True)
+        # The exam-wide run must be able to say WHICH question died, so record
+        # a generic code before propagating. The detail stays in the log.
+        await _record_grading_failure(
+            db,
+            question_id=request.get("question_id"),
+            student_id=request.get("student_id"),
+            error_code=UNEXPECTED_ERROR,
+        )
         raise HTTPException(status_code=500, detail=f"Error grading question: {str(e)}")
 
 async def extract_single_answer_text(
@@ -1142,7 +1208,8 @@ async def process_marking_scheme_text_image(
       - Map and store each extracted text into the corresponding Question's ideal_marking_scheme field.
     """
     # Retrieve all exam questions.
-    questions = db.query(Question).filter(Question.exam_id == exam_id).all()
+    result = await db.execute(select(Question).where(Question.exam_id == exam_id))
+    questions = result.scalars().all()
    
     questions_with_images = [q for q in questions if q.ms_text_images]
 
@@ -1293,7 +1360,25 @@ async def grade_exam_logic(exam_id: int, student_id: int, db: AsyncSession):
             "student_id": student_id,
             "question_id": question.id
         }
-        grade_res = await grade_question_with_diagram(req, db, None)  # No current_user needed
+        try:
+            grade_res = await grade_question_with_diagram(req, db, None)  # No current_user needed
+        except Exception as exc:
+            # Resilience, deliberately: one question that dies unexpectedly must
+            # not abandon the rest of the paper. Previously this propagated and
+            # every later question was left ungraded with no record of why.
+            # `_record_grading_failure` has already stored a code for this
+            # question, so the professor still learns which one died.
+            logger.error(
+                "grading raised for exam_id=%s student_id=%s question_id=%s: %s",
+                exam_id, student_id, question.id, type(exc).__name__, exc_info=True,
+            )
+            grade_res = {
+                "status": "grading_failed",
+                "grade": None,
+                "reasoning": None,
+                "error_code": UNEXPECTED_ERROR,
+                "raw_response": None,
+            }
         results.append({
             "question_number": question.question_number,
             "question_id": question.id,
@@ -1305,11 +1390,12 @@ async def grade_exam_logic(exam_id: int, student_id: int, db: AsyncSession):
         })
 
     # A question whose provider response could not be validated has NO mark in
-    # the database -- deliberately, so a failure is never scored as zero. That
-    # NULL is still summed as a zero contribution by add_exam_result_internal,
-    # and the exam is still stamped "graded" (audit C6). This summary carries
-    # the per-question status so that the aggregation fix has the signal it
-    # needs; nothing consumes `failed_questions` yet.
+    # the database -- deliberately, so a failure is never scored as zero.
+    # Completeness itself is derived from the persisted marks by
+    # `aggregate_student_result`, not from this return value, so a run that
+    # crashes outright is caught just as well as one that reports politely.
+    # What this summary adds is the REASON, which is now also persisted per
+    # response (`grading_error_code`) and surfaced to the professor.
     failed_questions = [r for r in results if r.get("status") != "graded"]
     if failed_questions:
         logger.error(

@@ -1,11 +1,11 @@
-from fastapi import APIRouter, Request, Depends, Form, HTTPException
+from fastapi import APIRouter, Request, Depends
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from datetime import datetime, timezone
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 from backend.database import get_db
-from backend.models.tables import Classroom, Enrollment
+from backend.models.tables import Enrollment
 from backend.models.users import User
 from backend.models.notifications import Notification, NotificationType
 from backend.utils.security import get_current_user_required
@@ -17,53 +17,14 @@ from backend.auth.policies import (
 
 router = APIRouter(tags=["enrollments"])
 
-@router.post("/classes/join-class")
-async def join_class(class_code: str = Form(...), role: str = Form("student"), db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user_required)):
-    if current_user.is_professor:
-        raise HTTPException(status_code=403, detail="Professors cannot join classes")
-    
-    result = await db.execute(select(Classroom).where(Classroom.class_code == class_code.strip().upper()))
-    classroom = result.scalars().first()
-    if not classroom:
-        return JSONResponse(status_code=400, content={"success": False, "error": "Invalid class code"})
-    
-    result = await db.execute(select(Enrollment).where(
-        Enrollment.student_id == current_user.id,
-        Enrollment.classroom_id == classroom.id
-    ))
-    existing_enrollment = result.scalars().first()
-    
-    if existing_enrollment:
-        if existing_enrollment.status == "accepted":
-            return JSONResponse({"success": True, "message": "Already enrolled", "redirect": f"/classes/{classroom.id}"})
-        elif existing_enrollment.status == "pending":
-            return JSONResponse({"success": True, "message": "Request already pending"})
-        else:
-            existing_enrollment.status = "pending"
-            await db.commit()
-    else:
-        new_enrollment = Enrollment(
-            student_id=current_user.id,
-            classroom_id=classroom.id,
-            status="pending"
-        )
-        db.add(new_enrollment)
-        await db.commit()
-    
-    notification = Notification(
-        type=NotificationType.ENROLLMENT_REQUEST,
-        title="New Enrollment Request",
-        message=f"{current_user.full_name} wants to join your {classroom.name} class",
-        sender_id=current_user.id,
-        recipient_id=classroom.owner_id,
-        classroom_id=classroom.id,
-        action_url=f"/enrollments/manage/{classroom.id}",
-        created_at=datetime.now(timezone.utc)
-    )
-    db.add(notification)
-    await db.commit()
-    
-    return JSONResponse({"success": True, "message": "Enrollment request submitted"})
+# REMOVED: a second `POST /classes/join-class`.
+# `classes.join_class` is registered first and was the only reachable one. The
+# two implement different product rules -- this copy created a PENDING
+# enrolment needing owner approval and notified the owner, while the live
+# handler auto-accepts ("FOR NOW ALL ACCEPTED ON JOINING"). Only the live rule
+# has ever run, so removing this changes nothing observable; it removes a trap
+# where reordering main.py would silently switch the join flow back to
+# approval-based.
 
 @router.get("/enrollments/manage/{class_id}")
 async def manage_enrollments(class_id: int, db: AsyncSession = Depends(get_db), ctx: ClassroomContext = Depends(require_classroom_owner), current_user: User = Depends(get_current_user_required)):

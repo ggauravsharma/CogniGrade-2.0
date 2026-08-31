@@ -160,6 +160,11 @@ async def create_class(request: Request, name: str = Form(...), subject: str = F
             "description": new_class.description,
             "class_code": new_class.class_code
         }})
+    except HTTPException:
+        # A 403/404 raised deliberately above is an ANSWER, not a fault.
+        # Without this, the broad handler below relabels it 500 and the caller
+        # is told the server broke when it was actually told "no".
+        raise
     except Exception as e:
         logger.error(f"Error creating class: {str(e)}", exc_info=True)
         return JSONResponse(status_code=500, content={"success": False, "error": "An error occurred while creating the class"})
@@ -252,6 +257,8 @@ async def create_assignment(class_id: int, assignment: AssignmentCreate, db: Asy
             "due_date": new_assignment.due_date.isoformat() if new_assignment.due_date else None,
             "points_possible": new_assignment.points_possible
         }})
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error creating assignment: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while creating the assignment")
@@ -323,6 +330,8 @@ async def get_assignment_submissions(
             })
 
         return {"submissions": formatted_submissions}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching submissions: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while fetching submissions")
@@ -394,6 +403,8 @@ async def get_my_submission(
         }
 
         return {"submission": formatted_submission, "status": "submitted"}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching submission: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while fetching the submission")
@@ -505,6 +516,8 @@ async def get_assignment(
             "user_role": user_role,
             "user_submission": formatted_submission
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching assignment: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while fetching the assignment")
@@ -559,6 +572,8 @@ async def get_assignment_comments(
             })
 
         return {"comments": formatted_comments}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching comments: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while fetching comments")
@@ -606,8 +621,10 @@ async def delete_assignment_comment(
         if not (is_author or is_owner or is_ta):
             raise HTTPException(status_code=403, detail="You can only delete your own comments")
         
-        # Delete the comment
-        db.delete(comment)
+        # Delete the comment. `AsyncSession.delete` is a COROUTINE: unawaited
+        # it scheduled nothing, so this endpoint reported a successful delete
+        # while the row was still there.
+        await db.delete(comment)
         await db.commit()
         
         return {"success": True, "message": "Comment deleted successfully"}
@@ -704,6 +721,8 @@ async def submit_assignment_file(
                 "submitted_at": submission.submitted_at.isoformat() if submission.submitted_at else None
             }
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error submitting assignment file: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while submitting the assignment file")
@@ -774,6 +793,8 @@ async def unsubmit_assignment(
             "files": file_paths,
             "has_files": len(file_paths) > 0
         })
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error unsubmitting assignment: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while unsubmitting the assignment")
@@ -889,6 +910,8 @@ async def create_announcement(class_id: int, announcement: AnnouncementCreate, d
             "title": new_announcement.title,
             "content": new_announcement.content
         }})
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error creating announcement: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while creating the announcement")
@@ -949,6 +972,8 @@ async def update_announcement(
                 "content": existing_announcement.content
             }
         })
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error updating announcement: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while updating the announcement")
@@ -1082,6 +1107,8 @@ async def view_class(class_id: int, db: AsyncSession = Depends(get_db), ctx: Cla
             "ta_enrollments": [e.id for e in ta_enrollments],
             "student_enrollments": [e.id for e in student_enrollments]
         })
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error loading class data: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while loading the class data")
@@ -1542,6 +1569,8 @@ async def get_class_classwork(
             "user_role": user_role
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error retrieving classwork: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"An error occurred while retrieving classwork: {str(e)}")
@@ -1597,6 +1626,8 @@ async def upload_assignment_materials(
             "message": f"{material_type} materials uploaded successfully",
             "files": saved_files
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error uploading assignment materials: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"An error occurred while uploading materials: {str(e)}")

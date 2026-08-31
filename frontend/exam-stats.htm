@@ -438,6 +438,14 @@
     .btn:hover {
       background-color: #0056b3; /* Darker blue on hover */
     }
+    /* Names the questions a professor has to go and fix. Deliberately terse:
+       the reason lives in the tooltip, never a stack trace or model output. */
+    .failed-questions{
+      margin-top:3px;
+      font-size:0.78em;
+      color:#8a5a00;
+      cursor:help;
+    }
     .incomplete-flag{
       display:inline-block;
       margin-left:6px;
@@ -687,9 +695,15 @@
         // A partial total is shown so progress stays visible, but it must never
         // read as a finished score. is_final comes from the exam result status.
         const incomplete = student.is_final === false && student.status === "grading_incomplete";
+        // Which questions have no mark, and why. Codes are already turned into
+        // short sentences by the backend; nothing here renders model output.
+        const failures = student.grading_failures || [];
+        const failureNote = failures.length
+          ? `<div class="failed-questions" title="${failures.map(f => `${f.label}: ${f.message}`).join(' — ').replace(/"/g, '&quot;')}">Failed: ${failures.map(f => f.label).join(', ')}</div>`
+          : '';
         const marksCell = incomplete
-          ? `${student.total_marks} <span class="incomplete-flag" title="Grading did not complete for every question. This total is partial, not final.">partial</span>`
-          : `${student.total_marks}`;
+          ? `${student.total_marks} <span class="incomplete-flag" title="Grading did not complete for every question. This total is partial, not final.">partial</span>${failureNote}`
+          : `${student.total_marks}${failureNote}`;
         tr.innerHTML = `<td>${student.name}</td>
                         <td>${student.roll || student.email}</td>
                         <td>${marksCell}</td>

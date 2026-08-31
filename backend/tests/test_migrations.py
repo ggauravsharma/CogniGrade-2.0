@@ -66,16 +66,18 @@ def db_path(tmp_path):
 def test_there_is_exactly_one_head():
     """Two heads would mean `upgrade head` is ambiguous and silently partial."""
     script = ScriptDirectory.from_config(alembic_config())
-    assert list(script.get_heads()) == ["0002"]
+    assert len(script.get_heads()) == 1, script.get_heads()
 
 
-def test_the_revision_chain_is_baseline_then_fractional_marks():
+def test_the_revision_chain_is_linear_and_in_order():
+    """Each revision names the one before it, with no branch and no gap."""
     script = ScriptDirectory.from_config(alembic_config())
-    baseline = script.get_revision("0001")
-    fractional = script.get_revision("0002")
+    expected = ["0001", "0002", "0003"]
 
-    assert baseline.down_revision is None
-    assert fractional.down_revision == "0001"
+    assert script.get_revision("0001").down_revision is None
+    for previous, current in zip(expected, expected[1:]):
+        assert script.get_revision(current).down_revision == previous
+    assert script.get_current_head() == expected[-1]
 
 
 def test_both_revisions_import_cleanly():
@@ -311,7 +313,7 @@ def test_an_empty_database_is_created_and_stamped(db_path):
 
     with engine.connect() as connection:
         version = connection.execute(sa.text("select version_num from alembic_version")).scalar()
-        assert version == "0002"
+        assert version == ScriptDirectory.from_config(alembic_config()).get_current_head()
         # ... and the schema is really there, not merely stamped.
         assert "question_responses" in sa.inspect(connection).get_table_names()
     engine.dispose()

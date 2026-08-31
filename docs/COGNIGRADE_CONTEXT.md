@@ -258,6 +258,81 @@ Alembic foundation and fractional marks (audit C7).
 - 283 tests (206 + 77); 285 after the PostgreSQL verification below added
   two bootstrap regression tests.
 
+### Backend Reliability v1 — DONE
+Grading-failure visibility, and the runtime bugs that would have broken a demo.
+
+A correct grading algorithm is not enough if an announcement page 500s, a
+deletion lies about succeeding, a 403 arrives as a 500, or a professor is told
+grading failed but not where. All of the following were confirmed at HEAD
+before being changed.
+
+**Grading failure visibility.** `grade_exam_logic` had always computed
+`failed_questions`, and `tasks.py` had always discarded the return value, so
+`grading_incomplete` was a dead end: no question, no reason, no recovery but a
+blind re-run.
+* New `backend/grading/failure.py` — provider-neutral `GradingFailure`,
+  `FAILURE_MESSAGES` (code -> one safe sentence), `describe()`,
+  `collect_failures()`. No SDK, FastAPI, SQLAlchemy or `backend.models` import
+  (AST-asserted). No message names a provider (asserted).
+* New column `QuestionResponse.grading_error_code` (Text, nullable), Alembic
+  revision **0003**. One nullable column, deliberately: not a job table, not an
+  event ledger. Only the CODE is stored — the raw provider response is logged
+  and never persisted, so it cannot reach a classroom UI.
+* Exposed on two surfaces that already existed, no new endpoints:
+  `GET /exams/{id}/stats` (manager-only) gains `grading_failures` and
+  `failed_question_labels` per student, built in ONE query for the whole exam;
+  `GET /exam/{id}/student-evaluation/{sid}` gains `grading_error_code` /
+  `grading_error` **only when `ctx.is_manager`** — that route is
+  self-or-manager, and a student gets their marks without the diagnostics.
+* `grade_exam_logic` no longer aborts the paper when one question raises: the
+  question is recorded as failed and the run continues.
+
+**Failure lifecycle.** The code is cleared in the same transaction as any
+write that produces a valid mark — provider success, manual edit,
+`update_student_response`, all three re-evaluation call sites, `drop_question`,
+`give_full_marks`. A stale failure therefore cannot outlive the failure it
+described, which is what makes retries self-healing without an attempt log.
+`marks_obtained = 0` is a grade and is never listed as a failure (C6 holds).
+
+**Announcements (`db.query` on an AsyncSession).** `get_class_announcements`
+returned 500 for everyone; so did `delete_announcement`, which additionally
+called `db.delete()` and `db.rollback()` without awaiting them. Both converted
+to async `select`; author names now resolve in one query instead of one per
+row.
+
+**People management (async lazy load).** `get_class_people` returned 500 for
+everyone: `classroom.owner.full_name` on a `ctx.classroom` loaded by a plain
+select. The owner name is now SELECTed; `e.student.full_name` — the same bug
+two lines down — is covered by `selectinload(Enrollment.student)`. No global
+lazy-loading configuration was changed.
+
+**Deletions that lied.** `AsyncSession.delete` is a coroutine; unawaited it
+schedules nothing while the endpoint reports success. Fixed in
+`announcements.delete_announcement` and `classes.delete_comment`. The
+`peopleManagement.remove_student` copy that had this bug was dead (below).
+STILL OPEN: `user_routes.delete_account` has six unawaited deletes AND reads
+lazy relationships in async context — out of this phase's scope, reported.
+
+**Duplicate routes — now zero.** All four shadowed handlers removed, keeping
+the implementation FastAPI actually served, so no observable API changed:
+`enrollments.join_class`, `announcements.create_announcement`,
+`announcements.update_announcement`, `peopleManagement.remove_student`. Two
+behaviour differences were dead, not lost, and are recorded below. A test
+asserts no duplicate (method, path) registration remains.
+
+**HTTPException swallowing — now zero.** An AST audit found 17 try-blocks that
+raise HTTPException and catch bare `Exception` first, turning a deliberate
+403/404 into a 500. Two were fixed inside the grading routes and 15 guarded
+with `except HTTPException: raise` (classes.py 13, exams.py 1, geminiAPI.py 1).
+Genuine faults still surface as server errors.
+
+**Also fixed:** `process_marking_scheme_text_image` used `db.query` on an
+AsyncSession (audit C10) — the endpoint failed on its first line. Converted to
+async select; it still requires a live provider call to exercise end to end, so
+it is NOT verified beyond compiling and no longer crashing on entry.
+
+- 320 tests (285 + 35).
+
 ---
 
 ## Authorization model
@@ -289,42 +364,35 @@ can never permit acting on a resource in classroom B.
 
 ## Known issues found but deliberately NOT fixed
 
-These were discovered while implementing security phases and are out of scope
-until their own remediation phase.
+These were discovered while implementing earlier phases and are out of scope
+until their own remediation phase. Items fixed in Backend Reliability v1 have
+been removed from this list.
 
-- `classes.py` has **17 handlers** wrapping the whole body in
-  `except Exception -> HTTPException(500)`, which converts deliberate 404/403
-  responses into 500. Authorization dependencies are unaffected (they run before
-  the body), but in-body checks report the wrong status.
-- `peopleManagement.get_class_people` returns 500 for everyone: it reads the
-  lazy relationship `classroom.owner.full_name` in async context.
-- `announcements.get_class_announcements` returns 500: `db.query()` on an
-  `AsyncSession` (same class of bug as `geminiAPI.py:1057`).
-- `peopleManagement.remove_student` calls `db.delete(...)` without `await`, so
-  the removal does not happen while the endpoint reports success. That route is
-  in any case shadowed — see below.
-- Still open in the grading path after Correctness v4: grading is serial, one
-  provider call per question; uploaded Gemini files are never deleted
-  (`upload_file` used, `delete_file` never) — a diagram/table call uploads
-  reference + student images per question and none are cleaned up.
-- `grade_exam_logic` returns `graded_count` / `failed_count` /
-  `failed_questions`. Aggregation does NOT read that return value: it derives
-  completeness from the persisted marks instead, so a crashed or partially
-  executed grading run is caught just as well as a politely reported one. The
-  return value is still useful for surfacing WHY a question failed, which no
-  UI does yet.
+- `user_routes.delete_account` is thoroughly broken: six `db.delete(...)` calls
+  without `await` (so the account is reported deleted but is not), a
+  `db.rollback()` without `await`, and iteration over lazy relationships
+  (`current_user.answer_scripts`, `.question_responses`, `.enrollments`,
+  `.received_notifications`) in async context, which raises MissingGreenlet.
+  Same defect classes as the ones fixed in Reliability v1, in a route that
+  phase did not scope.
+- **Announcement notifications are not sent.** The live
+  `classes.create_announcement` never created them; the copy that did was the
+  shadowed duplicate removed in Reliability v1. Starting to send them is a
+  behaviour change, not a bug fix, so it was reported rather than ported.
+- **TAs cannot remove students.** The shadowed
+  `peopleManagement.remove_student` allowed it (`require_owner=False`); the
+  live `enrollments.remove_student` is owner-only and always has been. Nothing
+  changed — but if TAs should have this, decide it deliberately.
+- Still open in the grading path: grading is serial, one provider call per
+  question; uploaded Gemini files are never deleted (`upload_file` used,
+  `delete_file` never) — a diagram/table call uploads reference + student
+  images per question and none are cleaned up.
 - `tasks.py` advances the exam to stage 7 after grading regardless of outcome.
   That is correct as it stands — stage 7 is "grading started", an exam-wide
   workflow marker, and result release is gated per student by
-  `ExamResult.status` — but it means the exam stage alone never signals
-  trouble.
-- **Four duplicate route paths.** The first router registered in `main.py` wins:
-  `POST /classes/join-class` (classes.py wins), `POST` and `PUT`
-  `/classes/{class_id}/announcements[/{id}]` (classes.py wins),
-  `POST /enrollments/{enrollment_id}/remove` (enrollments.py wins). Both copies
-  of each are secured, since include order could change.
-
----
+  `ExamResult.status` — but the exam stage alone never signals trouble.
+- `backend/routers/old/` is dead and does not compile. Excluded from
+  `compileall` runs; it should simply be deleted at some point.
 
 ## Remaining security risks
 
@@ -345,7 +413,7 @@ authorization rather than token signing. The Gemini SDK is stubbed only when the
 real package is absent, and the stub raises if any test reaches a model.
 
 ```
-.venv-test/Scripts/python.exe -m pytest -q      # 285 passed
+.venv-test/Scripts/python.exe -m pytest -q      # 320 passed
 ```
 
 `backend/requirements-dev.txt` holds test-only dependencies; production
@@ -432,6 +500,18 @@ in-process once conftest has imported the models.
 
 ---
 
+### Migration 0003 (Backend Reliability v1)
+
+Also runtime-verified on PostgreSQL 15.19 in a disposable container: upgrade
+`0002 -> 0003` added `question_responses.grading_error_code` as nullable text,
+existing rows kept their marks (`3.50` stayed `3.50`, a NULL mark stayed NULL)
+and defaulted to a NULL code, a code written afterwards read back, revision
+reported `0003`, and an autogenerate comparison against the live database
+showed no drift. On PostgreSQL this is a plain `ADD COLUMN`, which does not
+rewrite the table.
+
+---
+
 ## Experiments (isolated, not production)
 
 `experiments/` holds three provider-evaluation harnesses that are the reference
@@ -445,10 +525,10 @@ rectification for photographed sheets). Their `results/` and
 
 ## Next approved phase
 
-Not yet approved. Recommended next: **surface WHY a question failed grading.**
-`grade_exam_logic` already returns `graded_count` / `failed_count` /
-`failed_questions`, and nothing reads it. Since Correctness v3 the professor
-dashboard reports a `grading_incomplete` result and flags the row "partial",
-but it cannot say which question failed or why, so the only recovery is to
-re-run grading blindly. The data exists; it needs to be persisted or passed
-through and rendered.
+Not yet approved. Recommended next: **fix `user_routes.delete_account`.** It is
+the last route known to combine both defect classes Reliability v1 removed
+everywhere else — six unawaited `db.delete` calls and lazy-relationship access
+in async context — which means "delete my account" today reports success,
+deletes nothing, and probably 500s on the way. It is a privacy-facing promise
+the product currently breaks, and the fix is the same shape as the ones already
+made, with the same kind of regression test.

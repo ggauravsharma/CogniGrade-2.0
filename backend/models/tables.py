@@ -187,6 +187,12 @@ class QuestionResponse(Base):
     student_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     answer_text = Column(Text, nullable=True)
     marks_obtained = Column(Marks, nullable=True)
+    # Why this response has no mark, when it has none. NULL means "nothing went
+    # wrong" -- either the question is graded, or it was never attempted. It is
+    # cleared the moment a valid mark is written, so it can never go stale.
+    # A provider-neutral code only (see backend/grading/failure.py); the raw
+    # model output is logged, never stored, and never shown.
+    grading_error_code = Column(Text, nullable=True)
     query = Column(Text, nullable=True)
     reasoning = Column(Text, nullable=True)
     created_at = Column(TIMESTAMP(timezone=True), default=lambda: datetime.now(timezone.utc))

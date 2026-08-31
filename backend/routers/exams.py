@@ -277,6 +277,11 @@ async def create_exam(
                 "points_possible": new_exam.points_possible
             }
         })
+    except HTTPException:
+        # A 403/404 raised deliberately above is an ANSWER, not a fault.
+        # Without this, the broad handler below relabels it 500 and the caller
+        # is told the server broke when it was actually told "no".
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

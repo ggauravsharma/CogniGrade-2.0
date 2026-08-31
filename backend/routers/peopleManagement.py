@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Request, Form
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession     # ASYNC
 from sqlalchemy.future import select
+from sqlalchemy.orm import selectinload
 
 from typing import Optional
 from datetime import datetime, timezone
@@ -11,7 +12,7 @@ from pydantic import BaseModel
 import logging
 
 from backend.database import get_db
-from backend.models.tables import Classroom, Enrollment, Role
+from backend.models.tables import Classroom, Enrollment
 from backend.models.users import User
 from backend.utils.security import get_current_user_required
 from backend.auth.policies import (
@@ -35,71 +36,75 @@ async def get_class_people(
     # user ids) of any classroom in the database.
     classroom = ctx.classroom
 
+    # The owner's name has to be SELECTED, not walked into.
+    # `classroom.owner` is a lazy relationship and `ctx.classroom` was loaded by
+    # a plain select, so reading `classroom.owner.full_name` triggered lazy IO
+    # inside async context -- SQLAlchemy raises MissingGreenlet there, which
+    # made this endpoint return 500 for every caller, member or not.
+    # Fetched explicitly instead of by relationship access; no global lazy
+    # configuration is changed, so nothing else in the app is affected.
+    owner_name = None
+    if classroom.owner_id is not None:
+        found = await db.execute(
+            select(User.full_name).where(User.id == classroom.owner_id)
+        )
+        owner_name = found.scalar_one_or_none()
+
     # Prepare professor info
     professor = {
         "user_id": classroom.owner_id,
-        "full_name": classroom.owner.full_name,
+        "full_name": owner_name,
         "role": "professor"
     }
-    
-    # Fetch TA enrollments
-    result = await db.execute(select(Enrollment).where(
-        Enrollment.classroom_id == class_id,
-        Enrollment.status == "accepted",
-        Enrollment.role == "ta"
-    ))
+
+    # Fetch TA enrollments. `selectinload(Enrollment.student)` for the same
+    # reason: `e.student.full_name` below is another lazy access on the same
+    # code path, and would fail identically once the owner lookup was fixed.
+    result = await db.execute(select(Enrollment)
+        .options(selectinload(Enrollment.student))
+        .where(
+            Enrollment.classroom_id == class_id,
+            Enrollment.status == "accepted",
+            Enrollment.role == "ta"
+        )
+    )
     ta_enrollments = result.scalars().all()
-    
+
     # Fetch student enrollments
-    result = await db.execute(select(Enrollment).where(
-        Enrollment.classroom_id == class_id,
-        Enrollment.status == "accepted",
-        Enrollment.role == "student"
-    ))
+    result = await db.execute(select(Enrollment)
+        .options(selectinload(Enrollment.student))
+        .where(
+            Enrollment.classroom_id == class_id,
+            Enrollment.status == "accepted",
+            Enrollment.role == "student"
+        )
+    )
     student_enrollments = result.scalars().all()
     
-    teachers = [professor] + [{
-        "enrollment_id": e.id,
-        "user_id": e.student_id,
-        "full_name": e.student.full_name,
-        "role": e.role.value if hasattr(e.role, 'value') else e.role
-    } for e in ta_enrollments]
-    
-    students = [{
-        "enrollment_id": e.id,
-        "user_id": e.student_id,
-        "full_name": e.student.full_name,
-        "role": e.role.value if hasattr(e.role, 'value') else e.role
-    } for e in student_enrollments]
+    def _member(e):
+        return {
+            "enrollment_id": e.id,
+            "user_id": e.student_id,
+            "full_name": e.student.full_name if e.student else None,
+            "role": e.role.value if hasattr(e.role, 'value') else e.role
+        }
+
+    teachers = [professor] + [_member(e) for e in ta_enrollments]
+    students = [_member(e) for e in student_enrollments]
     
     return JSONResponse({"success": True, "teachers": teachers, "students": students})
 
-@router.post("/enrollments/{enrollment_id}/remove")
-async def remove_student(enrollment_id: int, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user_required)):
-    # Authorization is resolved against the enrolment's OWN classroom.
-    # Previously `current_user.is_professor` alone granted access, which let a
-    # professor of any classroom remove members from every other classroom.
-    enrollment, ctx = await assert_enrollment_manageable(
-        enrollment_id, current_user, db, require_owner=False
-    )
-    classroom = ctx.classroom
-
-    # Existing product rule preserved: a TA may only remove plain students,
-    # while the classroom owner may remove anyone.
-    if not ctx.is_owner and enrollment.role != Role.STUDENT:
-        logger.warning(
-            "authz denied: TA attempted to remove a non-student enrolment "
-            "(user_id=%s enrollment_id=%s)", current_user.id, enrollment_id
-        )
-        raise HTTPException(status_code=403, detail="Not authorized to remove this student")
-
-    student_id = enrollment.student_id
-    db.delete(enrollment)
-    await db.commit()
-    
-    # (Optional) Send a notification if needed...
-    
-    return JSONResponse({"success": True, "message": "Student removed from class"})
+# REMOVED: a second `POST /enrollments/{enrollment_id}/remove`.
+# `enrollments.remove_student` is registered first in main.py and was therefore
+# the only one ever reachable; this copy was dead code that additionally called
+# `db.delete(...)` without awaiting it, so had include order ever changed, the
+# endpoint would have reported success without deleting anything.
+#
+# BEHAVIOUR NOTE, not a change: this dead copy allowed a TA to remove a plain
+# student (`require_owner=False`), while the live handler is owner-only. Since
+# it was unreachable, removing it changes nothing a client can observe. If TAs
+# should be able to remove students, that is a product decision to make
+# deliberately on `enrollments.remove_student`.
 
 @router.post("/enrollments/{enrollment_id}/make-ta")
 async def make_ta(enrollment_id: int, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user_required)):
