@@ -628,6 +628,32 @@ quota depletes monotonically and **the concurrency variable cannot be isolated**
 on this key. Run B's apparent 7× speed-up is an artefact: it finished quickly by
 failing quickly.
 
+**FINDING 3a — the exact limit, from the provider's own error metadata.**
+A follow-up probe read the structured quota block returned with the 429:
+
+```
+quota_id     GenerateRequestsPerDayPerProjectPerModel-FreeTier
+quota_metric generativelanguage.googleapis.com/generate_content_free_tier_requests
+dimensions   model=gemini-3.6-flash, location=global
+quota_value  20
+```
+
+**20 requests per DAY, per project, per model, free tier.** The bucket is scoped
+to (project x model), so it is both project-level and model-level: a different
+model gets its own fresh 20/day. But a 33-question paper needs 33 calls, so
+**no model choice can complete one paper on the free tier** — this needs billing
+on the project, not a configuration change and not more API keys.
+
+Model availability at the time of testing, same key:
+
+```
+gemini-2.0-flash   404 retired
+gemini-2.5-flash   404 "no longer available to new users"
+gemini-3.6-flash   works; daily quota exhausted (the provider's recommended model)
+gemini-3.7-flash   authenticates, NOT quota-blocked, but 503 "high demand" on
+                   every attempt -- unusable, for a different reason
+```
+
 **Concurrency verdict: INSUFFICIENT EVIDENCE.** `max_concurrency` stays at 3,
 unvalidated, with `CG_AI__GRADING__MAX_CONCURRENCY=1` as the documented control.
 Re-running this experiment needs a quota that can complete one paper
@@ -727,10 +753,13 @@ been removed from this list.
   re-evaluate-all routes grade one question at a time. They could reuse
   `run_bounded`, but they were deliberately left alone: v2 scoped itself to the
   initial exam run, where the session/persistence split was the hard part.
-- **The Gemini quota on the current key cannot grade one paper.** Live
-  validation lost 16 of 33 questions to rate limiting on a fresh sequential run,
-  and 33 of 33 by the third run. Until quota is raised, grading is not usable
-  end to end and no concurrency setting can be chosen from measurement.
+- **The Gemini free tier cannot grade one paper: 20 requests/day/model.** The
+  quota is `GenerateRequestsPerDayPerProjectPerModel-FreeTier`, value 20, scoped
+  to (project x model). A 33-question paper needs 33 calls, so no model choice
+  or concurrency setting helps — the project needs billing enabled. Live
+  validation lost 16 of 33 questions on a fresh sequential run and 33 of 33 by
+  the third. `gemini-3.7-flash` is not quota-blocked but returns 503 "high
+  demand" on every attempt, so it is not a workaround either.
 - **Grading quality on `gemini-3.6-flash` is unbenchmarked.** The default was
   changed because the previous model was withdrawn, not because the new one was
   evaluated.
@@ -900,15 +929,15 @@ rectification for photographed sheets). Their `results/` and
 
 ## Next approved phase
 
-Not yet approved. Recommended next: **resolve the Gemini quota, then re-run the
-concurrency experiment.** Live validation showed the current key cannot complete
-one 33-question paper even sequentially — 16 of 33 lost to rate limiting on a
-fresh run, 33 of 33 by the third — so the 1-vs-3 comparison is unanswerable and,
-more importantly, the product cannot grade a real paper today. That is a billing
-and key-provisioning task, not a code change: enable billing or provision a key
-with adequate requests-per-minute, confirm the deployed container's key
-authenticates (it currently returns 401), then repeat the two runs from the
-harness described above.
+Not yet approved. Recommended next: **enable billing on the Gemini project,
+then re-run the concurrency experiment.** The free tier allows 20 requests per
+day per model (`GenerateRequestsPerDayPerProjectPerModel-FreeTier`), and one
+33-question paper needs 33 calls, so the product cannot grade a single paper
+today and the 1-vs-3 comparison is unanswerable. This is a provisioning task,
+not a code change and not more API keys: enable billing on the project, confirm
+the deployed container's key authenticates (it currently returns 401) and is
+named `GEMINI_API_KEY_1`, then repeat the two runs from the harness described
+above.
 
 Still open as policy, deliberately untouched: account deletion cascades through
 institutional academic data, and the repository tracks real profile-picture
