@@ -2,7 +2,7 @@
 
 The smallest coherent surface for the workflow this phase exists to enable:
 
-    a provider proposes regions      POST   /answer-scripts/{id}/segmentation
+    the configured provider proposes POST   /answer-scripts/{id}/segmentation
     a human reads them               GET    /answer-scripts/{id}/regions
     a human draws one                POST   /answer-scripts/{id}/regions
     a human corrects/accepts one     PATCH  /regions/{id}
@@ -18,8 +18,11 @@ them. Every route resolves the exam FROM THE ANSWER SCRIPT, so a caller
 authorised on exam A can never reach a region belonging to exam B -- the
 cross-resource rule the security foundations established.
 
-NO PROVIDER NAMES appear in any path. The segmentation endpoint names the task,
-not whoever performs it.
+NO PROVIDER NAMES appear in any path OR IN ANY REQUEST BODY. The segmentation
+endpoint names the task; which adapter performs it is deployment configuration
+(`resolve_segmentation_provider`). A client that could name the adapter could
+name the development double, and stored synthetic regions are indistinguishable
+from a model's afterwards.
 """
 
 from __future__ import annotations
@@ -33,7 +36,8 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.ai.providers import get_segmentation_provider
+from backend.ai.errors import ProviderNotConfiguredError
+from backend.ai.providers import resolve_segmentation_provider
 from backend.ai.segmentation import SegmentationRequest, validate_predictions
 from backend.auth.policies import assert_exam_manager, assert_exam_participant
 from backend.database import get_db
@@ -87,11 +91,18 @@ class ReorderRequest(BaseModel):
 
 
 class SegmentationRun(BaseModel):
+    """Which page to segment. NOT which provider segments it.
+
+    A `provider` field lived here and defaulted to the development double, so
+    an ordinary production request against a real answer script persisted
+    synthetic regions onto a real student's paper. Provider selection is
+    deployment configuration (`resolve_segmentation_provider`), so the field is
+    gone rather than merely given a safer default: a client that can name an
+    adapter can eventually name the wrong one.
+    """
+
     page_index: int
     page_count: int
-    #: Which adapter to use. Named explicitly -- there is no production
-    #: segmentation provider yet, so there is no default worth guessing.
-    provider: str = "fake"
     #: Discard existing model proposals for this page first. Human-authored and
     #: already-accepted regions are never touched.
     replace_existing: bool = True
@@ -205,13 +216,30 @@ async def request_segmentation(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user_required),
 ):
-    """Ask a provider to PROPOSE regions for one page.
+    """Ask the CONFIGURED provider to PROPOSE regions for one page.
 
     Everything it returns is stored as `proposed` and nothing downstream may
     treat that as an annotation. Proposals that fail deterministic validation
     are dropped and counted, never silently repaired.
+
+    The provider is resolved BEFORE the request is built and before anything is
+    written, so a deployment with no segmentation adapter answers 503 and
+    leaves the script exactly as it found it -- no deletions, no rows, no
+    commit.
     """
     script = await _script_for_write(answer_script_id, current_user, db)
+
+    try:
+        provider = resolve_segmentation_provider()
+    except ProviderNotConfiguredError as exc:
+        # 503, not 400: the caller asked for something reasonable that this
+        # deployment cannot currently perform. The code is provider-neutral --
+        # naming the registry here would leak which adapters exist.
+        logger.warning("segmentation requested but no provider is configured")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="segmentation_not_configured",
+        ) from exc
 
     try:
         request = SegmentationRequest(
@@ -220,11 +248,6 @@ async def request_segmentation(
             page_count=body.page_count,
             known_question_numbers=(),
         )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-    try:
-        provider = get_segmentation_provider(body.provider)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 

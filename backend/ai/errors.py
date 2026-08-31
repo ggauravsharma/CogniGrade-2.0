@@ -86,6 +86,19 @@ class ProviderResponseError(ProviderError):
     category = "empty_response"
 
 
+class ProviderNotConfiguredError(ProviderError):
+    """No adapter is configured for this task, so the call cannot be attempted.
+
+    A DEPLOYMENT fault, not a transport one, and emphatically not something to
+    paper over with a stand-in: the alternative to raising here is quietly
+    running a development double against real student work. Retrying cannot
+    install configuration, so it is not retryable.
+    """
+
+    retryable = False
+    category = "not_configured"
+
+
 #: Every category, for tests and for anything that wants to enumerate them.
 ALL_CATEGORIES = (
     ProviderError.category,
@@ -95,4 +108,5 @@ ALL_CATEGORIES = (
     ProviderAuthenticationError.category,
     ProviderInvalidRequestError.category,
     ProviderResponseError.category,
+    ProviderNotConfiguredError.category,
 )

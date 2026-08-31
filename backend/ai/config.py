@@ -50,6 +50,11 @@ RETIRED_MODELS = ("gemini-2.0-flash",)
 #: Prefix for every per-task environment override.
 ENV_PREFIX = "CG_AI"
 
+#: A task with NO adapter configured. Distinct from "misconfigured": it is the
+#: honest state of a capability the deployment has not been given yet, and the
+#: resolver turns it into an explicit failure rather than a substitute.
+NO_PROVIDER = ""
+
 
 @dataclass(frozen=True)
 class TaskSettings:
@@ -103,8 +108,14 @@ _TASK_DEFAULTS: Dict[str, Dict[str, object]] = {
     # Segmentation returns a structured region list, so it asks for JSON. One
     # page per call and sequential for now: no production provider is wired up
     # yet, and a limit nothing exercises would be a claim the code cannot keep.
+    #
+    # `provider` is EMPTY on purpose -- see `NO_PROVIDER`. Segmentation is the
+    # one task with no real adapter, and inheriting `DEFAULT_PROVIDER` would
+    # mean the resolver went looking for a Gemini segmenter that does not
+    # exist; naming the development double here would be worse still.
     AITask.SEGMENTATION: {
         "expects_json": True, "timeout_seconds": 180.0, "max_concurrency": 1,
+        "provider": NO_PROVIDER,
     },
 }
 

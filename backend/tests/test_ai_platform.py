@@ -130,7 +130,20 @@ def test_every_task_resolves_settings():
         settings = get_task_settings(task)
         assert settings.task == task
         assert settings.model == DEFAULT_MODEL
-        assert settings.provider == "gemini"
+
+
+def test_every_task_with_an_adapter_points_at_it():
+    for task in AITask.ALL:
+        if task == AITask.SEGMENTATION:
+            continue  # no adapter exists; see the test below
+        assert get_task_settings(task).provider == "gemini"
+
+
+def test_segmentation_has_no_provider_configured_by_default():
+    """A capability with no real adapter must resolve to nothing, not a double."""
+    from backend.ai.config import NO_PROVIDER
+
+    assert get_task_settings(AITask.SEGMENTATION).provider == NO_PROVIDER
 
 
 def test_the_model_is_not_hardcoded_in_the_router():

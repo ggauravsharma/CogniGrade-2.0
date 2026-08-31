@@ -383,6 +383,114 @@ def test_the_fake_provider_is_not_a_default():
 
 
 # ---------------------------------------------------------------------------
+# production safety: who chooses the segmentation provider
+# ---------------------------------------------------------------------------
+
+def test_an_unconfigured_deployment_resolves_no_segmentation_provider():
+    """The default deployment must refuse, not substitute."""
+    from backend.ai.errors import ProviderNotConfiguredError
+    from backend.ai.providers import resolve_segmentation_provider
+
+    with pytest.raises(ProviderNotConfiguredError) as exc:
+        resolve_segmentation_provider()
+    assert exc.value.category == "not_configured"
+    assert exc.value.retryable is False
+
+
+def test_an_unknown_configured_provider_is_not_configured_either(monkeypatch):
+    """A typo in configuration must fail closed, never fall through to a double."""
+    from backend.ai.errors import ProviderNotConfiguredError
+    from backend.ai.providers import resolve_segmentation_provider
+
+    monkeypatch.setenv("CG_AI__SEGMENTATION__PROVIDER", "not-a-real-adapter")
+    with pytest.raises(ProviderNotConfiguredError):
+        resolve_segmentation_provider()
+
+
+def test_the_fake_is_reachable_only_through_configuration(monkeypatch):
+    """It stays available to tests -- by the deployment key, not by a request."""
+    from backend.ai.providers import resolve_segmentation_provider
+    from backend.ai.providers.fake_segmentation import FakeSegmentationProvider
+
+    monkeypatch.setenv("CG_AI__SEGMENTATION__PROVIDER", "fake")
+    assert isinstance(resolve_segmentation_provider(), FakeSegmentationProvider)
+
+
+def test_the_request_body_cannot_name_a_provider():
+    """The field existed and defaulted to the fake. It must not come back."""
+    from backend.routers.regions import SegmentationRun
+
+    assert "provider" not in SegmentationRun.model_fields
+    source = (REPO_ROOT / "backend" / "routers" / "regions.py").read_text(encoding="utf-8")
+    assert '"fake"' not in source, "a route names a non-production adapter"
+
+
+@pytest.mark.asyncio
+async def test_segmentation_without_a_configured_provider_writes_nothing(client, db, world):
+    """The HIGH-severity regression: a normal production request must not be
+    able to persist synthetic regions on a real answer script."""
+    script = await _script(db, world)
+
+    res = await client.post(
+        f"/answer-scripts/{script.id}/segmentation",
+        json={"page_index": 0, "page_count": 3},
+        headers=as_user(world["owner_prof"]),
+    )
+    assert res.status_code == 503, res.text
+    assert res.json()["detail"] == "segmentation_not_configured"
+
+    db.expunge_all()
+    rows = (await db.execute(select(DocumentRegion).where(
+        DocumentRegion.answer_script_id == script.id
+    ))).scalars().all()
+    assert rows == [], "a request with no configured provider persisted regions"
+
+
+@pytest.mark.asyncio
+async def test_naming_the_fake_in_the_request_body_does_not_select_it(client, db, world):
+    """An old client sending the removed field gets the production answer."""
+    script = await _script(db, world)
+
+    res = await client.post(
+        f"/answer-scripts/{script.id}/segmentation",
+        json={"page_index": 0, "page_count": 3, "provider": "fake"},
+        headers=as_user(world["owner_prof"]),
+    )
+    assert res.status_code == 503, res.text
+
+    db.expunge_all()
+    rows = (await db.execute(select(DocumentRegion).where(
+        DocumentRegion.answer_script_id == script.id
+    ))).scalars().all()
+    assert rows == [], "a request body selected the fake provider"
+
+
+@pytest.mark.asyncio
+async def test_an_unconfigured_run_does_not_delete_existing_proposals(client, db, world):
+    """`replace_existing` must not take effect when nothing can replace them."""
+    script = await _script(db, world)
+    created = (await client.post(
+        f"/answer-scripts/{script.id}/regions",
+        json={"page_index": 0, "region_type": "table", "geometry_kind": "rect",
+              "geometry": _rect()},
+        headers=as_user(world["owner_prof"]),
+    )).json()
+
+    res = await client.post(
+        f"/answer-scripts/{script.id}/segmentation",
+        json={"page_index": 0, "page_count": 3, "replace_existing": True},
+        headers=as_user(world["owner_prof"]),
+    )
+    assert res.status_code == 503
+
+    db.expunge_all()
+    row = (await db.execute(select(DocumentRegion).where(
+        DocumentRegion.id == created["id"]
+    ))).scalars().first()
+    assert row is not None, "a refused segmentation run still deleted regions"
+
+
+# ---------------------------------------------------------------------------
 # persistence and the HTTP workflow
 # ---------------------------------------------------------------------------
 
@@ -395,12 +503,26 @@ async def _script(db, world, student=None):
     return found.scalars().first()
 
 
+@pytest.fixture
+def segmentation_configured(monkeypatch):
+    """Point the SEGMENTATION task at the deterministic double, explicitly.
+
+    This is the only way the fake becomes reachable: through the same
+    deployment configuration key an operator would use, named per test. No
+    request body can select it, and a test that forgets this fixture gets the
+    production answer -- 503 and nothing written -- rather than silently
+    exercising synthetic regions.
+    """
+    monkeypatch.setenv("CG_AI__SEGMENTATION__PROVIDER", "fake")
+    yield "fake"
+
+
 @pytest.mark.asyncio
-async def test_segmentation_persists_proposals_and_reports_rejections(client, db, world):
+async def test_segmentation_persists_proposals_and_reports_rejections(client, db, world, segmentation_configured):
     script = await _script(db, world)
     res = await client.post(
         f"/answer-scripts/{script.id}/segmentation",
-        json={"page_index": 2, "page_count": 3, "provider": "fake"},
+        json={"page_index": 2, "page_count": 3},
         headers=as_user(world["owner_prof"]),
     )
     assert res.status_code == 200, res.text
@@ -412,11 +534,11 @@ async def test_segmentation_persists_proposals_and_reports_rejections(client, db
 
 
 @pytest.mark.asyncio
-async def test_a_stored_region_round_trips_geometry_exactly(client, db, world):
+async def test_a_stored_region_round_trips_geometry_exactly(client, db, world, segmentation_configured):
     script = await _script(db, world)
     await client.post(
         f"/answer-scripts/{script.id}/segmentation",
-        json={"page_index": 0, "page_count": 3, "provider": "fake"},
+        json={"page_index": 0, "page_count": 3},
         headers=as_user(world["owner_prof"]),
     )
     res = await client.get(
@@ -432,12 +554,12 @@ async def test_a_stored_region_round_trips_geometry_exactly(client, db, world):
 
 
 @pytest.mark.asyncio
-async def test_regions_are_returned_in_page_then_reading_order(client, db, world):
+async def test_regions_are_returned_in_page_then_reading_order(client, db, world, segmentation_configured):
     script = await _script(db, world)
     for page in (1, 0):  # inserted out of order on purpose
         await client.post(
             f"/answer-scripts/{script.id}/segmentation",
-            json={"page_index": page, "page_count": 3, "provider": "fake"},
+            json={"page_index": page, "page_count": 3},
             headers=as_user(world["owner_prof"]),
         )
     res = await client.get(
@@ -481,11 +603,11 @@ async def test_a_human_region_with_bad_geometry_is_a_400(client, db, world):
 
 
 @pytest.mark.asyncio
-async def test_accepting_a_proposal_without_editing_marks_it_accepted(client, db, world):
+async def test_accepting_a_proposal_without_editing_marks_it_accepted(client, db, world, segmentation_configured):
     script = await _script(db, world)
     created = (await client.post(
         f"/answer-scripts/{script.id}/segmentation",
-        json={"page_index": 1, "page_count": 3, "provider": "fake"},
+        json={"page_index": 1, "page_count": 3},
         headers=as_user(world["owner_prof"]),
     )).json()["regions"][0]
 
@@ -498,12 +620,12 @@ async def test_accepting_a_proposal_without_editing_marks_it_accepted(client, db
 
 
 @pytest.mark.asyncio
-async def test_editing_a_proposal_marks_it_modified_automatically(client, db, world):
+async def test_editing_a_proposal_marks_it_modified_automatically(client, db, world, segmentation_configured):
     """The record of how good the model was must not depend on the client."""
     script = await _script(db, world)
     created = (await client.post(
         f"/answer-scripts/{script.id}/segmentation",
-        json={"page_index": 1, "page_count": 3, "provider": "fake"},
+        json={"page_index": 1, "page_count": 3},
         headers=as_user(world["owner_prof"]),
     )).json()["regions"][0]
 
@@ -519,11 +641,11 @@ async def test_editing_a_proposal_marks_it_modified_automatically(client, db, wo
 
 
 @pytest.mark.asyncio
-async def test_rejecting_a_proposal_keeps_it_as_a_record(client, db, world):
+async def test_rejecting_a_proposal_keeps_it_as_a_record(client, db, world, segmentation_configured):
     script = await _script(db, world)
     created = (await client.post(
         f"/answer-scripts/{script.id}/segmentation",
-        json={"page_index": 1, "page_count": 3, "provider": "fake"},
+        json={"page_index": 1, "page_count": 3},
         headers=as_user(world["owner_prof"]),
     )).json()["regions"][0]
 
@@ -559,12 +681,12 @@ async def test_deleting_a_human_region_removes_it(client, db, world):
 
 
 @pytest.mark.asyncio
-async def test_rerunning_segmentation_does_not_destroy_human_work(client, db, world):
+async def test_rerunning_segmentation_does_not_destroy_human_work(client, db, world, segmentation_configured):
     """A model re-run replaces its own untouched guesses and nothing else."""
     script = await _script(db, world)
     await client.post(
         f"/answer-scripts/{script.id}/segmentation",
-        json={"page_index": 1, "page_count": 3, "provider": "fake"},
+        json={"page_index": 1, "page_count": 3},
         headers=as_user(world["owner_prof"]),
     )
     human = (await client.post(
@@ -585,7 +707,7 @@ async def test_rerunning_segmentation_does_not_destroy_human_work(client, db, wo
 
     await client.post(
         f"/answer-scripts/{script.id}/segmentation",
-        json={"page_index": 1, "page_count": 3, "provider": "fake", "replace_existing": True},
+        json={"page_index": 1, "page_count": 3, "replace_existing": True},
         headers=as_user(world["owner_prof"]),
     )
 
@@ -599,11 +721,11 @@ async def test_rerunning_segmentation_does_not_destroy_human_work(client, db, wo
 
 
 @pytest.mark.asyncio
-async def test_reading_order_can_be_set_explicitly(client, db, world):
+async def test_reading_order_can_be_set_explicitly(client, db, world, segmentation_configured):
     script = await _script(db, world)
     created = (await client.post(
         f"/answer-scripts/{script.id}/segmentation",
-        json={"page_index": 0, "page_count": 3, "provider": "fake"},
+        json={"page_index": 0, "page_count": 3},
         headers=as_user(world["owner_prof"]),
     )).json()["regions"]
 
@@ -698,11 +820,11 @@ async def test_a_region_can_be_unassigned_then_assigned_then_unassigned(client, 
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_provider_metadata_is_recorded_without_touching_domain_fields(client, db, world):
+async def test_provider_metadata_is_recorded_without_touching_domain_fields(client, db, world, segmentation_configured):
     script = await _script(db, world)
     created = (await client.post(
         f"/answer-scripts/{script.id}/segmentation",
-        json={"page_index": 0, "page_count": 3, "provider": "fake"},
+        json={"page_index": 0, "page_count": 3},
         headers=as_user(world["owner_prof"]),
     )).json()["regions"]
 
@@ -713,11 +835,11 @@ async def test_provider_metadata_is_recorded_without_touching_domain_fields(clie
 
 
 @pytest.mark.asyncio
-async def test_no_raw_provider_response_is_persisted(client, db, world):
+async def test_no_raw_provider_response_is_persisted(client, db, world, segmentation_configured):
     script = await _script(db, world)
     await client.post(
         f"/answer-scripts/{script.id}/segmentation",
-        json={"page_index": 0, "page_count": 3, "provider": "fake"},
+        json={"page_index": 0, "page_count": 3},
         headers=as_user(world["owner_prof"]),
     )
     db.expunge_all()
@@ -764,23 +886,23 @@ async def test_a_student_may_not_annotate(client, db, world):
 
 
 @pytest.mark.asyncio
-async def test_a_student_may_not_request_segmentation(client, db, world):
+async def test_a_student_may_not_request_segmentation(client, db, world, segmentation_configured):
     script = await _script(db, world)
     res = await client.post(
         f"/answer-scripts/{script.id}/segmentation",
-        json={"page_index": 0, "page_count": 3, "provider": "fake"},
+        json={"page_index": 0, "page_count": 3},
         headers=as_user(world["student_a"]),
     )
     assert res.status_code == 403
 
 
 @pytest.mark.asyncio
-async def test_an_outsider_gets_nothing(client, db, world):
+async def test_an_outsider_gets_nothing(client, db, world, segmentation_configured):
     script = await _script(db, world)
     for method, url, payload in (
         ("get", f"/answer-scripts/{script.id}/regions", None),
         ("post", f"/answer-scripts/{script.id}/segmentation",
-         {"page_index": 0, "page_count": 3, "provider": "fake"}),
+         {"page_index": 0, "page_count": 3}),
     ):
         call = getattr(client, method)
         res = await (call(url, headers=as_user(world["outsider"])) if payload is None
