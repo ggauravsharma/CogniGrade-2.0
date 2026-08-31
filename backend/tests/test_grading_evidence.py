@@ -250,7 +250,7 @@ def test_reference_text_images_are_attached():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_student_files_never_reach_the_reference_slot(monkeypatch, tmp_path):
+async def test_student_files_never_reach_the_reference_slot(fake_provider, tmp_path):
     """End-to-end over the real handler with the uploader stubbed.
 
     Asserts on the actual `prompt_content` handed to the model: the reference
@@ -265,30 +265,7 @@ async def test_student_files_never_reach_the_reference_slot(monkeypatch, tmp_pat
     ms_path.write_bytes(b"ms")
     ans_path.write_bytes(b"ans")
 
-    uploaded = []
-
-    class FakeHandle:
-        def __init__(self, path):
-            self.name = f"files/{path.split('/')[-1].split(chr(92))[-1]}"
-            self.path = path
-
-        def __repr__(self):
-            return f"<FakeHandle {self.name}>"
-
-    def fake_upload(path=None, display_name=None, **kw):
-        uploaded.append(path)
-        return FakeHandle(path)
-
-    captured = {}
-
-    class FakeModel:
-        def generate_content(self, prompt_content, generation_config=None):
-            captured["prompt_content"] = prompt_content
-            captured["generation_config"] = generation_config
-            return SimpleNamespace(text='{"score": 5, "reason": "ok"}')
-
-    monkeypatch.setattr(geminiAPI.genai, "upload_file", fake_upload, raising=False)
-    monkeypatch.setattr(geminiAPI, "get_model", lambda: FakeModel())
+    provider = fake_provider(body='{"score": 5, "reason": "ok"}')
 
     question = make_question(ms_diagram=js(str(ms_path)))
     qr = make_response(answer_text="my answer", ans_diagram=js(str(ans_path)))
@@ -326,52 +303,43 @@ async def test_student_files_never_reach_the_reference_slot(monkeypatch, tmp_pat
         None,          # current_user None -> authorization handled by the caller
     )
 
-    parts = captured["prompt_content"]
-    handles = [p for p in parts if isinstance(p, FakeHandle)]
-    assert len(handles) == 2, f"expected one reference and one student file, got {handles}"
+    from backend.ai.contracts import FilePart, TextPart
+    from backend.ai.prompts.grading import (
+        REFERENCE_IMAGE_HEADING,
+        STUDENT_IMAGE_HEADING,
+    )
 
-    ref_marker = parts.index("[REFERENCE / MARKING SCHEME IMAGES]")
-    stu_marker = parts.index("[STUDENT ANSWER IMAGES]")
+    parts = provider.last_parts()
+    files = [p for p in parts if isinstance(p, FilePart)]
+    assert len(files) == 2, f"expected one reference and one student file, got {files}"
 
-    ref_handle = parts[ref_marker + 1]
-    stu_handle = parts[stu_marker + 1]
+    texts = [p.text if isinstance(p, TextPart) else None for p in parts]
+    ref_marker = texts.index(REFERENCE_IMAGE_HEADING)
+    stu_marker = texts.index(STUDENT_IMAGE_HEADING)
 
-    assert ref_handle.path == str(ms_path), "reference slot must hold the marking-scheme image"
-    assert stu_handle.path == str(ans_path), "student slot must hold the student image"
-    assert ref_handle.path != str(ans_path), (
+    ref_file = parts[ref_marker + 1]
+    stu_file = parts[stu_marker + 1]
+
+    assert ref_file.path == str(ms_path), "reference slot must hold the marking-scheme image"
+    assert stu_file.path == str(ans_path), "student slot must hold the student image"
+    assert ref_file.path != str(ans_path), (
         "REGRESSION: the student's image reached the marking-scheme slot"
     )
     assert ref_marker < stu_marker, "reference material must precede student evidence"
-    assert sorted(uploaded) == sorted([str(ms_path), str(ans_path)]), (
-        "each image must be uploaded exactly once"
+    assert sorted(provider.last_paths()) == sorted([str(ms_path), str(ans_path)]), (
+        "each image must appear exactly once"
     )
 
 
 @pytest.mark.asyncio
-async def test_missing_reference_leaves_reference_slot_absent(monkeypatch, tmp_path):
+async def test_missing_reference_leaves_reference_slot_absent(fake_provider, tmp_path):
     """With no marking-scheme image, no reference image section may appear."""
     from backend.routers import geminiAPI
 
     ans_path = tmp_path / "ans_only.png"
     ans_path.write_bytes(b"ans")
 
-    class FakeHandle:
-        def __init__(self, path):
-            self.path = path
-
-    monkeypatch.setattr(geminiAPI.genai, "upload_file",
-                        lambda path=None, display_name=None, **kw: FakeHandle(path),
-                        raising=False)
-
-    captured = {}
-
-    class FakeModel:
-        def generate_content(self, prompt_content, generation_config=None):
-            captured["prompt_content"] = prompt_content
-            captured["generation_config"] = generation_config
-            return SimpleNamespace(text='{"score": 1, "reason": "ok"}')
-
-    monkeypatch.setattr(geminiAPI, "get_model", lambda: FakeModel())
+    provider = fake_provider(body='{"score": 1, "reason": "ok"}')
 
     question = make_question()                      # no reference images
     qr = make_response(answer_text="a", ans_diagram=js(str(ans_path)))
@@ -404,9 +372,10 @@ async def test_missing_reference_leaves_reference_slot_absent(monkeypatch, tmp_p
         None,
     )
 
-    parts = captured["prompt_content"]
-    assert "[REFERENCE / MARKING SCHEME IMAGES]" not in parts, (
+    from backend.ai.prompts.grading import REFERENCE_IMAGE_HEADING
+
+    assert REFERENCE_IMAGE_HEADING not in provider.last_texts(), (
         "no reference image section may be emitted when there is no reference image"
     )
-    handles = [p for p in parts if isinstance(p, FakeHandle)]
-    assert len(handles) == 1 and handles[0].path == str(ans_path)
+    paths = provider.last_paths()
+    assert paths == [str(ans_path)]

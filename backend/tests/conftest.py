@@ -88,9 +88,15 @@ def _stub_generativeai_if_absent() -> bool:
             "The authorization test suite must never upload to Gemini."
         )
 
+    def _delete_file(*a, **kw):
+        raise AssertionError(
+            "The authorization test suite must never call Gemini file deletion."
+        )
+
     genai.configure = _configure
     genai.GenerativeModel = _StubModel
     genai.upload_file = _upload_file
+    genai.delete_file = _delete_file
 
     try:
         import google as _google
@@ -307,6 +313,80 @@ async def client(session_factory, world):
     transport = ASGITransport(app=app, raise_app_exceptions=False)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
+
+
+class RecordingProvider:
+    """A `TextTaskProvider` that records requests instead of calling anything.
+
+    Stubbing HERE rather than at the SDK exercises the whole real stack --
+    prompt building, request assembly, part ordering, retry, telemetry -- and
+    only replaces the vendor call itself. That is strictly more coverage than
+    the SDK-level stubs it replaced, and it is provider-neutral, so these tests
+    keep working when the provider does not.
+    """
+
+    name = "gemini"
+
+    def __init__(self, *, body="", error=None, errors=None):
+        self.body = body
+        #: A single error to raise every time, or a list consumed per attempt.
+        self.error = error
+        self.errors = list(errors) if errors else None
+        self.requests = []
+        self.settings = []
+
+    async def run_text_task(self, request, settings, *, timeout_seconds=None):
+        from backend.ai.contracts import ProviderResponse
+
+        self.requests.append(request)
+        self.settings.append(settings)
+
+        if self.errors is not None:
+            if self.errors:
+                nxt = self.errors.pop(0)
+                if nxt is not None:
+                    raise nxt
+        elif self.error is not None:
+            raise self.error
+
+        body = self.body(request) if callable(self.body) else self.body
+        return ProviderResponse(
+            text=body, provider=self.name, model=settings.model,
+            task=request.task, prompt_version=request.prompt_version,
+        )
+
+    # convenience for assertions -------------------------------------------
+    @property
+    def last_request(self):
+        assert self.requests, "the provider was never called"
+        return self.requests[-1]
+
+    def last_parts(self):
+        return list(self.last_request.parts)
+
+    def last_texts(self):
+        from backend.ai.contracts import TextPart
+
+        return [p.text for p in self.last_request.parts if isinstance(p, TextPart)]
+
+    def last_paths(self):
+        from backend.ai.contracts import FilePart
+
+        return [p.path for p in self.last_request.parts if isinstance(p, FilePart)]
+
+
+@pytest.fixture
+def fake_provider(monkeypatch):
+    """Install a `RecordingProvider` under the name every task is configured with."""
+    from backend.ai import providers
+
+    def _install(**kwargs):
+        provider = RecordingProvider(**kwargs)
+        providers.register_provider(provider.name, provider)
+        return provider
+
+    yield _install
+    providers.reset_providers()
 
 
 def as_user(user) -> dict:

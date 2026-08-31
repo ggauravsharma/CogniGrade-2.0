@@ -401,6 +401,109 @@ unawaited `AsyncSession` calls (`delete`/`commit`/`rollback`/`execute`/
   the previous handler; the three that passed only assert the response shape,
   which was never the broken part.
 
+### AI Platform Foundation v1 — DONE
+A provider-neutral service boundary, and Gemini made operationally safe.
+
+`geminiAPI.py` held the SDK, the API keys, the model objects, five upload call
+sites, every prompt, the generation config, the parsing and the orchestration.
+Replacing Gemini meant rewriting a router.
+
+**The new shape.**
+
+```
+route / orchestration
+        ↓  backend/ai/services.py      task-shaped, provider-neutral
+        ↓  backend/ai/contracts.py     ProviderRequest / ProviderResponse
+        ↓  backend/ai/providers/       one adapter per provider
+     Gemini today
+```
+
+Only `backend/ai/providers/` may import a vendor SDK. Asserted by a test that
+walks every module in `backend/ai/` and every router.
+
+**Five tasks, named** (`AITask`): `document_extraction`, `label_extraction`,
+`answer_recognition`, `marking_scheme_recognition`, `grading`. Not a generic
+`generate(prompt)` — the task name is what configuration, model selection,
+prompt versioning and telemetry are keyed by. Deliberately the current five;
+`SEGMENTATION`, `STRUCTURE`, `VERIFICATION` arrive when they become real.
+
+**Configuration is per task**, environment only, no DB:
+`CG_AI__<TASK>__MODEL`, `__TIMEOUT_SECONDS`, `__MAX_RETRIES`, `__PROVIDER`,
+`__TEMPERATURE`, with a `CG_AI__<FIELD>` global fallback. All five tasks point
+at `gemini-2.0-flash` today, unchanged — moving the model is a benchmarking
+decision, not a refactor. A malformed override falls back to the default rather
+than taking grading down.
+
+**Retry** (`backend/ai/retry.py`): bounded, full-jitter exponential backoff,
+per-step ceiling. Retryability is declared on the error CLASS, so it is decided
+once. Retried: rate limit, temporary, timeout. Never retried: authentication,
+invalid request, unusable response. Default 2 retries (3 attempts).
+
+**Timeout:** `request_options={"timeout": N}` is passed to `generate_content`,
+with a `TypeError` fallback for SDKs that reject it, wrapped in
+`asyncio.wait_for(budget + 5)` as a backstop. Honest limitation: the wait_for
+releases the caller but cannot kill the worker thread, and `upload_file` in
+0.8.4 takes no deadline of its own.
+
+**File lifecycle — the leak is closed.** `upload_file` had five call sites and
+`delete_file` none, so every graded diagram question left provider files behind
+forever. Uploads now happen only inside the adapter, and deletion is in a
+`finally`: it runs on success, on provider failure and on timeout. Cleanup
+failure is logged and swallowed — losing a remote temp file must never destroy
+a grade that was produced. Local files are never touched. Within one call each
+DISTINCT path uploads once (dedup by resolved path, so it can never make one
+C1 image side stand in for the other).
+
+**Error taxonomy** (`backend/ai/errors.py`): `ProviderRateLimitError`,
+`ProviderTemporaryError`, `ProviderTimeoutError`, `ProviderAuthenticationError`,
+`ProviderInvalidRequestError`, `ProviderResponseError`. SDK exceptions are
+classified by type name and message text rather than by importing
+`google.api_core`, whose classes move between versions. An unrecognised failure
+is treated as temporary — a bounded retry is cheaper than failing a whole exam
+on one odd transport error. A provider failure now reaches the grading route as
+a `grading_failed` with the CATEGORY as its `grading_error_code`, so Reliability
+v1's failure visibility now covers transport failures too, not just validation
+ones.
+
+**Prompts** moved to `backend/ai/prompts/` under versions (`grading/v1`,
+`answer_recognition/v1`, ...). Wording is verbatim — this phase is architecture,
+and rewording a grading prompt changes marks. The version travels into telemetry
+so a later experiment log can say which prompt produced a result.
+
+**Ordered prompt parts.** `ProviderRequest.parts` interleaves `TextPart` and
+`FilePart`. Diagram grading positions the marking-scheme images immediately
+after the marking-scheme text and the student's images immediately after the
+student's answer; flattening to "all files then all text" would change what the
+model is asked. The adapter preserves order exactly (tested).
+
+**Telemetry** (`backend/ai/telemetry.py`): one structured line per invocation —
+task, provider, model, prompt_version, duration_ms, attempts, success,
+error_category, file count, exam/student/question ids. Never the key, the
+student's answer, the marking scheme, file contents or the raw response;
+asserted by a test.
+
+**API keys — the rotation was a no-op.** `genai.configure()` sets a
+MODULE-GLOBAL key and `GenerativeModel` resolves one at call time, so every
+model in the old list used whichever key was configured LAST and `get_model()`
+rotating every 15 calls rotated nothing. The adapter now uses ONE key (the
+first) and warns loudly when more are configured. Behaviour change: the key in
+use moves from last to first. Real rotation needs per-call client binding,
+which the legacy SDK does not offer cleanly.
+
+**Concurrency-ready.** The module-global `call_count` guarded by a threading
+lock AND an asyncio lock is gone. No shared mutable per-request state remains,
+so the later bounded-concurrency phase has nothing to unpick.
+
+**SDK unchanged.** Still `google-generativeai==0.8.4`. Nothing in this phase
+required migrating to `google-genai`, and the adapter now makes that migration
+a single-file change. What would justify it: a real request deadline on uploads,
+and per-call client binding for genuine key rotation.
+
+- 402 tests (339 + 63). The nine pre-existing grading tests were rewired from
+  SDK-level stubs to a recording PROVIDER, which exercises strictly more real
+  code (prompt building, request assembly, retry, telemetry) and keeps working
+  when the provider does not.
+
 ---
 
 ## Authorization model
@@ -462,10 +565,17 @@ been removed from this list.
   `peopleManagement.remove_student` allowed it (`require_owner=False`); the
   live `enrollments.remove_student` is owner-only and always has been. Nothing
   changed — but if TAs should have this, decide it deliberately.
-- Still open in the grading path: grading is serial, one provider call per
-  question; uploaded Gemini files are never deleted (`upload_file` used,
-  `delete_file` never) — a diagram/table call uploads reference + student
-  images per question and none are cleaned up.
+- **Grading is still serial**, one provider call per question. The AI boundary
+  is now compatible with bounded concurrency (no global mutable call state) but
+  nothing drives it yet. (Provider file cleanup — the other half of this entry —
+  was fixed in AI Platform Foundation v1.)
+- **Remaining AI coupling:** the router still owns question-label parsing,
+  batching (chunks of 5) and marking-scheme key mapping — orchestration that a
+  later phase should move behind the service layer. Two commented-out legacy
+  blocks in `geminiAPI.py` still mention the SDK.
+- **`process_marking_scheme_text_image` is still unexercised end to end.** It
+  no longer crashes on entry (Reliability v1) and now runs through the service
+  layer, but proving it needs a live provider call.
 - `tasks.py` advances the exam to stage 7 after grading regardless of outcome.
   That is correct as it stands — stage 7 is "grading started", an exam-wide
   workflow marker, and result release is gated per student by
@@ -492,7 +602,7 @@ authorization rather than token signing. The Gemini SDK is stubbed only when the
 real package is absent, and the stub raises if any test reaches a model.
 
 ```
-.venv-test/Scripts/python.exe -m pytest -q      # 339 passed
+.venv-test/Scripts/python.exe -m pytest -q      # 402 passed
 ```
 
 SQLite now enforces foreign keys (see Reliability v2), so cascade behaviour in
@@ -618,12 +728,17 @@ rectification for photographed sheets). Their `results/` and
 
 ## Next approved phase
 
-Not yet approved. Recommended next: **decide and implement the data-retention
-policy for account deletion.** The mechanism is now correct, but the policy it
-executes is whatever the schema happens to say, and what it says is severe: a
-professor deleting their account erases their classrooms and every student's
-exam results inside them. That is very likely not what an institution wants, and
-it is the kind of thing discovered only after it happens. The work is a decision
-first (what must outlive an account — results, submissions, announcements?),
-then `ON DELETE SET NULL` migrations plus nullable author columns for whatever
-survives.
+Not yet approved. Recommended next: **bounded concurrency for exam grading.**
+`grade_exam_logic` still awaits one provider call per question in a loop, so a
+40-question paper is 40 sequential round trips and a class of 60 is an
+afternoon. Everything that blocked this is now gone — no module-global call
+counter, no shared client state, retries and timeouts are per call, and provider
+files are cleaned up per invocation — so the work is a bounded `asyncio`
+gather with a semaphore whose width is configurable per task, plus deciding what
+a partial failure means for the exam result (C6 already answers that at the
+persistence layer).
+
+Still open as policy, deliberately untouched: account deletion cascades through
+institutional academic data (a professor deleting their account erases their
+classrooms and every student's results), and the repository tracks real
+profile-picture files. Both are recorded above; neither belongs in an AI phase.

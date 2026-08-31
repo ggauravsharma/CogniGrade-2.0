@@ -1,18 +1,14 @@
 import os
 import uuid
-import io
-from typing import List, Optional, Dict
+from typing import List, Optional
 import logging
 import asyncio
-import threading
 import json
 import re
 import aiofiles  # Added for async file operations
 
-import google.generativeai as genai
 from fastapi import APIRouter, File, UploadFile, Depends, HTTPException, Form
-from fastapi.responses import JSONResponse, RedirectResponse
-from PIL import Image
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
@@ -21,60 +17,35 @@ from backend.models.files import AnswerScript, Material, FileTypeEnum
 from backend.models.users import User
 from backend.utils.security import get_current_user_required
 from backend.models.tables import QuestionResponse, Question
+from backend.ai import services as ai_services
+from backend.ai.contracts import FilePart, TextPart
+from backend.ai.errors import ProviderError
+from backend.ai.prompts.grading import (
+    REFERENCE_IMAGE_HEADING,
+    STUDENT_IMAGE_HEADING,
+)
 from backend.grading.evidence import build_grading_evidence
 from backend.grading.failure import UNEXPECTED_ERROR
-from backend.grading.result import (
-    GradingResponseError,
-    output_instruction,
-    parse_grading_response,
-)
+from backend.grading.result import GradingResponseError, output_instruction
 from backend.auth.policies import (
     ExamContext,
     assert_exam_manager,
     require_exam_manager,
 )
 
-api_keys = []
-i = 1
-while True:
-    key = os.getenv(f"GEMINI_API_KEY_{i}")
-    if not key:
-        break
-    api_keys.append(key)
-    i += 1
-
-if not api_keys:
-    raise RuntimeError("No GEMINI_API_KEY_X environment variables found.")
-
-model_name = "gemini-2.0-flash"
-models = []
-for key in api_keys:
-    genai.configure(api_key=key)
-    models.append(genai.GenerativeModel(model_name))
-
-call_count = 0
-call_lock = threading.Lock()
-async_call_lock = asyncio.Lock()
-calls_per_key = 15
-
-def get_model():
-    """Return the appropriate model instance based on a global call counter.
-    
-    The models are rotated every 'calls_per_key' calls.
-    Thread-safe and asyncio-safe.
-    """
-    global call_count
-    with call_lock:
-        call_count += 1
-        index = ((call_count - 1) // calls_per_key) % len(models)
-        print(f"Number of calls: {call_count}")
-        if (call_count - 1) % calls_per_key == 0:
-            print(f"Switching to model {index}")
-        return models[index]
-
-async def get_model_async():
-    async with async_call_lock:
-        return get_model()
+# The Gemini SDK, the API keys and the model objects now live in
+# backend/ai/providers/gemini.py. What stood here was:
+#
+#   * a module-global `genai.configure()` loop whose "rotation" was a no-op --
+#     configure() sets a MODULE-GLOBAL key, so every model in the list used
+#     whichever key was configured LAST;
+#   * a global mutable `call_count` guarded by a threading lock AND an asyncio
+#     lock, which is exactly the shared request state that would have to be
+#     unpicked before grading could run concurrently;
+#   * a hardcoded model name, so no task could be pointed at a different model.
+#
+# This module now asks `backend.ai.services` for a task and gets a domain value
+# back. It never sees a model, a key or a provider file handle.
 
 UPLOAD_DIRECTORY = "./uploads"
 os.makedirs(UPLOAD_DIRECTORY, exist_ok=True)
@@ -169,135 +140,10 @@ async def upload_and_extract(
             logger.info(f"Uploading {file.filename} to Gemini...")
 
             print(leaf_labels)
-            sample_file = await asyncio.to_thread(genai.upload_file, path=file_location, display_name=file.filename)
 
-            if file_type_enum == FileTypeEnum.question_paper:
-                logger.info("Question Paper detected.")
-#                 prompt = """
-# Task: Extract the printed questions from the provided document. Also, label each extracted question with its maximum marks if mentioned.
-
-# Instructions:
-# 1. Ensure that every complete printed question present in the document is extracted.
-# 2. Question Labeling:
-#     - Question Labeling: Label as "Question Number - X Max Marks - Y" (visible) or "Question Number - [X] Max Marks - Y" (unclear/absent/expected), where X is the Question Number, and Y is the marks for that question. For subparts, label as "Question Number - X(subpart)". Extract all answers even with duplicate question numbers.
-#     Example - "Question Number - 1(a) Max Marks - 10" if a question is labelled as 1 and has a subpart (a), and maximum marks of 10.
-    
-#     - Two or more questions can have the same Question Number, extract as is, do not skip any question.
-#     (a) Part 1...
-#     (b) Part 2..." and so on.
-
-# 3. Max marks for any question can be inferred by looking up the marks distribution scheme in the instructions section of the question paper, or if explicitly mentioned beside the question)
-# 4. After the Question Labels, the actual question text should be extracted.
-# 5. If the document contains both printed questions and handwritten answers, focus solely on extracting the printed questions.
-# 6. Do not extract any printed text that is not part of any question (e.g., instructions, headings, page numbers).
-# """
-                prompt = f"""You are given a document containing printed exam questions and a list of reference labels
-{leaf_labels}
-- each in the form Question.Part.Subpart. Your job is to extract every question (and its sub-parts) matching these labels, preserving all formatting, layout cues, and any mark allocations.
-
-Extraction Task
-
-1) Locate each question (and sub-part) in the document by matching against the given labels as closely as possible.
-2) Preserve verbatim: spacing, bullets, numbering style, arrows, algebraic notation, code blocks, annotations, and any explicit mark numbers.
-3) Skip any strikethrough or scribbled-out text. Ignore non-question text (headings, page numbers, general instructions).
-4) If the document contains both printed questions and handwritten answers, focus solely on extracting the printed questions.
-5) Give output in Markdown Format, do not use JSON formatting.
-
-Output Structure
----
-For each top-level question Q:
-    Question Number - Q
-
-If Q has parts, nest them under Q:
-    Part Q.a  (Add Partial Marks - m if available)
-    <exact text of sub-question a>
-    Part Q.b  (Add Partial Marks - n if available)
-    <exact text of sub-question b>
-    ...
----
-"""
-            elif file_type_enum == FileTypeEnum.answer_sheet:
-                prompt = """
-Task: Your only job is to extract the handwritten answer sections(messy handwriting, handwritten code possible) written by a student, preserving formatting, layout, code spacing, arrows, bullet points, and linking annotations.
-Do not correct student's answer. Don't change the student's answer at all. Do not answer the question yourself.
-Instructions:
-1. **Extract All Answers:** Ensure every complete handwritten answer is extracted. Very importantly, do not yourself correct any question.
-2. Question Labeling: Label as "Question Number - X" (visible) or "Question Number - [X]" (unclear/absent/expected), where X is the Question Number. For subparts, label as "Question Number - X(subpart)". Extract all answers even with duplicate question numbers.
-Example - "Question Number - 1(a)" if a question is labelled as 1 and has a subpart (a).
-3. **Completion Questions:**
-    - **Identify Initial Part:** For completion questions ("Complete...", "Fill in..."), find the provided initial answer. Look for three dots "...", blanks "___" or other visual cues.
-    - **Concatenate:** Combine the initial part with the student's completion, preserving formatting.
-4. **Differentiate Answers:** Use cues like "Answer :" etc, spatial separation, or box regions to identify answer sections.
-5. **Formatting:** You may rearrange, reformat the response if the question explicitly states so. But do not correct any incorrect content in the answer. Otherwise preserve the structure as present in the student's answer.
-6. **Ignore Struck-Out/Scribbled Content:** omit any word or line that is strikethrough or scribbled out from the extracted answer.
-7. **Ignore Irrelevant Text:** Extract only student answers, not instructions, headings, etc.
-8. Recheck the extracted answer to ensure it is the exact same as the student's answer, and that it is not missing any part of the answer. If you find any missing part, add it to the extracted answer.
-9. In case of any objective question, look for ticks or circles marking the selected option, which should be then extracted.
-10. Pay attention to boxes, lines, etc while formatting handwritten answer.
-11. Give output in Markdown Format, do not use JSON formatting.
-"""
-            elif file_type_enum in [FileTypeEnum.solution_script, FileTypeEnum.marking_scheme]:
-#                 prompt = """
-# Task: Extract solution/marking scheme sections with associated marks, preserving formatting, layout, code spacing, arrows, bullet points, and linking annotations.
-
-# Context: Analyze solution scripts or marking schemes (handwritten possible). Sections may include question numbers, or full question texts also, along with mark allocations. Extract all solutions/marking points and their marks, handling non-sequential links and specific format instructions.
-
-# Instructions:
-
-# 1. **Extract All with Marks:** Extract every complete solution/marking point. If marks are explicitly mentioned for any part, extract that mark information and associate it. Review layout to ensure all sections and their marks are captured and correctly labeled.
-
-# 2. **Understand Question Context:** Read the question number or full question alongside each solution. Understand the context and any format instructions within the question to guide extraction.
-
-# 3. **Labeling (Including Marks):**
-#     - Label with "Question Number - X" if clear, where X is the Question Number.
-#     - Label with "Question Number - [X]" if unclear or absent, where X is the Question Number.
-#     - Two or more questions can have the same Question Number, extract as is, do not skip any question's answer.
-# 4. **Differentiate and Associate Marks:** Use spatial cues and markers to identify distinct solution sections and their corresponding marks.
-
-# 5. **Formatting:** Preserve original structure and formatting, including mark placements. Do not correct content.
-
-# 6. **Ignore Struck-Out Content:** omit any strikethrough or scribbled content, including marks.
-
-# 7. **Ignore Irrelevant Text:** Extract only solution content and associated marks directly related to questions.
-# """
-                prompt = f"""You are given a marking scheme/solution script from which you have to extract text.
-                The structure of the marking scheme should roughly follow the following questions and parts hierarchy:
-{leaf_labels}
-
-The labels are given in the format Question.Part.Subpart, that is, the parent questions are separated from their children by points '.'. 
-
-Task:
-  Using these given labels as reference, locate and extract the solution or marking-scheme section—complete with its mark allocation, as well as possile. Preserve:
-  - original formatting (spacing, bullets, arrows, code blocks, annotations)
-  - layout and spatial cues
-  - any explicit mark numbers
-
-Extraction Instructions:
-1. Group Question.parts under a single Question
-2. If marks are mentioned, capture them and associate them with the exact text.
-3. Retain any question number you see (e.g. “Question Number - X”).
-4. Do not alter content—no corrections, just copy formatting verbatim.
-5. Skip any strikethrough or scribbled-out text (and their marks).
-6. Ignore any extraneous text not directly part of a solution or its marks.
-7. Focus solely on extracting the marking-scheme/solutions. Do not extract any question text even if it is present in the document.
-8. Give output in Markdown Format, do not use JSON formatting.
-
-Output format for each extracted question:
----
-For each top-level question Q:
-    Question Number - Q  Max Marks - M
-If Q has parts, nest them under Q:
-    Part Q.a  (Add Partial Marks - m if available)
-    <exact text of sub-question a>
-    Part Q.b  (Add Partial Marks - n if available)
-    <exact text of sub-question b>
-    ...
----
-
-"""
-            model = get_model()
-            response = await asyncio.to_thread(model.generate_content, (sample_file, prompt))
-            extracted_text = response.text if response.text else "No text extracted."
+            extracted_text = await ai_services.extract_document_text(
+                file_location, leaf_labels=leaf_labels, exam_id=exam_id
+            ) or "No text extracted."
             
             if existing:
                 existing.extracted_text = extracted_text
@@ -363,27 +209,8 @@ async def extract_question_labels(
             content = await file.read()
             await f.write(content)
 
-        ai_file = await asyncio.to_thread(genai.upload_file, path=file_path, display_name=file.filename)
 
-        prompt = """
-Extract every question label from the paper in the form Question_Number.Part.Subpart (any depth), 
-that is, parent questions are separated from their children by points '.'. There may be multiple levels of hierarchy.
-For each top-level question (no dots), also extract its maximum marks as 'Max Marks - X'.
-Do not attach marks to any sub-parts. Extract only numeric value of the Question Number, for example Q1 should be extracted as 1.
-
-Example output:
-1 - Max Marks - 6
-1.1
-1.1.a
-1.2
-2 - Max Marks - 5
-2.1
-2.1.a
-2.1.b
-"""
-        model = get_model()
-        resp = await asyncio.to_thread(model.generate_content, (ai_file, prompt))
-        text = resp.text.strip() or ""
+        text = (await ai_services.extract_question_labels(file_path, exam_id=exam_id)).strip()
 
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         raw_labels = []
@@ -536,51 +363,6 @@ Example output:
 # (or raise GradingResponseError). No caller re-implements parsing, so the two
 # grading routes and re-evaluation cannot drift apart again.
 
-# Ask the provider for a bare JSON body. Only the mime type is requested, not
-# an SDK-specific Schema object: the pinned google-generativeai 0.8.4 accepts
-# response_mime_type as a plain string, whereas response_schema expects an
-# SDK-specific type whose exact form varies by version. The decoder in
-# backend/grading/result.py is strict about the JSON it gets but tolerant about
-# wrapping, so a provider that ignores the mime-type hint still yields either a
-# valid result or an explicit failure -- never a silent None.
-GRADING_GENERATION_CONFIG = {
-    "response_mime_type": "application/json",
-    "temperature": 0,
-}
-
-
-def _provider_response_text(response) -> str:
-    """Read the text body defensively.
-
-    `response.text` raises on a blocked or empty candidate rather than
-    returning None, and the previous code did `"Grade:" in result_text`
-    directly, turning that into an opaque 500.
-    """
-    try:
-        text = response.text
-    except Exception as exc:  # noqa: BLE001 - provider raises assorted types
-        raise GradingResponseError(
-            "empty_response", f"provider returned no usable text: {exc}"
-        )
-    return text or ""
-
-
-async def _grade_with_provider(prompt_content, *, max_marks):
-    """Run one grading call and validate the response.
-
-    Returns (GradingResult, raw_text). Raises GradingResponseError if the
-    response cannot be validated.
-    """
-    model = get_model()
-    response = await asyncio.to_thread(
-        model.generate_content,
-        prompt_content,
-        generation_config=GRADING_GENERATION_CONFIG,
-    )
-    raw_text = _provider_response_text(response)
-    return parse_grading_response(raw_text, max_marks=max_marks), raw_text
-
-
 async def _persist_and_report(
     *, db, question_id, student_id, exam_id, result, raw_text
 ):
@@ -689,46 +471,40 @@ async def grade_question(
         if not question:
             raise HTTPException(status_code=404, detail="Question not found.")
         
-        if marking_scheme and ideal_answer:
-            prompt = f"""Question: {question.text}
-
-This is the correct marking scheme: {marking_scheme}
-
-Ideal Answer: {ideal_answer}
-
-Based on these, grade the following student answer: {student_answer}
-
-If the marking scheme doesn't specify mark distribution, grade proportionally based on the level of correctness—giving higher marks for more accurate and complete answers, and lower marks for partially correct or incomplete ones. Don't be too strict, nor too lenient.
-
-Maximum Marks Possible: {question.max_marks}.
-{output_instruction(question.max_marks)}"""
-        elif marking_scheme:
-            prompt = f"""Question: {question.text}
-
-This is the correct marking scheme: {marking_scheme}
-
-Grade the following student answer: {student_answer}
-
-If the marking scheme doesn't specify mark distribution, grade proportionally based on the level of correctness—giving higher marks for more accurate and complete answers, and lower marks for partially correct or incomplete ones. Don't be too strict, nor too lenient.
-
-Maximum Marks Possible: {question.max_marks}.
-{output_instruction(question.max_marks)}"""
-        elif ideal_answer:
-            prompt = f"""Question: {question.text}
-
-Ideal Answer: {ideal_answer}
-
-Grade the following student answer: {student_answer}
-
-Grade proportionally based on the level of correctness—giving higher marks for more accurate and complete answers, and lower marks for partially correct or incomplete ones. Don't be too strict, nor too lenient.
-
-Maximum Marks Possible: {question.max_marks}.
-{output_instruction(question.max_marks)}"""
-        
+        # The prompt itself is built by backend/ai/prompts/grading.py; three
+        # near-identical copies used to be assembled here inline.
         try:
-            result, raw_text = await _grade_with_provider(
-                prompt, max_marks=question.max_marks
+            result, raw_text = await ai_services.grade_answer(
+                question_text=question.text,
+                student_answer=student_answer,
+                max_marks=question.max_marks,
+                marking_scheme=marking_scheme,
+                ideal_answer=ideal_answer,
+                exam_id=exam_id,
+                student_id=student_id,
+                question_id=question_id,
             )
+        except ProviderError as exc:
+            # The call itself failed -- transport, quota, timeout. That is not
+            # a validation failure and emphatically not a zero: record the
+            # provider-neutral category as the failure code and report it in
+            # the same explicit shape.
+            await _record_grading_failure(
+                db, question_id=question_id, student_id=student_id,
+                error_code=exc.category,
+            )
+            logger.error(
+                "grading call failed: category=%s question_id=%s student_id=%s",
+                exc.category, question_id, student_id,
+            )
+            return {
+                "status": "grading_failed",
+                "grade": None,
+                "reasoning": None,
+                "error_code": exc.category,
+                "error": "the grading service could not be reached",
+                "raw_response": None,
+            }
         except GradingResponseError as exc:
             # An unparseable provider response is a FAILURE, never a zero.
             await _record_grading_failure(
@@ -809,55 +585,22 @@ async def grade_question_with_diagram(
         if not evidence.has_student_evidence:
             raise HTTPException(status_code=400, detail="Missing required parameters. Provide student_answer and at least one of ideal_answer or marking_scheme.")
 
-        async def _upload_one(path: str):
-            """Upload one local image. Returns (path, handle), or None on failure."""
-            try:
-                uploaded_file = await asyncio.to_thread(
-                    genai.upload_file,
-                    path=path,
-                    display_name=os.path.basename(path)
-                )
-                return path, uploaded_file
-            except Exception as e:
-                # `path` is a string. The previous handler indexed it as
-                # entry['img_path'], which raised inside the error handler and
-                # masked the original upload failure.
-                logger.error("Error uploading file %s: %s", path, e, exc_info=True)
-                return None
-
-        async def upload_all(paths):
-            """Upload a list of paths, preserving order and dropping failures."""
-            if not paths:
-                return []
-            results = await asyncio.gather(
-                *(_upload_one(p) for p in paths), return_exceptions=True
-            )
-            handles = []
-            for item in results:
-                # gather(return_exceptions=True) can yield an Exception, and
-                # _upload_one can yield None. The previous code unpacked every
-                # result blindly and raised TypeError on either.
-                if isinstance(item, BaseException) or item is None:
-                    continue
-                handles.append(item)
-            return handles
-
-        # Two independent upload batches. They are never combined.
-        reference_uploads = await upload_all(evidence.reference_images.all_paths)
-        student_uploads = await upload_all(evidence.student_images.all_paths)
-
-        reference_files = [f for (_, f) in reference_uploads]
-        student_files = [f for (_, f) in student_uploads]
+        # Two independent LISTS OF PATHS. They are never combined, and the
+        # route no longer holds a provider file handle at all -- uploading,
+        # deduplicating and deleting them is the adapter's job, which is what
+        # finally gives the uploads a guaranteed cleanup path.
+        reference_files = [FilePart(p) for p in evidence.reference_images.all_paths if p]
+        student_files = [FilePart(p) for p in evidence.student_images.all_paths if p]
 
         # Labels are attached only when files are present, so an absent
         # marking-scheme image costs no extra tokens and, critically, is never
         # back-filled with the student's own image.
         reference_parts = (
-            ["[REFERENCE / MARKING SCHEME IMAGES]"] + reference_files
+            [TextPart(REFERENCE_IMAGE_HEADING)] + reference_files
             if reference_files else []
         )
         student_parts = (
-            ["[STUDENT ANSWER IMAGES]"] + student_files
+            [TextPart(STUDENT_IMAGE_HEADING)] + student_files
             if student_files else []
         )
         # Presence and wording now come from the evidence structure itself,
@@ -870,55 +613,80 @@ async def grade_question_with_diagram(
         ans_attached = evidence.student_images.descriptor()
 
         if (marking_scheme or ms_image_present) and ideal_answer:
-            prompt_content = [f"""Question: {question.text}
+            prompt_content = [TextPart(f"""Question: {question.text}
 
-This is the correct marking scheme: {f'{marking_scheme}, with' if marking_scheme else "look at"} {f" the attached {ms_attached}" if ms_image_present else ""}"""] + reference_parts + [f"""
+This is the correct marking scheme: {f'{marking_scheme}, with' if marking_scheme else "look at"} {f" the attached {ms_attached}" if ms_image_present else ""}""")] + reference_parts + [TextPart(f"""
 
 Ideal Answer: {ideal_answer}
 
-Grade the following student answer: {f'{student_answer}, with' if student_answer else "look at"} {f" the attached {ans_attached}" if ans_image_present else ""}"""] + student_parts + [f"""
+Grade the following student answer: {f'{student_answer}, with' if student_answer else "look at"} {f" the attached {ans_attached}" if ans_image_present else ""}""")] + student_parts + [TextPart(f"""
 
 If the marking scheme doesn't specify mark distribution, grade proportionally based on the level of correctness—giving higher marks for more accurate and complete answers, and lower marks for partially correct or incomplete ones. Don't be too strict, nor too lenient.
 
 Maximum Marks Possible: {question.max_marks}.
-{output_instruction(question.max_marks)}"""]
+{output_instruction(question.max_marks)}""")]
         elif (marking_scheme or ms_image_present):
-            prompt_content = [f"""Question: {question.text}
+            prompt_content = [TextPart(f"""Question: {question.text}
 
-This is the correct marking scheme: {f'{marking_scheme}, with' if marking_scheme else "look at"} {f" the attached {ms_attached}" if ms_image_present else ""}"""] + reference_parts + [f"""
+This is the correct marking scheme: {f'{marking_scheme}, with' if marking_scheme else "look at"} {f" the attached {ms_attached}" if ms_image_present else ""}""")] + reference_parts + [TextPart(f"""
 
-Grade the following student answer: {f'{student_answer}, with' if student_answer else "look at"} {f" the attached {ans_attached}" if ans_image_present else ""}"""] + student_parts + [f"""
+Grade the following student answer: {f'{student_answer}, with' if student_answer else "look at"} {f" the attached {ans_attached}" if ans_image_present else ""}""")] + student_parts + [TextPart(f"""
 
 If the marking scheme doesn't specify mark distribution, grade proportionally based on the level of correctness—giving higher marks for more accurate and complete answers, and lower marks for partially correct or incomplete ones. Don't be too strict, nor too lenient.
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       
 Maximum Marks Possible: {question.max_marks}.
-{output_instruction(question.max_marks)}"""]
+{output_instruction(question.max_marks)}""")]
         elif ideal_answer:
-            prompt_content = [f"""Question: {question.text}
+            prompt_content = [TextPart(f"""Question: {question.text}
 
 Ideal Answer: {ideal_answer}
 
-Grade the following student answer: {f'{student_answer}, with' if student_answer else "look at"} {f" the attached {ans_attached}" if ans_image_present else ""}"""] + student_parts + [f"""
+Grade the following student answer: {f'{student_answer}, with' if student_answer else "look at"} {f" the attached {ans_attached}" if ans_image_present else ""}""")] + student_parts + [TextPart(f"""
 
 Give marks proportionally based on the level of correctness—giving higher marks for more accurate and complete answers, and lower marks for partially correct or incomplete ones. Don't be too strict, nor too lenient.
 
 Maximum Marks Possible: {question.max_marks}.
-{output_instruction(question.max_marks)}"""]
+{output_instruction(question.max_marks)}""")]
         else:
-            prompt_content = [f"""Question: {question.text}
+            prompt_content = [TextPart(f"""Question: {question.text}
 
-Grade the following student answer: {f'{student_answer}, with' if student_answer else "look at"} {f" the attached {ans_attached}" if ans_image_present else ""}"""] + student_parts + [f"""
+Grade the following student answer: {f'{student_answer}, with' if student_answer else "look at"} {f" the attached {ans_attached}" if ans_image_present else ""}""")] + student_parts + [TextPart(f"""
 
 Give marks proportionally based on the level of correctness—giving higher marks for more accurate and complete answers, and lower marks for partially correct or incomplete ones. Don't be too strict, nor too lenient.
                                                                                                                                                                                                                                                                                                                                                  
 Maximum Marks Possible: {question.max_marks}.
 
-{output_instruction(question.max_marks)}"""]
+{output_instruction(question.max_marks)}""")]
 
         try:
-            result, raw_text = await _grade_with_provider(
-                prompt_content, max_marks=question.max_marks
+            result, raw_text = await ai_services.grade_answer_with_parts(
+                prompt_content,
+                max_marks=question.max_marks,
+                exam_id=exam_id,
+                student_id=student_id,
+                question_id=question_id,
             )
+        except ProviderError as exc:
+            # The call itself failed -- transport, quota, timeout. That is not
+            # a validation failure and emphatically not a zero: record the
+            # provider-neutral category as the failure code and report it in
+            # the same explicit shape.
+            await _record_grading_failure(
+                db, question_id=question_id, student_id=student_id,
+                error_code=exc.category,
+            )
+            logger.error(
+                "grading call failed: category=%s question_id=%s student_id=%s",
+                exc.category, question_id, student_id,
+            )
+            return {
+                "status": "grading_failed",
+                "grade": None,
+                "reasoning": None,
+                "error_code": exc.category,
+                "error": "the grading service could not be reached",
+                "raw_response": None,
+            }
         except GradingResponseError as exc:
             # An unparseable provider response is a FAILURE, never a zero.
             await _record_grading_failure(
@@ -980,42 +748,18 @@ async def extract_single_answer_text(
             content={"message": "Text extraction skipped"}
         )
     
-    uploads = []
-    for path in img_paths:
-        if os.path.exists(path):
-            try:
-                up = await asyncio.to_thread(
-                    genai.upload_file, path=path, display_name=os.path.basename(path)
-                )
-                uploads.append(up)
-            except Exception as e:
-                logger.warning(f"Upload failed for {path}: {e}")
-    if not uploads:
-        raise HTTPException(500, "Failed to upload any image")
+    present = [path for path in img_paths if os.path.exists(path)]
+    if not present:
+        raise HTTPException(500, "No answer image is available to read")
 
-    prompt = """
-Task: The given image shows a student's handwritten answer with its Question Number at the top ”). 
-1) Read and extract that Question Number.
-2) Extract the full answer text, breaking out any sub-parts.
-3) Carefully consider the context of each answer to avoid extraction errors that may result from poor handwriting. For eg, simple spelling errors or subscript/superscript errors can be corrected, but do not correct calculation errors or the final answer.
-4) Return:
-
-Question Number [question_number]
-Answer: [text]          ← if no sub-parts
-
-—or—
-
-Question Number [question_number]
-Part: [part_label] - Answer: [text]
-"""
     try:
-        model = await get_model_async()
-        response = await asyncio.to_thread(model.generate_content, [*uploads, prompt])
-    except Exception as e:
-        logger.error(f"LLM call failed: {e}", exc_info=True)
+        extracted_text = (await ai_services.recognise_answer_images(
+            present, exam_id=exam_id, student_id=student_id, question_id=question_id
+        )).strip()
+    except ProviderError as exc:
+        logger.error("answer recognition failed: category=%s", exc.category)
         raise HTTPException(502, "Text-extraction service error")
 
-    extracted_text = response.text.strip()
     if not extracted_text:
         raise HTTPException(204, "No text extracted")
 
@@ -1072,56 +816,22 @@ async def process_answer_text_images_logic(exam_id: int, student_id: int, db: As
 
     async def process_batch(batch):
         print("\n\n\n\nProcessing batch", end="\n\n\n\n")
-        async def upload(entry):
-            try:
-                up = await asyncio.to_thread(
-                    genai.upload_file,
-                    path=entry["img_path"],
-                    display_name=os.path.basename(entry["img_path"])
-                )
-                return entry, up
-            except Exception as e:
-                logger.error(f"Upload failed {entry['img_path']}: {e}")
-                return None
-
-        uploads = await asyncio.gather(*(upload(e) for e in batch), return_exceptions=True)
-        uploaded = [(e, f) for e, f in uploads if e and f]
-
-        # print("Uploaded files: ", uploaded)
-        if not uploaded:
+        present = [e for e in batch if os.path.exists(e["img_path"])]
+        if not present:
             return {}
-
-        prompt = """
-Task: Each image shows a student’s handwritten answer with its Question Number at the top ”). 
-1) Read extract that Question Number.
-2) Extract the full answer text, breaking out any sub-parts.
-3) Carefully consider the context of each answer to avoid extraction errors that may result from poor handwriting.
-4) Return:
-
-Question Number [question_number]
-Answer: [text]          ← if no sub-parts
-
-—or—
-
-Question Number [question_number]
-Part: [part_label] - Answer: [text]
-...
-
-Separate each question with a blank line.
-"""
 
         try:
-            model = await get_model_async()
-            response = await asyncio.to_thread(
-                model.generate_content,
-                [f for (_, f) in uploaded] + [prompt]
+            text = await ai_services.recognise_answer_images(
+                [e["img_path"] for e in present],
+                batch=True,
+                exam_id=exam_id,
+                student_id=student_id,
             )
-            # print("Response: ", response.text)
-        except Exception as e:
-            logger.error(f"LLM call failed: {e}", exc_info=True)
+        except ProviderError as exc:
+            # One batch failing must not abandon the others.
+            logger.error("batch answer recognition failed: category=%s", exc.category)
             return {}
 
-        text = response.text or ""
         def parse_sections(txt):
             data = {}
             parts = re.split(r'Question Number\s*([^\r\n]+)', txt)
@@ -1241,60 +951,21 @@ async def process_marking_scheme_text_image(
     async def process_batch(batch):
         batch_extraction_mapping = {}
 
-        async def upload_file(entry):
-            try:
-                uploaded_file = await asyncio.to_thread(
-                    genai.upload_file,
-                    path=entry['img_path'],
-                    display_name=os.path.basename(entry['img_path'])
-                )
-                logger.info(f"Uploaded: {entry['img_path']} -> {uploaded_file.name}")
-                return entry, uploaded_file
-            except Exception as e:
-                logger.error(f"Error uploading file {entry['img_path']}: {str(e)}", exc_info=True)
-                return None
-
-        upload_tasks = [upload_file(entry) for entry in batch]
-        results = await asyncio.gather(*upload_tasks, return_exceptions=True)
-        uploaded_files = [(entry, uploaded_file) for result in results if result is not None for entry, uploaded_file in [result]]
-        
-        if not uploaded_files:
+        present = [e for e in batch if os.path.exists(e['img_path'])]
+        if not present:
             return batch_extraction_mapping
 
-        prompt = f"""Task: You are provided with multiple images, each containing marking scheme information for an exam question.
-Each image has a unique key.
-
-Your task is to extract and clearly structure the marking scheme details from each image.
-For each image, follow this format strictly:
-Key: <key>
-[Extracted marking scheme details here]
-
-If the marking scheme includes multiple criteria or parts, list each one on a new line using the format:
-Key: <key>
-Question Number [Question Number] - [extracted text]
-Part: [part number] - Details: [extracted text]
-Part: [part number] - Details: [extracted text]
-...
-
-If the image contains a single cohesive marking scheme, simply output the full details under the key.
-
-Ensure the extracted details are accurate and maintain the original logical structure.
-
-Images provided with keys: {", ".join(entry['key'] for entry, _ in uploaded_files)}
-"""
-
-        logger.info(prompt)
         try:
-            model = await get_model_async()
-            response = await asyncio.to_thread(
-                model.generate_content,
-                ([f for (_, f) in uploaded_files] + [prompt])
+            response_text = await ai_services.recognise_marking_scheme_images(
+                [e['img_path'] for e in present],
+                key_lines=[e['key'] for e in present],
+                exam_id=exam_id,
             )
-        except Exception as e:
-            logger.error(f"Error processing batch: {str(e)}", exc_info=True)
+        except ProviderError as exc:
+            logger.error("marking-scheme recognition failed: category=%s", exc.category)
             return batch_extraction_mapping
-        
-        if response.text:
+
+        if response_text:
             def parse_text(sample_text):
                 extracted_data = {}
                 # Example split assuming format "Key: <unique_key>" is used
@@ -1305,9 +976,9 @@ Images provided with keys: {", ".join(entry['key'] for entry, _ in uploaded_file
                     extracted_data[key] = content
                 return extracted_data
 
-            extracted_data = parse_text(response.text)
+            extracted_data = parse_text(response_text)
             
-            for entry, _ in uploaded_files:
+            for entry in present:
                 key_str = entry['key']
                 if key_str in extracted_data:
                     question_id = entry['question_id']

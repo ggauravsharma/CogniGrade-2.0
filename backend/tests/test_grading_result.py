@@ -334,26 +334,23 @@ def _response():
     )
 
 
-def _stub_model(monkeypatch, geminiAPI, body):
-    captured = {}
+def _stub_provider(fake_provider, body):
+    """Stub the PROVIDER, not the SDK.
 
-    class FakeModel:
-        def generate_content(self, prompt, generation_config=None):
-            captured["prompt"] = prompt
-            captured["generation_config"] = generation_config
-            return SimpleNamespace(text=body)
-
-    monkeypatch.setattr(geminiAPI, "get_model", lambda: FakeModel())
-    return captured
+    The prompt, the request assembly, the retry loop and the telemetry are all
+    real; only the vendor call is replaced. That is what keeps these tests
+    meaningful after the provider changes.
+    """
+    return fake_provider(body=body)
 
 
 @pytest.mark.asyncio
-async def test_text_grading_returns_validated_result(monkeypatch):
+async def test_text_grading_returns_validated_result(fake_provider):
     from backend.routers import geminiAPI
 
     q = _question()
     qr = _response()
-    _stub_model(monkeypatch, geminiAPI, '{"score": 2.5, "reason": "half"}')
+    _stub_provider(fake_provider, '{"score": 2.5, "reason": "half"}')
     db = _DB([q, qr])
 
     out = await geminiAPI.grade_question(
@@ -367,13 +364,13 @@ async def test_text_grading_returns_validated_result(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_text_grading_failure_does_not_write_marks(monkeypatch):
+async def test_text_grading_failure_does_not_write_marks(fake_provider):
     from backend.routers import geminiAPI
 
     q = _question()
     qr = _response()
     qr.marks_obtained = 4          # a previously good mark
-    _stub_model(monkeypatch, geminiAPI, "I am unable to grade this answer.")
+    _stub_provider(fake_provider, "I am unable to grade this answer.")
     db = _DB([q, qr])
 
     out = await geminiAPI.grade_question(
@@ -388,12 +385,12 @@ async def test_text_grading_failure_does_not_write_marks(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_diagram_grading_returns_the_same_contract(monkeypatch):
+async def test_diagram_grading_returns_the_same_contract(fake_provider):
     from backend.routers import geminiAPI
 
     q = _question()
     qr = _response()
-    _stub_model(monkeypatch, geminiAPI, '{"score": 1.5, "reason": "partial"}')
+    _stub_provider(fake_provider, '{"score": 1.5, "reason": "partial"}')
     db = _DB([qr, q, qr])
 
     out = await geminiAPI.grade_question_with_diagram(
@@ -407,13 +404,13 @@ async def test_diagram_grading_returns_the_same_contract(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_diagram_grading_failure_is_explicit(monkeypatch):
+async def test_diagram_grading_failure_is_explicit(fake_provider):
     from backend.routers import geminiAPI
 
     q = _question()
     qr = _response()
     qr.marks_obtained = 3
-    _stub_model(monkeypatch, geminiAPI, '{"score": 500, "reason": "way too high"}')
+    _stub_provider(fake_provider, '{"score": 500, "reason": "way too high"}')
     db = _DB([qr, q, qr])
 
     out = await geminiAPI.grade_question_with_diagram(
@@ -427,12 +424,12 @@ async def test_diagram_grading_failure_is_explicit(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_json_output_is_requested_from_the_provider(monkeypatch):
+async def test_json_output_is_requested_from_the_provider(fake_provider):
     from backend.routers import geminiAPI
 
     q = _question()
     qr = _response()
-    captured = _stub_model(monkeypatch, geminiAPI, '{"score": 1, "reason": "ok"}')
+    provider = _stub_provider(fake_provider, '{"score": 1, "reason": "ok"}')
     db = _DB([q, qr])
 
     await geminiAPI.grade_question(
@@ -440,19 +437,22 @@ async def test_json_output_is_requested_from_the_provider(monkeypatch):
          "exam_id": 1, "student_id": 2, "question_id": 3},
         db, None,
     )
-    cfg = captured["generation_config"]
-    assert cfg["response_mime_type"] == "application/json"
-    assert "Grade:" not in captured["prompt"], "the free-text contract is gone"
-    assert "score" in captured["prompt"]
+    request = provider.last_request
+    assert request.expects_json is True, "grading must ask for machine-readable output"
+    assert request.task == "grading"
+    assert request.prompt_version.startswith("grading/")
+    prompt_text = request.prompt_text
+    assert "Grade:" not in prompt_text, "the free-text contract is gone"
+    assert "score" in prompt_text
 
 
 @pytest.mark.asyncio
-async def test_empty_provider_response_is_explicit_failure(monkeypatch):
+async def test_empty_provider_response_is_explicit_failure(fake_provider):
     from backend.routers import geminiAPI
 
     q = _question()
     qr = _response()
-    _stub_model(monkeypatch, geminiAPI, "")
+    _stub_provider(fake_provider, "")
     db = _DB([q, qr])
 
     out = await geminiAPI.grade_question(
@@ -465,20 +465,13 @@ async def test_empty_provider_response_is_explicit_failure(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_provider_text_accessor_raising_is_handled(monkeypatch):
+async def test_provider_text_accessor_raising_is_handled(fake_provider):
     """`response.text` raises on a blocked candidate; that became an opaque 500."""
     from backend.routers import geminiAPI
 
-    class Exploding:
-        @property
-        def text(self):
-            raise RuntimeError("no candidates")
+    from backend.ai.errors import ProviderResponseError
 
-    class FakeModel:
-        def generate_content(self, prompt, generation_config=None):
-            return Exploding()
-
-    monkeypatch.setattr(geminiAPI, "get_model", lambda: FakeModel())
+    fake_provider(error=ProviderResponseError("provider returned no usable text"))
     q = _question()
     qr = _response()
     db = _DB([q, qr])
