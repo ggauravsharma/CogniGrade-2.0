@@ -45,6 +45,20 @@ from sqlalchemy import inspect
 
 from backend.database import Base
 
+# Importing the model packages is what populates Base.metadata -- declaring a
+# model registers its table as a side effect of import, and nothing else does.
+# Without these, `Base.metadata` is EMPTY here, `create_all` creates nothing,
+# and the fresh-database branch would stamp head over a database with no
+# schema: a state Alembic then believes is fully migrated and will never
+# repair. `migrations/env.py` imports them for the same reason. The application
+# happens to import the models earlier (main.py loads the routers first), but
+# this module must not depend on that ordering.
+import backend.models  # noqa: E402,F401
+import backend.models.files  # noqa: E402,F401
+import backend.models.notifications  # noqa: E402,F401
+import backend.models.tables  # noqa: E402,F401
+import backend.models.users  # noqa: E402,F401
+
 logger = logging.getLogger(__name__)
 
 #: Ships next to this module and inside the backend image.
@@ -118,6 +132,17 @@ def bootstrap_schema_sync(connection) -> str:
         return state
 
     if state == STATE_FRESH:
+        if not Base.metadata.tables:
+            # Belt and braces behind the imports above. A stamp asserts "this
+            # database is at head"; asserting that over an empty schema is the
+            # one outcome here that cannot be recovered automatically, so
+            # refuse to make the claim rather than make a false one.
+            logger.error(
+                "Refusing to initialise an empty database: no models are registered "
+                "on Base.metadata, so there is no schema to create and stamping head "
+                "would be false. Import backend.models before calling bootstrap_schema."
+            )
+            return state
         Base.metadata.create_all(bind=connection, checkfirst=True)
         try:
             _stamp_head_sync(connection)

@@ -21,6 +21,7 @@ behaves as expected on a populated production table. That needs a PostgreSQL
 run; see docs/COGNIGRADE_CONTEXT.md for what has and has not been verified.
 """
 
+import pathlib
 import sqlite3
 
 import pytest
@@ -48,6 +49,9 @@ from backend.models.numeric import Marks  # noqa: E402
 def _config(db_path):
     """An alembic Config pointed at a throwaway SQLite file."""
     return alembic_config(f"sqlite:///{db_path.as_posix()}")
+
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture
@@ -311,6 +315,60 @@ def test_an_empty_database_is_created_and_stamped(db_path):
         # ... and the schema is really there, not merely stamped.
         assert "question_responses" in sa.inspect(connection).get_table_names()
     engine.dispose()
+
+
+def test_bootstrap_registers_the_models_by_itself():
+    """Importing db_bootstrap must be enough to populate Base.metadata.
+
+    Declaring a model registers its table as a side effect of import, and
+    nothing else does. This suite cannot see the failure in-process -- conftest
+    has already imported the models -- so it asks a clean interpreter, which is
+    the only way to reproduce it.
+
+    Found by the PostgreSQL runtime verification: with an empty
+    `Base.metadata`, `create_all` created nothing and the fresh-database branch
+    still stamped head, leaving a database with no schema that Alembic believed
+    was fully migrated.
+    """
+    import subprocess
+    import sys
+
+    script = (
+        "import os, sys; sys.path.insert(0, os.getcwd());"
+        "os.environ.setdefault('SECRET_KEY', 'x');"
+        "os.environ['DATABASE_URL'] = 'sqlite+aiosqlite:///:memory:';"
+        "import backend.db_bootstrap;"
+        "from backend.database import Base;"
+        "print(len(Base.metadata.tables))"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, cwd=str(REPO_ROOT),
+    )
+    assert completed.returncode == 0, completed.stderr
+    registered = int(completed.stdout.strip().splitlines()[-1])
+    assert registered >= 10, f"only {registered} tables registered by importing db_bootstrap"
+
+
+def test_bootstrap_refuses_to_stamp_when_no_models_are_registered(db_path, caplog):
+    """A stamp claims "this database is at head". Never claim it over nothing."""
+    from unittest.mock import patch
+
+    import backend.db_bootstrap as bootstrap
+
+    engine = sa.create_engine(f"sqlite:///{db_path.as_posix()}")
+    with patch.object(bootstrap.Base, "metadata", sa.MetaData()):
+        with engine.begin() as connection:
+            with caplog.at_level("ERROR"):
+                assert bootstrap.bootstrap_schema_sync(connection) == STATE_FRESH
+
+    with engine.connect() as connection:
+        tables = sa.inspect(connection).get_table_names()
+    engine.dispose()
+
+    assert tables == [], f"nothing should have been created, found {tables}"
+    assert "alembic_version" not in tables, "an empty database must not be stamped"
+    assert "Refusing to initialise an empty database" in caplog.text
 
 
 def test_a_stamped_database_is_left_to_alembic(db_path):

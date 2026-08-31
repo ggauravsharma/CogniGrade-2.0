@@ -255,7 +255,8 @@ Alembic foundation and fractional marks (audit C7).
   fractional zero, a fractional partial total that stays non-final, and a
   failed re-evaluation restoring a fractional mark.
 
-- 283 tests (206 + 77).
+- 283 tests (206 + 77); 285 after the PostgreSQL verification below added
+  two bootstrap regression tests.
 
 ---
 
@@ -344,7 +345,7 @@ authorization rather than token signing. The Gemini SDK is stubbed only when the
 real package is absent, and the stub raises if any test reaches a model.
 
 ```
-.venv-test/Scripts/python.exe -m pytest -q      # 283 passed
+.venv-test/Scripts/python.exe -m pytest -q      # 285 passed
 ```
 
 `backend/requirements-dev.txt` holds test-only dependencies; production
@@ -355,20 +356,79 @@ real database, RabbitMQ, Celery, or Gemini.
 
 That caveat bites hardest on C7. **SQLite has dynamic typing** and will store
 1.5 in a column declared INTEGER, so the end-to-end fractional tests pass even
-against the old schema. What actually pins C7 is therefore static, not
+against the old schema. Inside the suite, what pins C7 is therefore static, not
 behavioural: the model columns are asserted to be `Marks`, their PostgreSQL DDL
 is asserted to compile to `NUMERIC(7, 2)`, and the migration's offline
 PostgreSQL output is asserted to contain the six `ALTER COLUMN ... TYPE
-NUMERIC(7, 2)` statements with no table drop or recreate. Verification status:
+NUMERIC(7, 2)` statements with no table drop or recreate.
+
+The behavioural half was closed separately — see **PostgreSQL runtime
+verification** below. Verification status:
 
 ```
-UNIT TESTED                    marks normalisation, aggregation, routes
-MIGRATION FILE VERIFIED        graph, chain, model/migration agreement
-STATICALLY VERIFIED            PostgreSQL DDL, offline `upgrade --sql`
-SQLITE MIGRATION TESTED        upgrade, data preservation, guarded downgrade
-NOT POSTGRES RUNTIME VERIFIED  no psql, no running Docker daemon and no
-                               asyncpg in the environment this was built in
+UNIT TESTED                        marks normalisation, aggregation, routes
+MIGRATION FILE VERIFIED            graph, chain, model/migration agreement
+STATICALLY VERIFIED                PostgreSQL DDL, offline `upgrade --sql`
+SQLITE MIGRATION TESTED            upgrade, data preservation, guarded downgrade
+POSTGRES MIGRATION TESTED          fresh + adoption path on PostgreSQL 15.19
+POSTGRES DATA-PRESERVATION TESTED  integer marks -> x.00, NULL preserved
+POSTGRES FRACTIONAL W/R TESTED     0.5 / 1.5 / 2.25 through the ORM and routes
 ```
+
+---
+
+## PostgreSQL runtime verification (C7)
+
+Run against a disposable **PostgreSQL 15.19** container (`postgres:15`, the
+image `docker-compose.yml` uses), on a throwaway port with ephemeral storage.
+No student data, no production database, nothing committed.
+
+The pre-Alembic schema was not simulated: a git worktree at `f6057cc` (the last
+commit before C7) ran the *old* models' `Base.metadata.create_all` against an
+empty database, producing a genuine legacy schema with six `integer` score
+columns and no `alembic_version`.
+
+**The defect reproduced.** On that legacy schema PostgreSQL silently rounded:
+`1.5 -> 2`, `2.25 -> 2`, `0.5 -> 1`. C7 was not theoretical.
+
+**Fresh path.** `upgrade head` on an empty database: both revisions ran, all 16
+tables plus `alembic_version` created, revision `0002`, all six columns
+`numeric(7,2)`, and an autogenerate comparison against the live database
+reported no drift.
+
+**Adoption path.** On the legacy database, `stamp 0001` applied no DDL and
+`upgrade head` ran only 0002. Values after: `3 -> 3.00`, `0 -> 0.00`,
+`NULL -> NULL`, `5 -> 5.00`, `4 -> 4.00`, `7 -> 7.00`, `100 -> 100.00`,
+`80 -> 80.00`. Row counts unchanged; no drift.
+
+**Fractional behaviour.** 0.5 / 1.5 / 2.25 / 0.0 written through the real
+models return as those floats and sit on disk as `0.50` / `1.50` / `2.25` /
+`0.00`. `0.1 + 0.2` is quantised to `0.30` at the write boundary. Aggregation
+totals 3.75 and, on a larger set, the application's float total matched
+PostgreSQL's own exact `SUM()` over the NUMERIC column to the cent. The manual
+`edit_marks` and `update_student_response` routes carried a fractional mark
+from an HTTP string through to `numeric(7,2)` and back out of the evaluation
+endpoint; a non-numeric mark was a 400. C6 held throughout: a stored zero read
+back as `0.0` (never `None`), a `NULL` mark read back as `None` and kept the
+result `grading_incomplete`.
+
+**Downgrade.** With fractional marks present, `downgrade 0001` refused, naming
+the offending columns and row counts, and left the schema, the revision and
+every value untouched. With whole-number data it succeeded and was loss-free
+(`3.00 -> 3`, `0.00 -> 0`, `NULL -> NULL`), and re-upgrading returned to head.
+
+**Bug found and fixed.** `db_bootstrap` read `Base.metadata` without importing
+the model modules. Declaring a model registers its table as an import side
+effect and nothing else does, so a caller that had not already imported
+`backend.models` got an EMPTY metadata: `create_all` created nothing and the
+fresh-database branch stamped head anyway, leaving a schema-less database that
+Alembic believed was fully migrated and would never repair. `main.py` is safe
+only by accident of import order (it loads the routers first). Fixed by
+importing the model packages in `db_bootstrap` (as `migrations/env.py` already
+did) plus a guard that refuses to stamp when no models are registered. Two
+regression tests, both verified to fail against the previous module — one
+spawns a clean interpreter, because this suite cannot see the failure
+in-process once conftest has imported the models.
 
 ---
 
@@ -385,15 +445,10 @@ rectification for photographed sheets). Their `results/` and
 
 ## Next approved phase
 
-Not yet approved. Recommended next: **run the 0002 migration against a real
-PostgreSQL instance.** Everything about C7 is verified except the one thing
-SQLite cannot stand in for — `ALTER TABLE ... TYPE NUMERIC(7, 2)` on a
-populated table, in the dialect production actually uses. The procedure is a
-disposable copy: restore a `pg_dump`, `stamp 0001`, `upgrade head`, confirm the
-integer marks came across as `x.00`, write 0.5 / 1.5 / 2.25, and read them back.
-Until that runs, the fix is correct by construction and by static verification
-but has never touched PostgreSQL.
-
-After that: nothing in the UI explains WHY a question failed grading.
-`grade_exam_logic` already returns `failed_questions`, and the professor
-dashboard now has a place to put it.
+Not yet approved. Recommended next: **surface WHY a question failed grading.**
+`grade_exam_logic` already returns `graded_count` / `failed_count` /
+`failed_questions`, and nothing reads it. Since Correctness v3 the professor
+dashboard reports a `grading_incomplete` result and flags the row "partial",
+but it cannot say which question failed or why, so the only recovery is to
+re-run grading blindly. The data exists; it needs to be persisted or passed
+through and rendered.
