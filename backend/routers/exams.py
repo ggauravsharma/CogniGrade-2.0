@@ -184,7 +184,7 @@ async def create_exam(
     class_id: int, 
     title: str = Form(...),
     exam_date: Optional[str] = Form(None),
-    points_possible: Optional[int] = Form(100),
+    points_possible: Optional[float] = Form(100),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user_required)
 ):  
@@ -513,7 +513,7 @@ async def get_exam_questions(
 class UpdatePartLabels(BaseModel):
     questionId: int
     partLabels: List[str]
-    maxMarks: Optional[int]
+    maxMarks: Optional[float]
 
 class UpdatesPayload(BaseModel):
     updates: List[UpdatePartLabels]

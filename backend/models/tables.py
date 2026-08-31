@@ -5,6 +5,7 @@ from sqlalchemy.dialects.postgresql import TIMESTAMP
 import shortuuid
 import enum
 from backend.database import Base
+from backend.models.numeric import Marks
 
 class AssignmentStatus(str, enum.Enum):
     PENDING = "pending"
@@ -65,7 +66,9 @@ class Assignment(Base):
     title = Column(String(100), nullable=False)
     description = Column(Text, nullable=True)
     due_date = Column(TIMESTAMP(timezone=True), nullable=True)
-    points_possible = Column(Integer, default=100)
+    # Every score in CogniGrade is `Marks` -- NUMERIC(7,2), read back as float.
+    # Audit C7: these were Integer, which truncated partial credit on write.
+    points_possible = Column(Marks, default=100)
     created_at = Column(TIMESTAMP(timezone=True), default=lambda: datetime.now(timezone.utc))
     classroom_id = Column(Integer, ForeignKey("classrooms.id", ondelete="CASCADE"))
     author_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
@@ -86,7 +89,7 @@ class Submission(Base):
     content = Column(Text, nullable=True)
     file_path = Column(Text, nullable=True)
     submitted_at = Column(TIMESTAMP(timezone=True), default=lambda: datetime.now(timezone.utc))
-    grade = Column(Integer, nullable=True)
+    grade = Column(Marks, nullable=True)
     feedback = Column(Text, nullable=True)
     status = Column(Enum(AssignmentStatus), default=AssignmentStatus.PENDING)
     assignment_id = Column(Integer, ForeignKey("assignments.id", ondelete="CASCADE"))
@@ -125,7 +128,7 @@ class Exam(Base):
     description = Column(Text, nullable=True)
     exam_date = Column(TIMESTAMP(timezone=True), nullable=True)
     duration_minutes = Column(Integer, nullable=True)
-    points_possible = Column(Integer, default=100)
+    points_possible = Column(Marks, default=100)
     created_at = Column(TIMESTAMP(timezone=True), default=lambda: datetime.now(timezone.utc))
     classroom_id = Column(Integer, ForeignKey("classrooms.id", ondelete="CASCADE"))
     author_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
@@ -145,7 +148,10 @@ class ExamResult(Base):
     id = Column(Integer, primary_key=True, index=True)
     exam_id = Column(Integer, ForeignKey("exams.id", ondelete="CASCADE"))
     student_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
-    marks_obtained = Column(Integer, nullable=True)
+    # NULL still means "grading produced no result" and 0 still means "the
+    # student earned nothing" -- Correctness v3 depends on that distinction and
+    # widening the type does not touch it.
+    marks_obtained = Column(Marks, nullable=True)
     feedback = Column(Text, nullable=True)
     graded_by = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
     graded_at = Column(TIMESTAMP(timezone=True), nullable=True)
@@ -163,7 +169,7 @@ class Question(Base):
     text = Column(Text, nullable=False)        # The question's text or prompt.
     ideal_answer = Column(Text, nullable=True)   # The ideal answer for the question
     ideal_marking_scheme = Column(Text, nullable=True)  # Marking scheme for the ideal answer
-    max_marks = Column(Integer, nullable=False)
+    max_marks = Column(Marks, nullable=False)
     created_at = Column(TIMESTAMP(timezone=True), default=lambda: datetime.now(timezone.utc))
     part_labels = Column(Text, nullable=True) 
 
@@ -180,7 +186,7 @@ class QuestionResponse(Base):
     question_id = Column(Integer, ForeignKey("questions.id", ondelete="CASCADE"), nullable=False)
     student_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     answer_text = Column(Text, nullable=True)
-    marks_obtained = Column(Integer, nullable=True)
+    marks_obtained = Column(Marks, nullable=True)
     query = Column(Text, nullable=True)
     reasoning = Column(Text, nullable=True)
     created_at = Column(TIMESTAMP(timezone=True), default=lambda: datetime.now(timezone.utc))

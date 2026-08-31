@@ -4,3 +4,6 @@ pytest==8.3.4
 pytest-asyncio==0.25.2
 httpx==0.27.2
 aiosqlite==0.20.0
+# Alembic is a production dependency (backend/requirements.txt) but the test
+# suite exercises the migrations directly, so the test venv needs it too.
+alembic==1.19.1

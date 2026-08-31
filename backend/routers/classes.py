@@ -16,6 +16,7 @@ from backend.database import get_db
 from backend.models.tables import Classroom, Enrollment, Assignment, Submission, Announcement
 from backend.models.users import User
 from backend.utils.security import get_current_user_required
+from backend.utils.marks_input import parse_mark_input
 from backend.auth.policies import (
     ClassroomContext,
     assert_assignment_access,
@@ -37,13 +38,15 @@ class AssignmentCreate(BaseModel):
     title: str
     description: Optional[str] = None
     due_date: Optional[str] = None  # as ISO string
-    max_marks: Optional[int] = None
+    max_marks: Optional[float] = None
 
 class SubmissionCreate(BaseModel):
     content: str
 
 class GradeSubmission(BaseModel):
-    grade: int
+    # float, not int: partial credit is a real grade (audit C7). Storage is
+    # NUMERIC(7,2) via the `Marks` column type, which quantises on write.
+    grade: float
     feedback: Optional[str] = None
 
 class AnnouncementCreate(BaseModel):
@@ -816,11 +819,12 @@ async def grade_submission(
                 raise HTTPException(status_code=403, detail="Only professors and TAs can grade submissions")
 
         # Validate grade
-        if assignment.points_possible and grade_data.grade > assignment.points_possible:
+        graded_value = parse_mark_input(grade_data.grade, field="grade")
+        if assignment.points_possible and graded_value > assignment.points_possible:
             raise HTTPException(status_code=400, detail=f"Grade cannot exceed maximum points: {assignment.points_possible}")
 
         # Update submission with grade
-        submission.grade = grade_data.grade
+        submission.grade = graded_value
         submission.feedback = grade_data.feedback
         submission.graded_by = current_user.id
         submission.graded_at = datetime.now(timezone.utc)

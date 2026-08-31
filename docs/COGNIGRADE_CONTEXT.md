@@ -29,9 +29,10 @@ except where noted:
 - **C6 — FIXED** in Correctness Foundation v3. Was:
   `add_exam_result_internal` summed only non-NULL marks and then stamped
   `status="graded"`, so a failed grading silently scored zero.
-- **C7** `marks_obtained` (×2) and `Question.max_marks` are `Integer` while the
-  grader emits `float`. No Alembic migrations exist; schema comes from
-  `Base.metadata.create_all`, which cannot alter existing columns.
+- **C7 — FIXED** in Correctness Foundation v4. Was: `marks_obtained` (×2) and
+  `Question.max_marks` were `Integer` while the grader emits `float`, and no
+  Alembic migrations existed — schema came from `Base.metadata.create_all`,
+  which cannot alter an existing column.
 - **C8** Answer crops are attributed to `current_user.id`; there is no
   `student_id` in the crop payload.
 - **C10** `geminiAPI.py:1057` calls `db.query()` on an `AsyncSession` — that
@@ -175,6 +176,87 @@ Exam aggregation and grading-failure state (audit C6).
 - 206 tests (183 + 23). Five of the new tests were verified to FAIL against
   bb536cd.
 
+### Correctness Foundation v4 — DONE
+Alembic foundation and fractional marks (audit C7).
+
+- **Old behaviour:** every score column was `Integer`. `GradingResult.score` has
+  been a float since Correctness v2 specifically so partial credit is
+  representable, and aggregation sums floats — but the write truncated. A 1.5
+  became 1 on PostgreSQL, i.e. half a mark taken off the student, silently.
+  `create_all` could never fix it: it creates missing tables and nothing else.
+
+- **Numeric decision:** `NUMERIC(7, 2)` — exact decimal, not binary float,
+  because a transcript is an exact record and `REAL` cannot hold 0.1. Scale 2
+  covers halves, quarters and hundredths (percentage-derived rubrics); it does
+  not represent exact thirds, which is how such a scheme is written down anyway.
+  Precision 7 (±99999.99) is two orders of magnitude above any real exam total.
+
+- **New modules:**
+  * `backend/grading/marks.py` — provider-neutral `to_decimal` / `to_number`,
+    `InvalidMarkError(code, ...)`, `MARKS_PRECISION` / `MARKS_SCALE`. No SDK,
+    FastAPI, SQLAlchemy or `backend.models` import (asserted by an AST-level
+    test). Accepts int/float/Decimal/numeric-str; rejects bool, NaN, Inf,
+    non-numeric and out-of-range; `None` and empty string stay `None`.
+  * `backend/models/numeric.py` — `Marks`, a `TypeDecorator` over
+    `Numeric(7,2)`. **This is the whole Decimal/float policy:** write quantises
+    to `Decimal`, read returns `float`. Nothing else in the codebase converts,
+    so `JSONResponse` and every existing float arithmetic keep working, and
+    float drift (0.1+0.2) is quantised away at the write boundary instead of
+    accumulating in the database.
+  * `backend/db_bootstrap.py` — the startup schema decision, below.
+
+- **Columns migrated (6):** `QuestionResponse.marks_obtained`,
+  `ExamResult.marks_obtained`, `Question.max_marks`, `Submission.grade`,
+  `Assignment.points_possible`, `Exam.points_possible`. The two
+  `points_possible` maxima are included deliberately: leaving them Integer
+  would make an exam out of 37.5 unrepresentable while its questions could hold
+  fractions. Names stay domain names — never `gemini_score`.
+
+- **Alembic:** `backend/alembic.ini` (inside `backend/` so it ships in the
+  image; `script_location = %(here)s/migrations`, no `sqlalchemy.url`, so no
+  credential is committed) and `backend/migrations/env.py`, which takes metadata
+  from `backend.database.Base` after importing every model module, takes the URL
+  from `-x url=` then Config then `ALEMBIC_DATABASE_URL` then
+  `settings.DATABASE_URL`, drives async engines through `run_sync`, and uses
+  batch mode on SQLite only.
+
+- **Migration strategy — baseline + stamp.** `0001_baseline` reproduces the
+  pre-Alembic schema exactly, Integer marks columns and all;
+  `0002_fractional_marks` alters the six columns. Fresh DB: `upgrade head`.
+  Existing DB: back up, `stamp 0001`, then `upgrade head` (only 0002 runs).
+  0001 must NEVER be edited to track later models — that would make the stamp
+  a lie. A test asserts it still declares `sa.Integer()`.
+
+- **Downgrade is guarded, not silent.** `downgrade 0002` counts non-integral
+  values in every affected column and raises, naming table/column/row counts,
+  rather than rounding a student's mark. With whole-number data it proceeds and
+  is loss-free.
+
+- **`create_all` is now three-way** (`db_bootstrap.bootstrap_schema`):
+  `alembic_version` present -> do nothing, Alembic owns it; no tables at all ->
+  create from models AND stamp head, so the two mechanisms stay consistent;
+  tables but no `alembic_version` -> pre-Alembic database, warn loudly with the
+  adoption commands and touch nothing. The stamp degrades to a warning if
+  alembic is not importable, so startup never hard-requires migration tooling.
+
+- **Application fixes:** manual marks now go through
+  `backend/utils/marks_input.parse_mark_input` (the UI posts strings; a bad
+  value is a 400 naming the field instead of a driver error at flush time);
+  `update_student_response` no longer nulls a mark when the field is absent;
+  the stats histogram derives its bucket count instead of assuming
+  `points_possible` is an int; `GradeSubmission.grade`,
+  `AssignmentCreate.max_marks`, the `points_possible` Form field and
+  `UpdatePartLabels.maxMarks` became floats; the marks inputs in
+  `exam-stats.htm` / `assignment.htm` gained `step="any"` and `parseInt`
+  became `parseFloat`.
+
+- **C6 unchanged and re-asserted:** `0.0` is a mark, `None` is a missing
+  grading result, `grading_incomplete` still blocks finalisation. Tests cover
+  fractional zero, a fractional partial total that stays non-final, and a
+  failed re-evaluation restoring a fractional mark.
+
+- 283 tests (206 + 77).
+
 ---
 
 ## Authorization model
@@ -220,12 +302,10 @@ until their own remediation phase.
 - `peopleManagement.remove_student` calls `db.delete(...)` without `await`, so
   the removal does not happen while the endpoint reports success. That route is
   in any case shadowed — see below.
-- Still open in the grading path after Correctness v3: **C7** integer marks
-  columns (needs Alembic — `create_all` cannot alter them, so a fractional
-  score is still truncated on write); grading is serial, one provider call
-  per question; uploaded Gemini files are never deleted (`upload_file` used,
-  `delete_file` never) — a diagram/table call uploads reference + student
-  images per question and none are cleaned up.
+- Still open in the grading path after Correctness v4: grading is serial, one
+  provider call per question; uploaded Gemini files are never deleted
+  (`upload_file` used, `delete_file` never) — a diagram/table call uploads
+  reference + student images per question and none are cleaned up.
 - `grade_exam_logic` returns `graded_count` / `failed_count` /
   `failed_questions`. Aggregation does NOT read that return value: it derives
   completeness from the persisted marks instead, so a crashed or partially
@@ -264,7 +344,7 @@ authorization rather than token signing. The Gemini SDK is stubbed only when the
 real package is absent, and the stub raises if any test reaches a model.
 
 ```
-.venv-test/Scripts/python.exe -m pytest -q      # 206 passed
+.venv-test/Scripts/python.exe -m pytest -q      # 283 passed
 ```
 
 `backend/requirements-dev.txt` holds test-only dependencies; production
@@ -272,6 +352,23 @@ real package is absent, and the stub raises if any test reaches a model.
 
 Caveat: SQLite, not Postgres. Nothing here is integration-tested against the
 real database, RabbitMQ, Celery, or Gemini.
+
+That caveat bites hardest on C7. **SQLite has dynamic typing** and will store
+1.5 in a column declared INTEGER, so the end-to-end fractional tests pass even
+against the old schema. What actually pins C7 is therefore static, not
+behavioural: the model columns are asserted to be `Marks`, their PostgreSQL DDL
+is asserted to compile to `NUMERIC(7, 2)`, and the migration's offline
+PostgreSQL output is asserted to contain the six `ALTER COLUMN ... TYPE
+NUMERIC(7, 2)` statements with no table drop or recreate. Verification status:
+
+```
+UNIT TESTED                    marks normalisation, aggregation, routes
+MIGRATION FILE VERIFIED        graph, chain, model/migration agreement
+STATICALLY VERIFIED            PostgreSQL DDL, offline `upgrade --sql`
+SQLITE MIGRATION TESTED        upgrade, data preservation, guarded downgrade
+NOT POSTGRES RUNTIME VERIFIED  no psql, no running Docker daemon and no
+                               asyncpg in the environment this was built in
+```
 
 ---
 
@@ -288,13 +385,14 @@ rectification for photographed sheets). Their `results/` and
 
 ## Next approved phase
 
-Not yet approved. Recommended next: **C7 — numeric mark columns**, which now
-blocks the rest of the grading path. `GradingResult.score` is a float and
-aggregation sums floats, but `QuestionResponse.marks_obtained`,
-`ExamResult.marks_obtained` and `Question.max_marks` are still `Integer`, so
-half marks are truncated on write. Fixing it requires introducing Alembic, since
-the schema comes from `Base.metadata.create_all`, which cannot alter a column.
-That is a migration-infrastructure phase, not a one-line change.
+Not yet approved. Recommended next: **run the 0002 migration against a real
+PostgreSQL instance.** Everything about C7 is verified except the one thing
+SQLite cannot stand in for — `ALTER TABLE ... TYPE NUMERIC(7, 2)` on a
+populated table, in the dialect production actually uses. The procedure is a
+disposable copy: restore a `pg_dump`, `stamp 0001`, `upgrade head`, confirm the
+integer marks came across as `x.00`, write 0.5 / 1.5 / 2.25, and read them back.
+Until that runs, the fix is correct by construction and by static verification
+but has never touched PostgreSQL.
 
 After that: nothing in the UI explains WHY a question failed grading.
 `grade_exam_logic` already returns `failed_questions`, and the professor

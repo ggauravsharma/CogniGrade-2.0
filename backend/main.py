@@ -6,7 +6,9 @@ from contextlib import asynccontextmanager
 import os
 import logging
 
-from backend.database import engine, get_db, Base
+# Base is no longer imported here: the schema decision moved to db_bootstrap.
+from backend.database import engine, get_db
+from backend.db_bootstrap import bootstrap_schema
 from backend.routers import auth, classes, enrollments, notifications, announcements, exams, geminiAPI, studentBackend, peopleManagement, examStats, user_routes, studentEdit, routingTasks
 from backend.auth import files as protected_files
 from backend.config import settings
@@ -22,9 +24,11 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
-    async with engine.begin() as conn:
-        await conn.run_sync(lambda sync_conn: Base.metadata.create_all(bind=sync_conn, checkfirst=True))
+    # Startup. Alembic is the schema authority; create_all now runs only on a
+    # genuinely empty database, and that database is stamped so the two agree.
+    # See backend/db_bootstrap.py for the three cases and why each behaves the
+    # way it does.
+    await bootstrap_schema(engine)
     yield
     # Shutdown
     await engine.dispose()  # closes all connections

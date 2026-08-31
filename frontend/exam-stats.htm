@@ -809,7 +809,7 @@
                 <td class="question-number">Question ${q.question_number}</td>
                 <td class="marks-cell">
                   <span class="marks-text">${q.marks_obtained !== null ? q.marks_obtained : 'N/A'}</span>
-                  <input type="number" class="marks-input" value="${q.marks_obtained !== null ? q.marks_obtained : ''}" style="display: none;">
+                  <input type="number" step="any" class="marks-input" value="${q.marks_obtained !== null ? q.marks_obtained : ''}" style="display: none;">
                 </td>
               </tr>
             `;

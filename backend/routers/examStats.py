@@ -11,6 +11,7 @@ from backend.models.tables import Exam, ExamResult, Enrollment, Question, Questi
 from backend.models.files import AnswerScript
 from backend.models.users import User
 from backend.utils.security import get_current_user_required
+from backend.utils.marks_input import parse_mark_input
 from backend.grading.aggregation import (
     ExamResultStatus,
     aggregate_student_result,
@@ -25,6 +26,7 @@ from backend.auth.policies import (
     require_self_or_exam_manager,
 )
 from backend.routers.geminiAPI import grade_question, grade_question_with_diagram, extract_single_answer_text
+import math
 import re
 
 router = APIRouter(tags=["exam-stats"])
@@ -85,16 +87,22 @@ async def get_exam_stats(exam_id: int,
 
     # The distribution is a claim about achieved scores, so a partial total must
     # not enter it -- it would understate the cohort and move the mean.
-    buckets = [0] * (exam.points_possible*2 + 1)
+    # Half-mark buckets. `points_possible` is now NUMERIC, so the bucket COUNT
+    # has to be derived rather than assumed to be an int -- and a total that
+    # lands between buckets (2.25) is floored into the bucket it belongs to and
+    # clamped, so a mark above the nominal maximum cannot index off the end.
+    bucket_count = int(math.floor(float(exam.points_possible or 0) * 2)) + 1
+    buckets = [0] * bucket_count
     excluded_from_distribution = 0
     for s in students:
         if not s["is_final"]:
             excluded_from_distribution += 1
             continue
-        bucket = int(s["total_marks"]*2)
+        bucket = int(math.floor(float(s["total_marks"]) * 2))
+        bucket = max(0, min(bucket, bucket_count - 1))
         buckets[bucket] += 1
     distribution = {
-        "labels": [f"{i/2}" for i in range(exam.points_possible*2 + 1)],
+        "labels": [f"{i/2}" for i in range(bucket_count)],
         "data": buckets
     }
     grading_progress = graded_scripts / total_answer_scripts if total_answer_scripts else 0
@@ -155,7 +163,10 @@ async def edit_marks(
     Receives the new marks and optional reasoning from form data. After updating,
     it calls the internal function to update the overall exam result.
     """
-    grade = payload["grade"]
+    # The manual-edit control posts `marksInput.value`, i.e. a string such as
+    # "1.5". Normalising here means a bad value is a 400 naming the field
+    # instead of a driver error at flush time, and a fractional value survives.
+    grade = parse_mark_input(payload.get("grade"), field="grade")
     # Ensure the professor is making the request
     if not current_user.is_professor:
         raise HTTPException(status_code=403, detail="Access denied")
@@ -169,7 +180,7 @@ async def edit_marks(
     if not response:
         raise HTTPException(status_code=404, detail="Response not found for this student and question.")
     
-    response.marks_obtained = payload["grade"]
+    response.marks_obtained = grade
     await db.commit()
     
     await add_exam_result_internal(exam_id, student_id, db) #, current_user)
@@ -266,18 +277,21 @@ async def update_student_response(
         QuestionResponse.student_id == student_id
     ))
     response = result.scalars().first()
+    # Same normalisation as edit_marks: a JSON client may send 1.5, "1.5" or 1.
+    marks_given = "marks_obtained" in update_data
+    new_marks = parse_mark_input(update_data.get("marks_obtained"), field="marks_obtained")
     if not response:
         response = QuestionResponse(
             question_id=question_id,
             student_id=student_id,
             answer_text=update_data.get("response", ""),
-            marks_obtained=update_data.get("marks_obtained"),
+            marks_obtained=new_marks,
             reasoning=update_data.get("reasoning", "")
         )
         db.add(response)
     else:
         response.answer_text = update_data.get("response", response.answer_text)
-        response.marks_obtained = update_data.get("marks_obtained", response.marks_obtained)
+        response.marks_obtained = new_marks if marks_given else response.marks_obtained
         response.reasoning = update_data.get("reasoning", response.reasoning)
     await db.commit()
     await add_exam_result_internal(exam_id, student_id, db) #, current_user)
