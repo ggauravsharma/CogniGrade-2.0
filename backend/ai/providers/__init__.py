@@ -28,6 +28,36 @@ def get_provider(name: str) -> TextTaskProvider:
     raise ValueError(f"unknown AI provider: {name!r}")
 
 
+_SEGMENTATION_REGISTRY = {}
+
+
+def get_segmentation_provider(name: str):
+    """Return the segmentation adapter for `name`.
+
+    Separate from `get_provider` because segmentation has a different
+    capability shape (regions in, not text) -- squeezing it into the text
+    interface would have been the generic-`generate()` mistake in another form.
+
+    There is deliberately NO default: no production segmentation provider
+    exists yet, and quietly falling back to the fake would put test output in
+    front of a teacher.
+    """
+    if name in _SEGMENTATION_REGISTRY:
+        return _SEGMENTATION_REGISTRY[name]
+
+    if name == "fake":
+        from backend.ai.providers.fake_segmentation import FakeSegmentationProvider
+
+        _SEGMENTATION_REGISTRY[name] = FakeSegmentationProvider()
+        return _SEGMENTATION_REGISTRY[name]
+
+    raise ValueError(f"unknown segmentation provider: {name!r}")
+
+
+def register_segmentation_provider(name: str, provider) -> None:
+    _SEGMENTATION_REGISTRY[name] = provider
+
+
 def register_provider(name: str, provider: TextTaskProvider) -> None:
     """Install a provider explicitly. Used by tests and by future adapters."""
     _REGISTRY[name] = provider
@@ -36,6 +66,10 @@ def register_provider(name: str, provider: TextTaskProvider) -> None:
 def reset_providers() -> None:
     """Drop cached adapters. Tests use this; nothing in production should."""
     _REGISTRY.clear()
+    _SEGMENTATION_REGISTRY.clear()
 
 
-__all__ = ["TextTaskProvider", "get_provider", "register_provider", "reset_providers"]
+__all__ = [
+    "TextTaskProvider", "get_provider", "register_provider", "reset_providers",
+    "get_segmentation_provider", "register_segmentation_provider",
+]

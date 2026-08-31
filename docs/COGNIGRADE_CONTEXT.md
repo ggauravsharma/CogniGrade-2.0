@@ -688,6 +688,105 @@ raised a `UnicodeEncodeError` in the logging handler on a Windows console (a Ω
 in a physics answer). Verbose SQL echo is a privacy and noise problem in a
 grading system. Not fixed here; recorded below.
 
+### Segmentation & Structure Integration v1 — DONE
+A structured representation of an answer sheet, and the seam a model plugs into.
+
+The crop workflow persisted only a cropped PNG: page identity, geometry,
+reading order and part labels were discarded or burned into pixels and
+recovered later by asking a model to read a number off an image. This phase
+adds a real structure alongside it. **Additive — the crop workflow is
+untouched and still works.**
+
+```
+Page (answer script + page_index)
+  ↓  SegmentationRequest
+FakeSegmentationProvider.segment_page        (backend/ai/providers/fake_segmentation.py)
+  ↓  SegmentationResponse[RegionPrediction]
+validate_predictions                         (backend/ai/segmentation.py)
+  ↓  Region[]  — deterministic gate
+DocumentRegion rows, status="proposed"       (backend/models/tables.py)
+  ↓  human accept / modify / reject
+status accepted|modified                     (POST/PATCH/DELETE /regions)
+  ↓
+future HTR / HMER / diagram / grading pipeline
+```
+
+**Proposals are not annotations.** A provider's output is stored as `proposed`
+and nothing downstream may treat it as truth. Prior experiments found this
+class of model silently omits content, over-merges regions, misreports which
+page it was given, and self-reports confidence that does not correlate with
+being right — so `validate_predictions` checks every proposal against facts the
+application already holds, and drops what disagrees with a reason code.
+
+Two rules follow directly from those failure modes:
+* **page_index comes from the REQUEST, never the response.** We know what we
+  sent.
+* **an unclear question assignment stays unassigned.** A region naming a
+  question the exam does not have is kept — the content is real — but left
+  unattached rather than filed under the wrong question.
+* **confidence is stored as opaque metadata and never gates acceptance.**
+
+**Geometry is normalised to the page: every coordinate a float in [0, 1].**
+`crop-edit.js` renders through `getViewport({scale})` and reads
+`getBoundingClientRect()`, so pixel numbers depend on zoom, DPR and window
+size; a fraction of the page is the only figure that survives re-rendering, or
+re-rasterising the PDF at a different DPI. Rect (`x,y,w,h`) and polygon
+(`points`) both round-trip exactly; a backwards drag is normalised, not
+rejected. Bounds are derived deterministically, rounded to the same 6 dp.
+
+**Vocabulary** (`backend/regions/schema.py`), nine values, each earning its
+place: `handwritten_text`, `printed_text`, `math`, `diagram`, `table`,
+`crossed_out`, `teacher_marking`, `page_furniture`, `other`. `math` is separate
+because handwritten mathematics needs HMER not HTR — typing a region is a
+routing decision. `crossed_out` and `teacher_marking` exist so struck-through
+work and the teacher's red pen are REPRESENTED rather than silently included or
+dropped; `STUDENT_ANSWER_TYPES` is what a grading pipeline filters on, and
+neither is in it. `LEGACY_BUCKET_TO_REGION_TYPE` maps the three old crop
+buckets on.
+
+**Lifecycle:** `proposed → accepted | modified | rejected`; a human-drawn
+region is born `accepted`. Editing a proposal promotes it to `modified`
+automatically rather than trusting the client to say so — the split between
+"the model was right" and "a human fixed it" is the only record of how good the
+model actually was. Rejected model proposals are KEPT as rejected (the other
+half of that record); a human's own region is deleted outright.
+
+**Provenance:** `source` is `model | human`, structural only — never a vendor
+name in the schema. `provider` / `model_name` / `prompt_version` /
+`provider_metadata` are optional columns the domain never reads. No raw
+provider response and no key is persisted.
+
+**Database:** one new table `document_regions` (Alembic **0004**, purely
+additive). `exam_id` is carried directly so authorization is one join;
+`answer_script_id` / `material_id` name the source document. `question_id` is
+`ON DELETE SET NULL`, not CASCADE — an unassigned region is legitimate, so
+deleting a question must orphan its regions rather than destroy the student
+work they point at. Multi-page answers need nothing special: regions carry
+their own `page_index`, so one question owning regions on pages 3 and 4 is the
+default case, not a feature.
+
+**API** (`backend/routers/regions.py`), no provider name in any path:
+`GET /answer-scripts/{id}/regions`, `POST .../segmentation`,
+`POST .../regions`, `PATCH /regions/{id}`, `DELETE /regions/{id}`,
+`POST .../regions/reorder`. Authorization reuses the exam policies and is
+always resolved FROM the answer script or the region, so authority over one
+exam grants nothing on another. A student may read regions on their own script
+and may not annotate; managers do everything.
+
+**Frontend:** one additive module, `frontend/region-overlay.js` — fetch, draw
+rects and polygons over the crop editor's existing per-page `.overlay`, label
+each with type/question/reading position, dash the non-answer types, fade
+proposals. No editing, no redesign; `regionToGeometry` is the inverse a future
+editor will need. Placement is pure percentages, which is the payoff of the
+normalised coordinate decision.
+
+**Verified on PostgreSQL 15.19** (disposable container): fresh DB → head, and a
+legacy pre-Alembic DB → `stamp 0001` → head. Both reached 0004 with no drift;
+all six legacy crop columns intact; FK delete rules confirmed
+(`c,c,c` and `n` for `question_id`).
+
+- 510 tests (437 + 73). **NO LIVE PROVIDER CALLS — zero quota.**
+
 ---
 
 ## Authorization model
@@ -766,6 +865,14 @@ been removed from this list.
 - **`backend/database.py` sets `echo=True`**, logging every SQL statement --
   including model-written grading reasons about student answers -- and it
   crashed the logging handler on a non-ASCII character during live validation.
+- **Nothing produces regions in production yet.** The only segmentation
+  adapter is the deterministic fake used by tests; `get_segmentation_provider`
+  has no default, so a real one must be written and named explicitly. The crop
+  editor still writes crops, not regions.
+- **Regions are not consumed by grading yet.** `GradingEvidence` still reads
+  the legacy `ans_*_images` / `ms_*_images` path lists. Wiring accepted regions
+  into evidence (and generating crops from geometry on demand) is the next
+  integration, deliberately not done here.
 - **Grading concurrency is per process, not per deployment.** The semaphore
   bounds one exam run. Two Celery workers grading two students simultaneously
   are each bounded to 3, so the real ceiling is `workers × 3`. A distributed
@@ -803,7 +910,7 @@ authorization rather than token signing. The Gemini SDK is stubbed only when the
 real package is absent, and the stub raises if any test reaches a model.
 
 ```
-.venv-test/Scripts/python.exe -m pytest -q      # 437 passed
+.venv-test/Scripts/python.exe -m pytest -q      # 510 passed
 ```
 
 SQLite now enforces foreign keys (see Reliability v2), so cascade behaviour in
@@ -929,17 +1036,26 @@ rectification for photographed sheets). Their `results/` and
 
 ## Next approved phase
 
-Not yet approved. Recommended next: **enable billing on the Gemini project,
-then re-run the concurrency experiment.** The free tier allows 20 requests per
-day per model (`GenerateRequestsPerDayPerProjectPerModel-FreeTier`), and one
-33-question paper needs 33 calls, so the product cannot grade a single paper
-today and the 1-vs-3 comparison is unanswerable. This is a provisioning task,
-not a code change and not more API keys: enable billing on the project, confirm
-the deployed container's key authenticates (it currently returns 401) and is
-named `GEMINI_API_KEY_1`, then repeat the two runs from the harness described
-above.
+Not yet approved. Two independent tracks are now open, and they do not block
+each other:
+
+**Recommended next: feed accepted regions into grading evidence.** The
+structure exists and is tested but nothing reads it — `build_grading_evidence`
+still takes the legacy `ans_*_images` lists. The work is to let an exam whose
+regions are accepted produce evidence from geometry instead: generate a crop
+per region on demand from the original page, keep `crossed_out` and
+`teacher_marking` out of `student_images` by filtering on
+`STUDENT_ANSWER_TYPES`, and preserve C1's two-sided separation. That turns the
+contract from a stored representation into the thing grading actually runs on,
+and it needs no provider and no quota.
+
+Still blocked on provisioning, separately: the Gemini free tier allows 20
+requests per day per model, so no real end-to-end grading run — and therefore
+no live segmentation model either — is possible until billing is enabled.
 
 Still open as policy, deliberately untouched: account deletion cascades through
 institutional academic data, and the repository tracks real profile-picture
-files and answer-script PDFs under `data-fin/` that were committed before those
-paths were gitignored.
+files and answer-script PDFs committed before those paths were gitignored.
+
+**FOUNDATION PR STILL DEFERRED** — the merge to `main` waits on a complete real
+end-to-end grading run, which waits on provisioning.

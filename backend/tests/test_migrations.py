@@ -70,14 +70,26 @@ def test_there_is_exactly_one_head():
 
 
 def test_the_revision_chain_is_linear_and_in_order():
-    """Each revision names the one before it, with no branch and no gap."""
-    script = ScriptDirectory.from_config(alembic_config())
-    expected = ["0001", "0002", "0003"]
+    """Each revision names the one before it, with no branch and no gap.
 
-    assert script.get_revision("0001").down_revision is None
-    for previous, current in zip(expected, expected[1:]):
-        assert script.get_revision(current).down_revision == previous
-    assert script.get_current_head() == expected[-1]
+    The chain is walked from head backwards rather than hard-coded, so adding a
+    revision does not require editing this test -- only breaking the chain does.
+    """
+    script = ScriptDirectory.from_config(alembic_config())
+
+    chain = []
+    revision = script.get_current_head()
+    while revision is not None:
+        chain.append(revision)
+        down = script.get_revision(revision).down_revision
+        assert not isinstance(down, tuple), f"{revision} is a merge point"
+        revision = down
+    chain.reverse()
+
+    assert chain == sorted(chain), f"revision ids are not in order: {chain}"
+    assert chain[0] == "0001"
+    assert script.get_revision(chain[0]).down_revision is None
+    assert len(chain) == len(set(chain))
 
 
 def test_both_revisions_import_cleanly():
@@ -239,7 +251,9 @@ def _offline_sql(revision_range, url="postgresql://user:pw@host/db"):
 
 
 def test_postgresql_receives_an_alter_to_numeric_for_every_marks_column():
-    sql = _offline_sql("0001:head").lower()
+    # Scoped to the one revision under test: later revisions legitimately
+    # create tables, which the "no create table" assertion below would flag.
+    sql = _offline_sql("0001:0002").lower()
     for table, column, _nullable in (
         ("assignments", "points_possible", True),
         ("exam_results", "marks_obtained", True),

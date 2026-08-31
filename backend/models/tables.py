@@ -204,6 +204,78 @@ class QuestionResponse(Base):
     question = relationship("Question", back_populates="responses")
     student = relationship("User", back_populates="question_responses")
 
+class DocumentRegion(Base):
+    """A structured region of one page of an answer script or marking scheme.
+
+    ADDITIVE. The crop workflow (`QuestionResponse.ans_*_images`,
+    `Question.ms_*_images`) is untouched and keeps working; this table is where
+    NEW annotations record what those crops could not: which page, where on it,
+    what kind of content, whose it is, what order to read it in, and whether a
+    human has accepted it. See `backend/regions/schema.py` for the contract.
+
+    Exactly one of `answer_script_id` / `material_id` is set -- the document the
+    region lives on. `exam_id` is carried directly so authorization is one join
+    rather than three, and so a region can never be orphaned from the exam whose
+    policy governs it.
+    """
+
+    __tablename__ = "document_regions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    exam_id = Column(Integer, ForeignKey("exams.id", ondelete="CASCADE"), nullable=False, index=True)
+    # The source document. Exactly one is set; enforced in the service layer
+    # rather than by a CHECK so the rule lives with the code that explains it.
+    answer_script_id = Column(Integer, ForeignKey("answer_scripts.id", ondelete="CASCADE"), nullable=True)
+    material_id = Column(Integer, ForeignKey("materials.id", ondelete="CASCADE"), nullable=True)
+
+    #: Page within that document, 0-based. Taken from the REQUEST, never from a
+    #: provider's self-report -- see backend/ai/segmentation.py.
+    page_index = Column(Integer, nullable=False)
+
+    region_type = Column(Text, nullable=False)
+    #: "rect" or "polygon".
+    geometry_kind = Column(Text, nullable=False)
+    #: JSON, normalised to the page: every coordinate is a float in [0, 1].
+    #: Pixel coordinates would not survive a re-render at a different zoom.
+    geometry = Column(Text, nullable=False)
+
+    #: Optional semantic assignment. NULL is a legitimate, expected state: a
+    #: region whose question is unclear is kept unassigned rather than guessed.
+    question_id = Column(Integer, ForeignKey("questions.id", ondelete="SET NULL"), nullable=True)
+    question_part = Column(Text, nullable=True)
+
+    #: Explicit ordinal. Never inferred from DOM order or row id.
+    reading_order = Column(Integer, nullable=False, default=0)
+
+    #: "proposed" | "accepted" | "modified" | "rejected". A model proposal is
+    #: not an annotation until a person says so.
+    status = Column(Text, nullable=False, default="proposed")
+    #: "model" | "human". Structural only -- never a vendor name.
+    source = Column(Text, nullable=False, default="model")
+
+    # Provenance, for later benchmarking. Optional, non-sensitive, and never
+    # read by domain logic. No raw provider response, no API key.
+    provider = Column(Text, nullable=True)
+    model_name = Column(Text, nullable=True)
+    prompt_version = Column(Text, nullable=True)
+    #: JSON blob of opaque provider metadata (e.g. self-reported confidence,
+    #: which is stored but deliberately never acted on).
+    provider_metadata = Column(Text, nullable=True)
+
+    #: Optional path to a crop generated from this region. The page plus the
+    #: geometry stays authoritative; a crop is a derived artefact that can be
+    #: regenerated, which is the inversion this table exists to make possible.
+    crop_path = Column(Text, nullable=True)
+
+    created_at = Column(TIMESTAMP(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(TIMESTAMP(timezone=True), onupdate=lambda: datetime.now(timezone.utc))
+
+    exam = relationship("Exam")
+    answer_script = relationship("AnswerScript")
+    material = relationship("Material")
+    question = relationship("Question")
+
+
 class Query(Base):
     __tablename__ = "queries"
     

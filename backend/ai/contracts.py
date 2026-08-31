@@ -36,6 +36,10 @@ class AITask:
     MARKING_SCHEME_RECOGNITION = "marking_scheme_recognition"
     #: Award a mark for one answer.
     GRADING = "grading"
+    #: Propose the regions of a page: where the answers, diagrams, tables,
+    #: crossed-out work and teacher markings are. Added because segmentation is
+    #: now a real task with a real provider interface, not a placeholder.
+    SEGMENTATION = "segmentation"
 
     ALL = (
         DOCUMENT_EXTRACTION,
@@ -43,6 +47,7 @@ class AITask:
         ANSWER_RECOGNITION,
         MARKING_SCHEME_RECOGNITION,
         GRADING,
+        SEGMENTATION,
     )
 
 

@@ -3,6 +3,7 @@ from backend.models.users import User, UserSettings, LoginHistory
 from backend.models.tables import (
     Classroom, Enrollment, Assignment, Submission, 
     Announcement, Exam, ExamResult,
+    DocumentRegion,
     Query,
     AssignmentStatus, EnrollmentStatus, Role
 )

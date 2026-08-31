@@ -9,7 +9,7 @@ import logging
 # Base is no longer imported here: the schema decision moved to db_bootstrap.
 from backend.database import engine, get_db
 from backend.db_bootstrap import bootstrap_schema
-from backend.routers import auth, classes, enrollments, notifications, announcements, exams, geminiAPI, studentBackend, peopleManagement, examStats, user_routes, studentEdit, routingTasks
+from backend.routers import auth, classes, enrollments, notifications, announcements, exams, geminiAPI, studentBackend, peopleManagement, examStats, user_routes, studentEdit, routingTasks, regions
 from backend.auth import files as protected_files
 from backend.config import settings
 
@@ -74,6 +74,7 @@ app.include_router(examStats.router)
 app.include_router(studentEdit.router)  
 app.include_router(user_routes.router)
 app.include_router(routingTasks.router)
+app.include_router(regions.router)
 app.include_router(protected_files.router)
 
 @app.get("/")
