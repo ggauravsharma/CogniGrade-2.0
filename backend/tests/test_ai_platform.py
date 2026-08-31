@@ -108,6 +108,23 @@ def test_contracts_and_prompts_are_provider_neutral():
 # configuration
 # ---------------------------------------------------------------------------
 
+def test_the_default_model_is_not_a_retired_one():
+    """Live validation found the previous default had been withdrawn.
+
+    `gemini-2.0-flash` returned 404 on every call -- "no longer available" --
+    so grading was impossible until the default was repaired. A retired model
+    fails in a way that looks like a CogniGrade bug rather than an expired
+    dependency, which is exactly why it is worth pinning down.
+    """
+    from backend.ai.config import RETIRED_MODELS
+
+    assert DEFAULT_MODEL not in RETIRED_MODELS, (
+        f"{DEFAULT_MODEL} has been withdrawn by the provider"
+    )
+    for task in AITask.ALL:
+        assert get_task_settings(task).model not in RETIRED_MODELS
+
+
 def test_every_task_resolves_settings():
     for task in AITask.ALL:
         settings = get_task_settings(task)

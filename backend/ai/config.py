@@ -25,9 +25,27 @@ from backend.ai.contracts import AITask
 #: The provider every task uses today. One provider, named in one place.
 DEFAULT_PROVIDER = "gemini"
 
-#: The model in production before this phase, kept verbatim. Changing it is a
-#: benchmarking decision, not a refactor -- see the context file.
-DEFAULT_MODEL = "gemini-2.0-flash"
+#: The grading/extraction model.
+#:
+#: WAS `gemini-2.0-flash` until live validation found the provider had RETIRED
+#: it: every call returned
+#:
+#:     404 This model models/gemini-2.0-flash is no longer available.
+#:         Please update your code to use models/gemini-3.6-flash
+#:
+#: so CogniGrade could not grade anything at all. `gemini-3.6-flash` is the
+#: replacement the provider itself named, and one live grading call against it
+#: was verified to return a valid score.
+#:
+#: NOTE: this is a repair, not an endorsement. Grading QUALITY on this model has
+#: not been benchmarked -- the retired model made comparison impossible. Any
+#: task can be pinned elsewhere with `CG_AI__<TASK>__MODEL`.
+DEFAULT_MODEL = "gemini-3.6-flash"
+
+#: Models known to be withdrawn by the provider. A default must never be one of
+#: these again: the failure is a 404 on every call, which looks like a bug in
+#: CogniGrade rather than an expired dependency.
+RETIRED_MODELS = ("gemini-2.0-flash",)
 
 #: Prefix for every per-task environment override.
 ENV_PREFIX = "CG_AI"

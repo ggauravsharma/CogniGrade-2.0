@@ -583,6 +583,85 @@ concurrency=4   0.61s
 
 - 436 tests (402 + 34).
 
+### Live validation v1 — DONE (findings, not architecture)
+Real PostgreSQL + real Gemini, one prepared exam, three runs.
+
+Ran against a **disposable copy** of the development database (`pg_dump` of the
+running stack restored into a separate throwaway container). The live
+`classroom` database was never written to. Workload: the developer's own test
+exam — 39 questions, 33 with student evidence, 6 without.
+
+**FINDING 1 — the configured model had been RETIRED.** Every call returned
+
+```
+404 This model models/gemini-2.0-flash is no longer available.
+    Please update your code to use models/gemini-3.6-flash
+```
+
+CogniGrade could not grade anything at all, at any concurrency. `DEFAULT_MODEL`
+is now `gemini-3.6-flash`, the replacement the provider itself named, verified
+with one live call. `RETIRED_MODELS` plus a regression test stop a withdrawn
+model becoming the default again. **Grading QUALITY on the new model is
+unbenchmarked** — the retired model made any comparison impossible.
+
+**FINDING 2 — the deployed container's API key does not authenticate.**
+`GEMINI_API_KEY_1` inside the running `portal_backend` is rejected with
+`401 … Expected OAuth 2 access token`. The key in the repository-root `.env`
+works, but is named `GEMINI_API_KEY` while the code has always read
+`GEMINI_API_KEY_1`, so that file alone would configure nothing. Both are the
+newer `AQ.`-format keys, not legacy `AIza`. Not fixed here: `.env` is
+user-owned and gitignored.
+
+**FINDING 3 — quota, not concurrency, is the binding constraint.** Three
+consecutive runs of the same workload:
+
+```
+run          conc  wall_s  graded  failed  attempts  429-retries  lost to 429
+A (first)      1   223.4     16      23       68          51           16
+B (second)     3    31.2      3      36       93          90           30
+C (third)      1   221.9      0      39       99          98           33
+```
+
+Even the FIRST sequential run lost 16 of 33 questions to rate limiting. The
+graded count then fell 16 → 3 → 0 across runs regardless of concurrency, so the
+quota depletes monotonically and **the concurrency variable cannot be isolated**
+on this key. Run B's apparent 7× speed-up is an artefact: it finished quickly by
+failing quickly.
+
+**Concurrency verdict: INSUFFICIENT EVIDENCE.** `max_concurrency` stays at 3,
+unvalidated, with `CG_AI__GRADING__MAX_CONCURRENCY=1` as the documented control.
+Re-running this experiment needs a quota that can complete one paper
+sequentially; until then the number cannot be chosen from measurement.
+
+**What the runs DID prove, live:**
+* The **Alembic adoption path works on real data.** The restored copy was the
+  legacy pre-Alembic schema (INTEGER marks, no `grading_error_code`).
+  `stamp 0001` + `upgrade head` migrated it: existing marks preserved
+  (`1` → `1.00`, `3` → `3.00`), and an autogenerate comparison reported no drift.
+* **C1 holds live.** Six questions carried images, two carried BOTH reference and
+  student images; zero leakage between the slots, checked structurally without
+  reading image contents.
+* **C6 holds live.** 16 graded and 23 failed in run A, and no row ever carried
+  both a score and an error code. One question scored a genuine `0.0` alongside
+  23 `NULL` marks with codes — the distinction the whole invariant exists for.
+  Every run ended `grading_incomplete` with `graded_at` unset.
+* **C7 storage holds live.** Totals persisted to `NUMERIC(7,2)` (`31.00`, `3.00`,
+  `0.00`). No fractional score was produced by this marking scheme, so the
+  fractional path was not exercised beyond the existing PostgreSQL verification.
+* **The concurrency machinery is sound.** At concurrency 3 all 39 questions were
+  accounted for, failures were isolated per question, results came back in
+  question order, and there were no session, transaction or duplicate-write
+  errors. The provider-neutral error taxonomy classified every failure
+  (`rate_limit`, `malformed_json`, `no_student_evidence`).
+* **Result consistency:** the three questions graded in both runs A and B scored
+  identically.
+
+**FINDING 4 — `create_async_engine(..., echo=True)`** logs every statement,
+including the grading reason the model wrote about a student's answer. It also
+raised a `UnicodeEncodeError` in the logging handler on a Windows console (a Ω
+in a physics answer). Verbose SQL echo is a privacy and noise problem in a
+grading system. Not fixed here; recorded below.
+
 ---
 
 ## Authorization model
@@ -648,6 +727,16 @@ been removed from this list.
   re-evaluate-all routes grade one question at a time. They could reuse
   `run_bounded`, but they were deliberately left alone: v2 scoped itself to the
   initial exam run, where the session/persistence split was the hard part.
+- **The Gemini quota on the current key cannot grade one paper.** Live
+  validation lost 16 of 33 questions to rate limiting on a fresh sequential run,
+  and 33 of 33 by the third run. Until quota is raised, grading is not usable
+  end to end and no concurrency setting can be chosen from measurement.
+- **Grading quality on `gemini-3.6-flash` is unbenchmarked.** The default was
+  changed because the previous model was withdrawn, not because the new one was
+  evaluated.
+- **`backend/database.py` sets `echo=True`**, logging every SQL statement --
+  including model-written grading reasons about student answers -- and it
+  crashed the logging handler on a non-ASCII character during live validation.
 - **Grading concurrency is per process, not per deployment.** The semaphore
   bounds one exam run. Two Celery workers grading two students simultaneously
   are each bounded to 3, so the real ceiling is `workers × 3`. A distributed
@@ -685,7 +774,7 @@ authorization rather than token signing. The Gemini SDK is stubbed only when the
 real package is absent, and the stub raises if any test reaches a model.
 
 ```
-.venv-test/Scripts/python.exe -m pytest -q      # 436 passed
+.venv-test/Scripts/python.exe -m pytest -q      # 437 passed
 ```
 
 SQLite now enforces foreign keys (see Reliability v2), so cascade behaviour in
@@ -811,16 +900,17 @@ rectification for photographed sheets). Their `results/` and
 
 ## Next approved phase
 
-Not yet approved. Recommended next: **measure grading against a real
-PostgreSQL + Celery + Gemini run, at concurrency 1 and 3, on one real paper.**
-Everything about v2 is proven against fakes: the semaphore bound, failure
-isolation, ordering, session safety and the wall-clock shape. What is NOT known
-is how Gemini's actual rate limiting responds to three concurrent grading calls
-on the deployment's own quota — whether the full-jitter retry absorbs it, or
-whether the default should be 2. That needs one controlled run with real
-credentials and a real answer script, and it is the last thing standing between
-this and a confident prototype demo.
+Not yet approved. Recommended next: **resolve the Gemini quota, then re-run the
+concurrency experiment.** Live validation showed the current key cannot complete
+one 33-question paper even sequentially — 16 of 33 lost to rate limiting on a
+fresh run, 33 of 33 by the third — so the 1-vs-3 comparison is unanswerable and,
+more importantly, the product cannot grade a real paper today. That is a billing
+and key-provisioning task, not a code change: enable billing or provision a key
+with adequate requests-per-minute, confirm the deployed container's key
+authenticates (it currently returns 401), then repeat the two runs from the
+harness described above.
 
 Still open as policy, deliberately untouched: account deletion cascades through
 institutional academic data, and the repository tracks real profile-picture
-files. Both are recorded above.
+files and answer-script PDFs under `data-fin/` that were committed before those
+paths were gitignored.
