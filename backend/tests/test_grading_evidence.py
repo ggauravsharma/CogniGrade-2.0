@@ -207,13 +207,58 @@ def test_missing_question_response_is_safe():
 
 @pytest.mark.parametrize("kwargs,expected", [
     ({}, ""),
+    # one category at a time
     ({"diagram": ["d"]}, "diagrams"),
     ({"table": ["t"]}, "tables"),
-    ({"diagram": ["d"], "table": ["t"]}, "diagrams and tables"),
-    ({"text": ["x"]}, "images"),
+    ({"math": ["m"]}, "mathematical working"),
+    ({"text": ["x"]}, "text images"),
+    # combinations: EVERY present category is named, in attachment order
+    ({"table": ["t"], "diagram": ["d"]}, "tables and diagrams"),
+    ({"math": ["m"], "diagram": ["d"]}, "mathematical working and diagrams"),
+    ({"math": ["m"], "table": ["t"]}, "mathematical working and tables"),
+    ({"math": ["m"], "table": ["t"], "diagram": ["d"]},
+     "mathematical working, tables and diagrams"),
+    ({"text": ["x"], "math": ["m"], "table": ["t"], "diagram": ["d"]},
+     "text images, mathematical working, tables and diagrams"),
 ])
 def test_descriptor_matches_contents(kwargs, expected):
     assert ImageSet(**kwargs).descriptor() == expected
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"math": ["m"]},
+    {"math": ["m"], "diagram": ["d"]},
+    {"math": ["m"], "table": ["t"]},
+])
+def test_maths_is_never_described_as_a_diagram(kwargs):
+    """It used to be bucketed as one, so the prompt asserted something false."""
+    described = ImageSet(**kwargs).descriptor()
+    assert "mathematical working" in described
+    if not kwargs.get("diagram"):
+        assert "diagram" not in described
+
+
+def test_a_category_with_no_files_is_never_mentioned():
+    described = ImageSet(table=["t"]).descriptor()
+    assert described == "tables"
+    for absent in ("diagram", "mathematical", "text"):
+        assert absent not in described
+
+
+def test_the_descriptor_names_every_attached_category():
+    """The old implementation returned the FIRST match and hid the rest."""
+    from backend.grading.evidence import CATEGORY_LABELS
+
+    full = ImageSet(text=["x"], math=["m"], table=["t"], diagram=["d"])
+    described = full.descriptor()
+    for label in CATEGORY_LABELS.values():
+        assert label in described, f"{label} was attached but not described"
+
+
+def test_present_categories_follows_attachment_order():
+    full = ImageSet(text=["x"], math=["m"], table=["t"], diagram=["d"])
+    assert full.present_categories == ("text", "math", "table", "diagram")
+    assert full.all_paths == ["x", "m", "t", "d"]
 
 
 def test_empty_imageset_reports_nothing_present():
@@ -379,3 +424,70 @@ async def test_missing_reference_leaves_reference_slot_absent(fake_provider, tmp
     )
     paths = provider.last_paths()
     assert paths == [str(ans_path)]
+
+
+# ---------------------------------------------------------------------------
+# what the descriptor actually says in the assembled prompt
+# ---------------------------------------------------------------------------
+
+def _prompt_text(evidence, *, marking_scheme="the scheme", ideal_answer=None):
+    """The concatenated text of one assembled grading prompt."""
+    from backend.ai.contracts import TextPart
+    from backend.routers.geminiAPI import _build_diagram_prompt_parts
+
+    parts = _build_diagram_prompt_parts(
+        make_question(), evidence,
+        marking_scheme=marking_scheme, ideal_answer=ideal_answer,
+    )
+    return "\n".join(p.text for p in parts if isinstance(p, TextPart))
+
+
+def _evidence_with(student_images, *, answer_text="the recognised answer"):
+    return GradingEvidence(
+        question_text="q", max_marks=5,
+        marking_scheme_text="the scheme",
+        student_answer_text=answer_text,
+        student_images=student_images,
+    )
+
+
+def test_the_prompt_never_calls_attached_mathematics_a_diagram():
+    """The mapping used to file maths under `diagram`, so the prompt said so."""
+    text = _prompt_text(_evidence_with(ImageSet(math=["/tmp/m.png"])))
+    assert "mathematical working" in text
+    assert "diagram" not in text
+
+
+def test_the_prompt_names_every_attached_student_category():
+    text = _prompt_text(_evidence_with(
+        ImageSet(math=["/tmp/m.png"], table=["/tmp/t.png"], diagram=["/tmp/d.png"])
+    ))
+    assert "mathematical working, tables and diagrams" in text
+
+
+def test_the_prompt_omits_categories_with_no_files():
+    text = _prompt_text(_evidence_with(ImageSet(table=["/tmp/t.png"])))
+    assert "the attached tables" in text
+    assert "mathematical working" not in text
+    assert "diagrams" not in text
+
+
+def test_the_prompt_describes_the_two_sides_separately():
+    """A student category must never be announced in the marking-scheme slot."""
+    evidence = GradingEvidence(
+        question_text="q", max_marks=5,
+        marking_scheme_text="the scheme",
+        reference_images=ImageSet(diagram=["/tmp/ms.png"]),
+        student_answer_text="answer",
+        student_images=ImageSet(math=["/tmp/m.png"]),
+    )
+    text = _prompt_text(evidence)
+    scheme_half, student_half = text.split("Grade the following student answer", 1)
+    assert "diagrams" in scheme_half and "mathematical working" not in scheme_half
+    assert "mathematical working" in student_half
+
+
+def test_a_question_with_no_student_images_says_nothing_about_attachments():
+    text = _prompt_text(_evidence_with(ImageSet()))
+    for label in ("the attached", "mathematical working", "tables", "diagrams"):
+        assert label not in text.split("Grade the following student answer", 1)[1]

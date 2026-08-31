@@ -68,22 +68,60 @@ def parse_image_paths(raw: Any) -> list[str]:
     return [v for v in values if isinstance(v, str) and v.strip()]
 
 
+#: The kinds of visual evidence one side of the comparison can carry, in the
+#: order they are attached and described.
+#:
+#: `math` is its own category rather than a flavour of `diagram`. Handwritten
+#: mathematics and a drawn figure are read differently -- one is followed step
+#: by step for method marks, the other is checked for structure and labels --
+#: and a prompt that calls an attached derivation "a diagram" is telling the
+#: grader something false about the evidence in front of it. The category also
+#: happens to be the routing key a future HMER stage needs, but it earns its
+#: place on honesty alone.
+EVIDENCE_CATEGORIES: tuple[str, ...] = ("text", "math", "table", "diagram")
+
+#: How each category is named to a grader. Provider-neutral wording, and true
+#: of BOTH sides: `text` covers marking-scheme text images as well as a
+#: student's, so it must not say "handwritten".
+CATEGORY_LABELS: dict[str, str] = {
+    "text": "text images",
+    "math": "mathematical working",
+    "table": "tables",
+    "diagram": "diagrams",
+}
+
+
+def _join_labels(labels: Sequence[str]) -> str:
+    """`a`, `a and b`, `a, b and c` -- an English list, not a comma-joined dump."""
+    labels = list(labels)
+    if not labels:
+        return ""
+    if len(labels) == 1:
+        return labels[0]
+    return ", ".join(labels[:-1]) + " and " + labels[-1]
+
+
 @dataclass(frozen=True)
 class ImageSet:
     """Image paths for one side of the comparison, split by kind."""
 
     text: list[str] = field(default_factory=list)
+    math: list[str] = field(default_factory=list)
     table: list[str] = field(default_factory=list)
     diagram: list[str] = field(default_factory=list)
 
     @property
     def all_paths(self) -> list[str]:
-        """Every path, in a stable order: text, then tables, then diagrams."""
-        return [*self.text, *self.table, *self.diagram]
+        """Every path, in a stable order: text, maths, tables, then diagrams."""
+        return [*self.text, *self.math, *self.table, *self.diagram]
 
     @property
     def has_any(self) -> bool:
         return bool(self.all_paths)
+
+    @property
+    def has_math(self) -> bool:
+        return bool(self.math)
 
     @property
     def has_table(self) -> bool:
@@ -93,21 +131,32 @@ class ImageSet:
     def has_diagram(self) -> bool:
         return bool(self.diagram)
 
-    def descriptor(self) -> str:
-        """Short natural-language name for what is attached, or ''.
+    def paths_for(self, category: str) -> list[str]:
+        """The paths in one category. Raises on a category that does not exist."""
+        if category not in EVIDENCE_CATEGORIES:
+            raise KeyError(f"unknown evidence category: {category!r}")
+        return getattr(self, category)
 
-        Replaces the previous `check_image_presence` helper, which returned
-        three booleans and reported `image_present=True` as its initial value.
+    @property
+    def present_categories(self) -> tuple[str, ...]:
+        """Every category that actually holds a file, in attachment order."""
+        return tuple(c for c in EVIDENCE_CATEGORIES if getattr(self, c))
+
+    def descriptor(self) -> str:
+        """Natural-language name for EVERYTHING attached, or ''.
+
+        Enumerates every category present rather than the first one that
+        matches. The previous implementation returned a single phrase, so a
+        question carrying maths, a table and a diagram was described to the
+        grader as "diagrams" -- three kinds of evidence attached and two of
+        them unannounced. A category with no files is never mentioned.
+
+        Replaces the older `check_image_presence` helper, which returned three
+        booleans and reported `image_present=True` as its initial value.
         """
-        if self.has_diagram and self.has_table:
-            return "diagrams and tables"
-        if self.has_diagram:
-            return "diagrams"
-        if self.has_table:
-            return "tables"
-        if self.text:
-            return "images"
-        return ""
+        return _join_labels(
+            [CATEGORY_LABELS[c] for c in self.present_categories]
+        )
 
 
 @dataclass(frozen=True)
@@ -179,6 +228,10 @@ def build_grading_evidence(
 
     student_images = ImageSet(
         text=[],  # see docstring: already represented by the extracted text
+        # No legacy column carries mathematics: the old crop editor had three
+        # buckets and maths went into whichever one the teacher picked. Only
+        # structured regions can populate this, so it stays empty here.
+        math=[],
         table=parse_image_paths(getattr(question_response, "ans_table_images", None)),
         diagram=parse_image_paths(getattr(question_response, "ans_diagram_images", None)),
     )

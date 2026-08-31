@@ -7,6 +7,31 @@ Branch: `cognigrade-improvements` · Fork: `ggauravsharma/CogniGrade-2.0`
 
 ---
 
+## What CogniGrade is
+
+An **AI-first** automated assessment system. The normal path is fully
+automatic:
+
+```
+question paper / marking scheme / answer script uploaded
+  → the model does the document understanding, recognition and question mapping
+  → automatic grading
+  → aggregation
+  → results
+```
+
+A human is an **exception path only**: model failure, model uncertainty, a
+detected anomaly, or a teacher's correction/override.
+
+CogniGrade is therefore **not** an annotation platform, not a LabelMe-style
+labelling tool, and not a dataset-labelling workflow. The region API and the
+read-only overlay exist to carry *structured model output* into grading, not to
+put a drawing task in front of a teacher. **Do not build a manual region editor
+as the normal workflow.** Manual endpoints stay as an exception/correction
+seam; they must never become the route an ordinary exam travels.
+
+---
+
 ## Standing architecture rule
 
 Gemini is the **current** AI provider, not the architecture. CogniGrade must stay
@@ -815,7 +840,9 @@ reference slot — asserted.
 **Precedence** (`backend/grading/region_evidence.build_evidence`):
 usable accepted/modified regions → structured; otherwise → legacy crops,
 byte-for-byte as before. Structured **replaces** the legacy student images, it
-is never added to them, so the same answer is never sent twice.
+is never added to them, so the same answer is never sent twice. **SUPERSEDED**
+by Region Safety & Evidence Semantics v1 below: whole-set replacement lost
+unrelated legacy evidence, and precedence is now decided per category.
 
 **Fallback is not a catch-all.** It covers "there is nothing structured to
 use". It does NOT cover "there was, and producing it failed": a render,
@@ -836,11 +863,9 @@ downstream graders expect an opaque page-like background. Nothing is drawn onto
 the pixels: no question number, part, order or type. Those stay columns.
 
 **Type → bucket:** `handwritten_text → text`, `table → table`,
-`diagram → diagram`, and **`math → diagram`**. That last is a documented
-temporary compromise, not a claim that mathematics is a picture: `ImageSet` has
-three buckets, `text` is reserved for content already converted to `answer_text`
-upstream, and a math crop placed there would be an image the prompt describes as
-text and never mentions. It belongs with diagrams until an HMER stage exists.
+`diagram → diagram`, and `math → diagram`. **SUPERSEDED** by Region Safety &
+Evidence Semantics v1 below: `math` is now its own category and handwritten
+text is no longer attached at all.
 
 **Lifecycle.** `CropWorkspace` is a context manager over a private temp
 directory, removed on success, failure and cancellation alike. Nothing is ever
@@ -865,6 +890,108 @@ binary and no system dependency (unlike pdf2image/poppler). Its absence is an
 explicit `page_render_unavailable` preparation failure, not a crash.
 
 - 557 tests (510 + 47). **NO LIVE PROVIDER CALLS — zero quota.**
+
+---
+
+### Region Safety & Evidence Semantics v1 — DONE
+
+A report-only audit of the two region commits concluded: **no revert needed**,
+the normal grading workflow is unchanged, the legacy path still works, and the
+region architecture is useful AI-first infrastructure worth keeping. It found
+four narrow correctness/safety defects, all confirmed against HEAD and all
+fixed here. No feature was added and nothing was reverted.
+
+**A — the production route defaulted to the fake segmentation provider.**
+`SegmentationRun.provider` defaulted to `"fake"`, and the router is registered
+in production, so an ordinary authenticated request against a real answer
+script persisted synthetic regions on a real student's paper — indistinguishable
+from a model's once stored. Fixed by removing provider choice from the request
+body entirely. The provider is now resolved from deployment configuration
+(`resolve_segmentation_provider`, reading `CG_AI__SEGMENTATION__PROVIDER` like
+every other task), the segmentation task's configured provider is **empty by
+default** (`NO_PROVIDER`), and an unconfigured or misconfigured deployment gets
+`ProviderNotConfiguredError` → **503 `segmentation_not_configured`** with
+nothing written: no rows, no `replace_existing` deletions, no commit. The fake
+stays available to tests through that same configuration key (the
+`segmentation_configured` fixture) — never through a client.
+
+**B — mathematics was described to the grader as a diagram.** `math` mapped to
+the `diagram` bucket, so the prompt told the model that an attached handwritten
+derivation was a picture. `ImageSet` now has a fourth category and the mapping
+is honest.
+
+**C — structured evidence replaced the whole student `ImageSet`.** One accepted
+table region deleted a valid legacy diagram from the prompt, silently. Fixed by
+per-category precedence.
+
+**D — handwritten-text crops were attached alongside the recognised text.**
+`handwritten_text → text` would have sent the same sentences twice. Now
+explicitly not attached.
+
+**Evidence categories** (`backend/grading/evidence.py`), both sides:
+
+```
+text     "text images"             math   "mathematical working"
+table    "tables"                  diagram "diagrams"
+```
+
+`ImageSet.descriptor()` now **enumerates every category that holds a file**, in
+that order — "mathematical working, tables and diagrams" — instead of returning
+the first phrase that matched and leaving the rest unannounced. A category with
+no files is never mentioned.
+
+**Structured vs legacy precedence, per category:**
+
+```
+math     structured crops if any were produced, else legacy (always empty)
+table    structured crops if any were produced, else legacy ans_table_images
+diagram  structured crops if any were produced, else legacy ans_diagram_images
+text     never attached on the student side, from either source
+```
+
+So a structured table and a legacy diagram both survive, while a structured
+diagram and a stale legacy diagram are never both sent. `EvidenceSource` gained
+`mixed` for that middle case, so telemetry does not overstate how much of a
+prompt reflects the current annotation.
+
+**Handwritten-text policy — decided, not defaulted.** The recognition stage
+already turns handwriting into `answer_text`, and the legacy path has always
+passed `student ImageSet.text = []` for that reason. A `handwritten_text`
+region is therefore selected, counted and question-assigned, but **never
+rendered and never attached**: no crop is generated at all, so it costs no
+rasterisation. If a later phase wants raw handwriting as a distinct multimodal
+signal, it belongs in `text` *with the recognised text suppressed*, not
+alongside it.
+
+**"Usable" now means evidence actually produced**, not "an accepted region
+exists" (`attachable_regions`). An accepted handwritten-text region attaches
+nothing, so it cannot displace a valid legacy diagram — and a missing source
+document in that case is not a preparation failure, because there was never any
+structured evidence to fail at producing.
+
+**Fail-closed behaviour preserved.** Where a region *would* attach an image and
+the source document is missing or unrenderable, it is still
+`RegionEvidenceError` → preparation failure with NO mark (C6). Silently
+substituting a legacy crop could produce a plausible but wrong mark, and the
+repository holds no evidence that a legacy crop corresponds to the current
+accepted state.
+
+**Non-answer types unchanged and re-asserted:** `crossed_out`,
+`teacher_marking`, `page_furniture`, `printed_text`, `other` never become
+student evidence, and `proposed`/`rejected` still never grade.
+
+**`PROPOSED` was NOT made gradeable.** A raw model proposal and a
+deterministically validated result are different things, and only the second
+should grade unattended. The intended future shape is
+`model prediction → deterministic validation → auto-accepted/validated →
+grading`, with anomalies staying `proposed`. `DocumentRegion.status` is plain
+text with no DB enum or check constraint, so a future `auto_accepted` /
+`validated` value needs **no migration** — only a change to
+`RegionStatus.ALL`/`USABLE` and the tests that pin them. Deferred deliberately:
+real segmentation integration should decide that policy, not this phase.
+
+- 607 tests (557 + 50). **NO LIVE PROVIDER CALLS — zero quota. No migration.**
+- C1 PASS · C6 PASS · C7 PASS.
 
 ---
 
@@ -993,7 +1120,7 @@ authorization rather than token signing. The Gemini SDK is stubbed only when the
 real package is absent, and the stub raises if any test reaches a model.
 
 ```
-.venv-test/Scripts/python.exe -m pytest -q      # 557 passed
+.venv-test/Scripts/python.exe -m pytest -q      # 607 passed
 ```
 
 SQLite now enforces foreign keys (see Reliability v2), so cascade behaviour in
@@ -1119,15 +1246,20 @@ rectification for photographed sheets). Their `results/` and
 
 ## Next approved phase
 
-Not yet approved. Recommended next: **let the crop editor write regions instead
-of only crops.** The backend now prefers accepted structured regions and falls
-back to legacy crops, and the region API and overlay both exist — but the only
-way to create a region today is the API directly, so no real exam benefits. The
-work is to make the existing editor POST geometry (it already computes boxes and
-freehand paths, and `regionToGeometry` in `frontend/region-overlay.js` is the
-conversion) alongside or instead of the cropped PNG, and to let a professor
-accept or correct proposals in the same view. That closes the loop from
-annotation to grading without a provider and without quota.
+Not yet approved. Recommended next: **an offline end-to-end reliability harness
+for the automatic pipeline** — one deterministic run of upload → recognition →
+grading → aggregation → results against stubbed providers, asserting that a
+whole exam completes, that a single failed question yields NULL marks and a
+failure code rather than a zero, and that aggregation refuses to finalise while
+any mark is missing. Every stage is unit-tested in isolation today and none of
+them is tested joined up, which is where a real run will break first. Zero
+quota, no new schema.
+
+Explicitly NOT recommended: region-editor development. The previous
+recommendation here (making the crop editor POST geometry) would have made
+manual annotation part of the normal workflow, which is the opposite of the
+AI-first goal — see **What CogniGrade is**. Regions should arrive from a
+segmentation model and deterministic validation, not from a drawing task.
 
 Still blocked on provisioning, separately: the Gemini free tier allows 20
 requests per day per model, so no real end-to-end grading run — and no live

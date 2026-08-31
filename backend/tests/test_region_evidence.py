@@ -38,9 +38,12 @@ from backend.regions.cropping import (
     crop_region,
 )
 from backend.regions.evidence import (
+    NON_ATTACHED_STUDENT_TYPES,
     REGION_TYPE_TO_BUCKET,
     EvidenceSource,
+    attachable_regions,
     build_region_image_set,
+    merge_student_evidence,
     select_gradeable_regions,
 )
 from backend.regions.schema import GeometryKind, RegionSource, RegionStatus, RegionType
@@ -340,26 +343,36 @@ def test_selection_order_does_not_depend_on_input_order():
 # region type -> evidence bucket
 # ---------------------------------------------------------------------------
 
-def test_every_student_answer_type_has_a_bucket():
+def test_every_student_answer_type_is_either_attached_or_explicitly_not():
+    """No student-answer type may fall through unhandled."""
     from backend.regions.schema import STUDENT_ANSWER_TYPES
 
     for region_type in STUDENT_ANSWER_TYPES:
-        assert region_type in REGION_TYPE_TO_BUCKET
+        attached = region_type in REGION_TYPE_TO_BUCKET
+        withheld = region_type in NON_ATTACHED_STUDENT_TYPES
+        assert attached != withheld, f"{region_type} is both or neither"
 
 
 def test_no_non_answer_type_has_a_bucket():
     for region_type in (RegionType.TEACHER_MARKING, RegionType.CROSSED_OUT,
                         RegionType.PAGE_FURNITURE, RegionType.PRINTED_TEXT):
         assert region_type not in REGION_TYPE_TO_BUCKET
+        assert region_type not in NON_ATTACHED_STUDENT_TYPES
 
 
 def test_the_mapping_is_the_documented_one():
     assert REGION_TYPE_TO_BUCKET == {
-        RegionType.HANDWRITTEN_TEXT: "text",
-        RegionType.MATH: "diagram",
+        RegionType.MATH: "math",
         RegionType.DIAGRAM: "diagram",
         RegionType.TABLE: "table",
     }
+    assert NON_ATTACHED_STUDENT_TYPES == (RegionType.HANDWRITTEN_TEXT,)
+
+
+def test_maths_is_not_bucketed_as_a_diagram():
+    """It was, and the prompt then told the grader the derivation was a picture."""
+    assert REGION_TYPE_TO_BUCKET[RegionType.MATH] == "math"
+    assert REGION_TYPE_TO_BUCKET[RegionType.MATH] != REGION_TYPE_TO_BUCKET[RegionType.DIAGRAM]
 
 
 def test_regions_land_in_their_mapped_buckets(page_image):
@@ -371,10 +384,74 @@ def test_regions_land_in_their_mapped_buckets(page_image):
     ]
     with CropWorkspace() as workspace:
         result = build_region_image_set(regions, source_path=page_image, workspace=workspace)
-        assert result.buckets == {"text": 1, "table": 1, "diagram": 2}
+        # handwritten text is counted, not attached; maths has its own bucket
+        assert result.buckets == {"text": 0, "math": 1, "table": 1, "diagram": 1}
+        assert result.not_attached_count == 1
         assert result.source == EvidenceSource.STRUCTURED_REGIONS
         assert result.region_count == 4
-        assert len(result.image_set.all_paths) == 4
+        assert len(result.image_set.all_paths) == 3
+        assert result.image_set.text == []
+        assert result.covered_categories == ("math", "table", "diagram")
+
+
+def test_a_handwritten_text_region_is_never_rendered(page_image):
+    """No crop, so no cost -- and nothing to duplicate answer_text with."""
+    regions = [_Region(1, region_type=RegionType.HANDWRITTEN_TEXT)]
+    with CropWorkspace() as workspace:
+        result = build_region_image_set(regions, source_path=page_image, workspace=workspace)
+        assert result.image_set.all_paths == []
+        assert result.covered_categories == ()
+        assert result.not_attached_count == 1
+        assert result.render_count == 0, "a page was rasterised for a crop we discard"
+        assert workspace.paths == []
+
+
+# ---------------------------------------------------------------------------
+# per-category composition
+# ---------------------------------------------------------------------------
+
+def test_structured_wins_only_the_categories_it_covers():
+    legacy = ImageSet(table=["legacy-table.png"], diagram=["legacy-diagram.png"])
+    structured = ImageSet(table=["fresh-table.png"])
+    merged = merge_student_evidence(
+        legacy=legacy, structured=structured, covered=("table",)
+    )
+    assert merged.table == ["fresh-table.png"]
+    assert merged.diagram == ["legacy-diagram.png"], "an unrelated legacy category was erased"
+
+
+def test_a_covered_category_never_carries_both():
+    legacy = ImageSet(diagram=["legacy-diagram.png"])
+    structured = ImageSet(diagram=["fresh-diagram.png"])
+    merged = merge_student_evidence(
+        legacy=legacy, structured=structured, covered=("diagram",)
+    )
+    assert merged.diagram == ["fresh-diagram.png"]
+    assert "legacy-diagram.png" not in merged.all_paths
+
+
+def test_structured_maths_leaves_legacy_tables_alone():
+    legacy = ImageSet(table=["legacy-table.png"])
+    structured = ImageSet(math=["fresh-math.png"])
+    merged = merge_student_evidence(
+        legacy=legacy, structured=structured, covered=("math",)
+    )
+    assert merged.math == ["fresh-math.png"]
+    assert merged.table == ["legacy-table.png"]
+
+
+def test_covering_nothing_leaves_legacy_untouched():
+    legacy = ImageSet(table=["t.png"], diagram=["d.png"])
+    merged = merge_student_evidence(legacy=legacy, structured=ImageSet(), covered=())
+    assert merged == legacy
+
+
+def test_attachable_regions_ignores_types_that_attach_nothing():
+    regions = [
+        _Region(1, region_type=RegionType.HANDWRITTEN_TEXT),
+        _Region(2, region_type=RegionType.TABLE),
+    ]
+    assert [r.id for r in attachable_regions(regions)] == [2]
 
 
 def test_multi_page_regions_render_each_page_once(tmp_path, page_image):
@@ -385,10 +462,12 @@ def test_multi_page_regions_render_each_page_once(tmp_path, page_image):
     second = Image.new("RGB", first.size, (0, 255, 0))
     first.save(pdf, "PDF", resolution=72.0, save_all=True, append_images=[second])
 
+    # Explicitly an attachable type: handwritten text is never rendered, so
+    # the stub default would exercise nothing here.
     regions = [
-        _Region(1, page_index=0, reading_order=0),
-        _Region(2, page_index=0, reading_order=1),
-        _Region(3, page_index=1, reading_order=0),
+        _Region(1, page_index=0, reading_order=0, region_type=RegionType.DIAGRAM),
+        _Region(2, page_index=0, reading_order=1, region_type=RegionType.DIAGRAM),
+        _Region(3, page_index=1, reading_order=0, region_type=RegionType.DIAGRAM),
     ]
     renderer = PageRenderer(str(pdf))
     with CropWorkspace() as workspace:
@@ -630,6 +709,320 @@ async def test_the_answer_script_is_resolved_from_the_database_not_a_client(db, 
     assert script is not None
     assert script.student_id == world["student_a"].id
     assert script.exam_id == world["exam_a"].id
+
+
+# ---------------------------------------------------------------------------
+# structured vs legacy: precedence is decided one category at a time
+# ---------------------------------------------------------------------------
+
+async def _response_with(db, world, *, table=None, diagram=None, answer_text=None):
+    question, student = world["q1"], world["student_a"]
+    response = (await db.execute(select(QuestionResponse).where(
+        QuestionResponse.question_id == question.id,
+        QuestionResponse.student_id == student.id,
+    ))).scalars().first()
+    if table is not None:
+        response.ans_table_images = json.dumps(table)
+    if diagram is not None:
+        response.ans_diagram_images = json.dumps(diagram)
+    if answer_text is not None:
+        response.answer_text = answer_text
+    await db.commit()
+    return response
+
+
+async def _build(db, world, response, workspace):
+    return await build_evidence(
+        question=world["q1"], question_response=response,
+        exam_id=world["exam_a"].id, student_id=world["student_a"].id, db=db,
+        workspace=workspace, marking_scheme="scheme",
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_structured_table_does_not_erase_a_legacy_diagram(db, world, page_image):
+    """The silent evidence-loss bug: one accepted region emptied the whole set."""
+    script = await _script(db, world)
+    await _point_script_at(db, script, page_image)
+    response = await _response_with(db, world, diagram=["/tmp/legacy-diagram.png"])
+    await _add_region(db, world, script, question_id=world["q1"].id,
+                      region_type=RegionType.TABLE)
+
+    with CropWorkspace() as workspace:
+        evidence, result = await _build(db, world, response, workspace)
+        assert result.source == EvidenceSource.MIXED
+        assert result.covered_categories == ("table",)
+        assert len(evidence.student_images.table) == 1
+        assert all(workspace.directory in p for p in evidence.student_images.table)
+        assert evidence.student_images.diagram == ["/tmp/legacy-diagram.png"], (
+            "REGRESSION: an unrelated legacy category was erased"
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_structured_diagram_replaces_the_legacy_diagram(db, world, page_image):
+    """Within a category the annotation is authoritative; the crop may be stale."""
+    script = await _script(db, world)
+    await _point_script_at(db, script, page_image)
+    response = await _response_with(db, world, diagram=["/tmp/legacy-diagram.png"])
+    await _add_region(db, world, script, question_id=world["q1"].id,
+                      region_type=RegionType.DIAGRAM)
+
+    with CropWorkspace() as workspace:
+        evidence, result = await _build(db, world, response, workspace)
+        assert result.source == EvidenceSource.STRUCTURED_REGIONS
+        assert len(evidence.student_images.diagram) == 1
+        assert "/tmp/legacy-diagram.png" not in evidence.student_images.all_paths, (
+            "the same answer was sent twice, once from a stale crop"
+        )
+
+
+@pytest.mark.asyncio
+async def test_structured_maths_leaves_a_legacy_table_in_place(db, world, page_image):
+    script = await _script(db, world)
+    await _point_script_at(db, script, page_image)
+    response = await _response_with(db, world, table=["/tmp/legacy-table.png"])
+    await _add_region(db, world, script, question_id=world["q1"].id,
+                      region_type=RegionType.MATH)
+
+    with CropWorkspace() as workspace:
+        evidence, result = await _build(db, world, response, workspace)
+        assert result.source == EvidenceSource.MIXED
+        assert result.covered_categories == ("math",)
+        assert len(evidence.student_images.math) == 1
+        assert evidence.student_images.table == ["/tmp/legacy-table.png"]
+        assert evidence.student_images.diagram == []
+
+
+@pytest.mark.asyncio
+async def test_structured_maths_is_never_filed_as_a_diagram(db, world, page_image):
+    """It used to be, and the prompt then described the derivation as a picture."""
+    script = await _script(db, world)
+    await _point_script_at(db, script, page_image)
+    response = await _response_with(db, world)
+    await _add_region(db, world, script, question_id=world["q1"].id,
+                      region_type=RegionType.MATH)
+
+    with CropWorkspace() as workspace:
+        evidence, _result = await _build(db, world, response, workspace)
+        assert evidence.student_images.diagram == []
+        assert len(evidence.student_images.math) == 1
+        described = evidence.student_images.descriptor()
+        assert described == "mathematical working"
+        assert "diagram" not in described
+
+
+@pytest.mark.asyncio
+async def test_maths_and_a_legacy_diagram_are_both_described(db, world, page_image):
+    """Every attached category reaches the prompt wording, not just the first."""
+    script = await _script(db, world)
+    await _point_script_at(db, script, page_image)
+    response = await _response_with(db, world, diagram=["/tmp/legacy-diagram.png"])
+    await _add_region(db, world, script, question_id=world["q1"].id,
+                      region_type=RegionType.MATH)
+
+    with CropWorkspace() as workspace:
+        evidence, result = await _build(db, world, response, workspace)
+        assert result.source == EvidenceSource.MIXED
+        assert evidence.student_images.descriptor() == "mathematical working and diagrams"
+
+
+@pytest.mark.asyncio
+async def test_no_structured_visual_evidence_leaves_legacy_untouched(db, world, page_image):
+    """Accepted handwritten text attaches nothing, so it displaces nothing."""
+    script = await _script(db, world)
+    await _point_script_at(db, script, page_image)
+    response = await _response_with(
+        db, world, table=["/tmp/legacy-table.png"], diagram=["/tmp/legacy-diagram.png"],
+    )
+    await _add_region(db, world, script, question_id=world["q1"].id,
+                      region_type=RegionType.HANDWRITTEN_TEXT)
+
+    with CropWorkspace() as workspace:
+        evidence, result = await _build(db, world, response, workspace)
+        assert result.source == EvidenceSource.LEGACY_CROPS
+        assert result.not_attached_count == 1
+        assert evidence.student_images.table == ["/tmp/legacy-table.png"]
+        assert evidence.student_images.diagram == ["/tmp/legacy-diagram.png"]
+
+
+# ---------------------------------------------------------------------------
+# handwritten text: represented, transcribed, never attached twice
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_handwritten_text_region_does_not_duplicate_the_answer_text(
+    db, world, page_image
+):
+    """`answer_text` already carries the handwriting; the crop must not follow it."""
+    script = await _script(db, world)
+    await _point_script_at(db, script, page_image)
+    response = await _response_with(db, world, answer_text="the recognised answer")
+    await _add_region(db, world, script, question_id=world["q1"].id,
+                      region_type=RegionType.HANDWRITTEN_TEXT)
+
+    with CropWorkspace() as workspace:
+        evidence, _result = await _build(db, world, response, workspace)
+        assert evidence.student_answer_text == "the recognised answer"
+        assert evidence.student_images.text == []
+        assert evidence.student_images.all_paths == []
+        assert workspace.paths == [], "a crop was generated for content already in the prompt"
+
+
+@pytest.mark.asyncio
+async def test_handwritten_text_alongside_a_table_attaches_only_the_table(
+    db, world, page_image
+):
+    script = await _script(db, world)
+    await _point_script_at(db, script, page_image)
+    response = await _response_with(db, world, answer_text="the recognised answer")
+    await _add_region(db, world, script, question_id=world["q1"].id,
+                      region_type=RegionType.HANDWRITTEN_TEXT, reading_order=0)
+    await _add_region(db, world, script, question_id=world["q1"].id,
+                      region_type=RegionType.TABLE, reading_order=1)
+
+    with CropWorkspace() as workspace:
+        evidence, result = await _build(db, world, response, workspace)
+        assert result.region_count == 2
+        assert result.not_attached_count == 1
+        assert evidence.student_images.text == []
+        assert len(evidence.student_images.table) == 1
+        assert evidence.student_images.descriptor() == "tables"
+
+
+@pytest.mark.asyncio
+async def test_only_handwritten_text_and_no_source_is_not_a_preparation_failure(
+    db, world
+):
+    """Nothing structured was ever going to be produced, so nothing failed.
+
+    The fail-closed rule still applies wherever a region WOULD have attached an
+    image -- see `test_a_missing_source_document_is_a_preparation_failure`.
+    """
+    script = await _script(db, world)
+    await _point_script_at(db, script, "")
+    response = await _response_with(db, world, diagram=["/tmp/legacy-diagram.png"])
+    await _add_region(db, world, script, question_id=world["q1"].id,
+                      region_type=RegionType.HANDWRITTEN_TEXT)
+
+    with CropWorkspace() as workspace:
+        evidence, result = await _build(db, world, response, workspace)
+    assert result.source == EvidenceSource.LEGACY_CROPS
+    assert evidence.student_images.diagram == ["/tmp/legacy-diagram.png"]
+
+
+@pytest.mark.asyncio
+async def test_a_missing_source_still_fails_when_a_region_would_attach(db, world):
+    """Fail-closed preserved: a stale legacy crop is not a substitute (audit C6)."""
+    script = await _script(db, world)
+    await _point_script_at(db, script, "")
+    response = await _response_with(db, world, diagram=["/tmp/legacy-diagram.png"])
+    await _add_region(db, world, script, question_id=world["q1"].id,
+                      region_type=RegionType.TABLE)
+
+    with CropWorkspace() as workspace:
+        with pytest.raises(RegionEvidenceError) as exc:
+            await _build(db, world, response, workspace)
+    assert exc.value.code == "source_missing"
+
+
+# ---------------------------------------------------------------------------
+# non-answer content stays out, whatever else is present
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("region_type", [
+    RegionType.CROSSED_OUT, RegionType.TEACHER_MARKING,
+    RegionType.PAGE_FURNITURE, RegionType.PRINTED_TEXT, RegionType.OTHER,
+])
+@pytest.mark.asyncio
+async def test_non_answer_regions_never_reach_composed_evidence(
+    db, world, page_image, region_type
+):
+    script = await _script(db, world)
+    await _point_script_at(db, script, page_image)
+    response = await _response_with(db, world, diagram=["/tmp/legacy-diagram.png"])
+    await _add_region(db, world, script, question_id=world["q1"].id,
+                      region_type=region_type)
+
+    with CropWorkspace() as workspace:
+        evidence, result = await _build(db, world, response, workspace)
+        assert result.source == EvidenceSource.LEGACY_CROPS
+        assert result.covered_categories == ()
+        assert evidence.student_images.diagram == ["/tmp/legacy-diagram.png"]
+        assert workspace.paths == []
+
+
+@pytest.mark.asyncio
+async def test_crossed_out_work_beside_a_table_does_not_become_evidence(
+    db, world, page_image
+):
+    script = await _script(db, world)
+    await _point_script_at(db, script, page_image)
+    response = await _response_with(db, world)
+    await _add_region(db, world, script, question_id=world["q1"].id,
+                      region_type=RegionType.CROSSED_OUT, reading_order=0)
+    await _add_region(db, world, script, question_id=world["q1"].id,
+                      region_type=RegionType.TABLE, reading_order=1)
+
+    with CropWorkspace() as workspace:
+        evidence, result = await _build(db, world, response, workspace)
+        assert result.region_count == 1, "struck-through working was graded"
+        assert len(evidence.student_images.all_paths) == 1
+
+
+# ---------------------------------------------------------------------------
+# the normal automatic workflow is unchanged
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_an_exam_with_zero_regions_matches_the_legacy_evidence_exactly(
+    db, world, page_image
+):
+    """No DocumentRegion anywhere: the composed evidence must equal the old one."""
+    from backend.grading.evidence import build_grading_evidence
+
+    script = await _script(db, world)
+    await _point_script_at(db, script, page_image)
+    response = await _response_with(
+        db, world, table=["/tmp/t.png"], diagram=["/tmp/d.png"],
+        answer_text="the recognised answer",
+    )
+
+    legacy = build_grading_evidence(
+        question=world["q1"], question_response=response, marking_scheme="scheme",
+    )
+    with CropWorkspace() as workspace:
+        composed, result = await _build(db, world, response, workspace)
+
+    assert result.source == EvidenceSource.LEGACY_CROPS
+    assert composed == legacy, "the zero-region path diverged from the legacy path"
+    assert composed.student_images.all_paths == ["/tmp/t.png", "/tmp/d.png"]
+
+
+@pytest.mark.asyncio
+async def test_the_reference_side_is_untouched_by_composition(db, world, page_image):
+    """AUDIT C1 again, now that the student side is merged rather than replaced."""
+    script = await _script(db, world)
+    await _point_script_at(db, script, page_image)
+    world["q1"].ms_table_images = json.dumps(["/tmp/ms-table.png"])
+    world["q1"].ms_diagram_images = json.dumps(["/tmp/ms-diagram.png"])
+    await db.commit()
+    response = await _response_with(db, world, diagram=["/tmp/legacy-diagram.png"])
+    await _add_region(db, world, script, question_id=world["q1"].id,
+                      region_type=RegionType.MATH)
+
+    with CropWorkspace() as workspace:
+        evidence, _result = await _build(db, world, response, workspace)
+        student_paths = set(evidence.student_images.all_paths)
+        reference_paths = set(evidence.reference_images.all_paths)
+
+        assert reference_paths == {"/tmp/ms-table.png", "/tmp/ms-diagram.png"}
+        assert not (student_paths & reference_paths), (
+            "REGRESSION: a student region reached the reference slot"
+        )
+        assert evidence.reference_images.math == [], (
+            "marking-scheme evidence must not acquire a student category"
+        )
 
 
 @pytest.mark.asyncio
