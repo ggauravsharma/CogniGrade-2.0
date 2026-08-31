@@ -376,6 +376,38 @@ async def test_different_models_get_different_clients(adapter, sdk):
     assert len(sdk.generate_calls) == 2
 
 
+@pytest.mark.asyncio
+async def test_concurrent_invocations_do_not_share_per_call_state(adapter, sdk, tmp_path):
+    """Part P: uploads, warnings and timings must be local to one invocation.
+
+    Ten calls run at once, each with its OWN file. If the adapter kept the
+    upload list, the warning list or the timer on the instance, the responses
+    would cross-contaminate and this would catch it.
+    """
+    import asyncio
+
+    paths = []
+    for index in range(10):
+        path = tmp_path / f"file-{index}.png"
+        path.write_bytes(b"x")
+        paths.append(str(path))
+
+    responses = await asyncio.gather(*(
+        adapter.run_text_task(_request([path]), get_task_settings(AITask.GRADING))
+        for path in paths
+    ))
+
+    assert len(responses) == 10
+    for response in responses:
+        assert response.uploaded_file_count == 1, (
+            "an invocation saw another invocation's uploads"
+        )
+        assert response.warnings == ()
+    # Every file uploaded once and deleted once, nothing lost or doubled.
+    assert sorted(sdk.uploaded) == sorted(paths)
+    assert len(sdk.deleted) == 10
+
+
 def test_the_adapter_holds_no_global_mutable_call_state():
     """The old router kept a module-global counter behind two locks, which is
     exactly what a later concurrency phase would have had to unpick."""

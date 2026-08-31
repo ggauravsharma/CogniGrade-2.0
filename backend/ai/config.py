@@ -52,6 +52,16 @@ class TaskSettings:
     temperature: float = 0.0
     #: Ask for JSON where the provider supports it.
     expects_json: bool = False
+    #: How many calls for THIS task may be in flight at once within one
+    #: orchestrated run. 1 means strictly sequential.
+    #:
+    #: The default is deliberately low. Gemini's free tier allows roughly 15
+    #: requests per minute for flash models, and a grading call takes seconds,
+    #: so sequential grading is already close to that ceiling; 3 is a
+    #: meaningful speed-up that the full-jitter retry can absorb 429s around,
+    #: without turning one exam into a burst. An operator on a constrained
+    #: quota should set 1 or 2; 1 restores the previous behaviour exactly.
+    max_concurrency: int = 3
 
     def with_overrides(self, **kwargs) -> "TaskSettings":
         return replace(self, **kwargs)
@@ -64,10 +74,14 @@ _TASK_DEFAULTS: Dict[str, Dict[str, object]] = {
     AITask.GRADING: {"expects_json": True, "temperature": 0.0},
     # Document reads are long; a whole question paper takes longer than one
     # answer image.
-    AITask.DOCUMENT_EXTRACTION: {"timeout_seconds": 180.0},
-    AITask.LABEL_EXTRACTION: {"timeout_seconds": 180.0},
-    AITask.ANSWER_RECOGNITION: {"timeout_seconds": 120.0},
-    AITask.MARKING_SCHEME_RECOGNITION: {"timeout_seconds": 120.0},
+    AITask.DOCUMENT_EXTRACTION: {"timeout_seconds": 180.0, "max_concurrency": 1},
+    AITask.LABEL_EXTRACTION: {"timeout_seconds": 180.0, "max_concurrency": 1},
+    # Recognition batches ALREADY ran concurrently before this phase, via a
+    # bare `asyncio.gather` over every batch at once -- a 60-image paper opened
+    # twelve simultaneous calls. They now go through the same bounded helper as
+    # grading, so the concurrency that existed is capped rather than removed.
+    AITask.ANSWER_RECOGNITION: {"timeout_seconds": 120.0, "max_concurrency": 3},
+    AITask.MARKING_SCHEME_RECOGNITION: {"timeout_seconds": 120.0, "max_concurrency": 3},
 }
 
 
@@ -107,6 +121,7 @@ def get_task_settings(task: str) -> TaskSettings:
     for field in (
         "provider", "model", "timeout_seconds", "max_retries",
         "retry_base_delay", "retry_max_delay", "temperature", "expects_json",
+        "max_concurrency",
     ):
         raw = _env(task, field)
         if raw is None:
@@ -117,6 +132,12 @@ def get_task_settings(task: str) -> TaskSettings:
             # A malformed override must not take the grading path down; the
             # documented default is a safe answer.
             continue
+
+    # A concurrency of 0 or a negative would mean "grade nothing"; clamp to
+    # sequential rather than deadlock or silently do no work.
+    if "max_concurrency" in overrides:
+        overrides["max_concurrency"] = max(1, overrides["max_concurrency"])
+
     return settings.with_overrides(**overrides) if overrides else settings
 
 
@@ -128,6 +149,7 @@ def describe_configuration() -> Dict[str, Dict[str, object]]:
             "model": s.model,
             "timeout_seconds": s.timeout_seconds,
             "max_retries": s.max_retries,
+            "max_concurrency": s.max_concurrency,
             "expects_json": s.expects_json,
         }
         for task in AITask.ALL

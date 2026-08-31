@@ -504,6 +504,85 @@ and per-call client binding for genuine key rotation.
   code (prompt building, request assembly, retry, telemetry) and keeps working
   when the provider does not.
 
+### AI Platform Foundation v2 — DONE
+Bounded concurrency for exam grading.
+
+`grade_exam_logic` awaited one provider call per question in a loop, so a
+40-question paper was 40 sequential round trips.
+
+**Why a bare `gather` would have been a bug.** The loop read the database,
+called the provider and wrote the result per question on ONE `AsyncSession`.
+An `AsyncSession` is not safe for concurrent use — two coroutines sharing one
+interleave on the same connection. Concurrency here needed a phase split, not
+a wrapper.
+
+**Three phases:**
+
+```
+1. LOAD     serial, one session   read questions + responses, build every prompt
+2. GRADE    concurrent, NO session provider calls only, semaphore-bounded
+3. PERSIST  serial, one session   write outcomes in QUESTION ORDER
+```
+
+Phase 1 ends holding plain dicts — no ORM instance survives into phase 2, so
+the session is never touched by two coroutines at once. `_build_diagram_prompt_parts`
+was extracted from the route body (verbatim, including its unusual 8-space
+indentation, because the prompt literals are multi-line f-strings whose
+continuation lines are part of the string) so both the route and the exam run
+build the same prompt.
+
+**`backend/ai/concurrency.py`** — `run_bounded(items, worker, limit)`. Returns
+one `Outcome` per item in INPUT order, never completion order. Failures are
+captured per item, so one question failing cannot cancel its siblings the way
+`asyncio.gather`'s default would. `limit <= 1` runs a plain sequential loop,
+which is what makes `max_concurrency = 1` an exact restoration rather than an
+approximation. The semaphore is created PER CALL, never at module scope,
+because Celery drives this through `loop.run_until_complete` rather than a
+long-lived server loop.
+
+**Configuration:** `TaskSettings.max_concurrency`, per task, via
+`CG_AI__<TASK>__MAX_CONCURRENCY`. Grading defaults to **3** — Gemini's free
+tier is roughly 15 requests/minute for flash models and a grading call takes
+seconds, so sequential grading was already near that ceiling; 3 is a real
+speed-up the full-jitter retry can absorb 429s around. Values `<= 0` are
+clamped to 1 rather than deadlocking. **Setting it to 1 is the emergency
+quota control** and needs no deploy.
+
+**Recognition was already concurrent, and unbounded.** Two pre-existing bare
+`asyncio.gather` calls put EVERY image batch in flight at once — a 60-image
+paper opened twelve simultaneous provider calls. Those now go through
+`run_bounded` at a limit of 3. This phase capped concurrency there; it did not
+introduce it. Document and label extraction stay at 1 (one file, one call).
+An AST-based test asserts no bare `asyncio.gather` remains in the router.
+
+**Retries are not multiplied.** The exam layer adds no retry of its own and
+relies on the service contract. Asserted: one permanently failing question
+produces exactly `max_retries + 1` provider calls, not `(max_retries + 1)²`.
+
+**Aggregation still runs after everything.** `backend/tasks.py` is unchanged:
+recognise → grade → `add_exam_result_internal` → stage. A test replaces each
+step with a recorder and asserts grading FINISHES before aggregation starts.
+C6 derives completeness from the persisted marks, so provider completion order
+cannot affect it.
+
+**Celery bridge unchanged, deliberately.** `tasks.py` still uses
+`get_event_loop().run_until_complete(...)`. Switching to `asyncio.run` would
+close the loop after each task, and the SQLAlchemy async engine's pool holds
+connections bound to that loop — reusing the engine on a later task would then
+fail. Known limitation: `asyncio.get_event_loop()` with no running loop raises
+on Python 3.12+; production runs 3.11 (`python:3.11-slim`), where it still
+creates one. That is a latent upgrade blocker, recorded not fixed.
+
+**Fake-provider benchmark** (10 items × 200 ms, no quota used):
+
+```
+concurrency=1   2.04s
+concurrency=2   1.01s
+concurrency=4   0.61s
+```
+
+- 436 tests (402 + 34).
+
 ---
 
 ## Authorization model
@@ -565,10 +644,14 @@ been removed from this list.
   `peopleManagement.remove_student` allowed it (`require_owner=False`); the
   live `enrollments.remove_student` is owner-only and always has been. Nothing
   changed — but if TAs should have this, decide it deliberately.
-- **Grading is still serial**, one provider call per question. The AI boundary
-  is now compatible with bounded concurrency (no global mutable call state) but
-  nothing drives it yet. (Provider file cleanup — the other half of this entry —
-  was fixed in AI Platform Foundation v1.)
+- **Re-evaluation is still serial.** `send_for_reevaluation` and the
+  re-evaluate-all routes grade one question at a time. They could reuse
+  `run_bounded`, but they were deliberately left alone: v2 scoped itself to the
+  initial exam run, where the session/persistence split was the hard part.
+- **Grading concurrency is per process, not per deployment.** The semaphore
+  bounds one exam run. Two Celery workers grading two students simultaneously
+  are each bounded to 3, so the real ceiling is `workers × 3`. A distributed
+  limiter is deliberately not built; the per-task setting is the control.
 - **Remaining AI coupling:** the router still owns question-label parsing,
   batching (chunks of 5) and marking-scheme key mapping — orchestration that a
   later phase should move behind the service layer. Two commented-out legacy
@@ -602,7 +685,7 @@ authorization rather than token signing. The Gemini SDK is stubbed only when the
 real package is absent, and the stub raises if any test reaches a model.
 
 ```
-.venv-test/Scripts/python.exe -m pytest -q      # 402 passed
+.venv-test/Scripts/python.exe -m pytest -q      # 436 passed
 ```
 
 SQLite now enforces foreign keys (see Reliability v2), so cascade behaviour in
@@ -728,17 +811,16 @@ rectification for photographed sheets). Their `results/` and
 
 ## Next approved phase
 
-Not yet approved. Recommended next: **bounded concurrency for exam grading.**
-`grade_exam_logic` still awaits one provider call per question in a loop, so a
-40-question paper is 40 sequential round trips and a class of 60 is an
-afternoon. Everything that blocked this is now gone — no module-global call
-counter, no shared client state, retries and timeouts are per call, and provider
-files are cleaned up per invocation — so the work is a bounded `asyncio`
-gather with a semaphore whose width is configurable per task, plus deciding what
-a partial failure means for the exam result (C6 already answers that at the
-persistence layer).
+Not yet approved. Recommended next: **measure grading against a real
+PostgreSQL + Celery + Gemini run, at concurrency 1 and 3, on one real paper.**
+Everything about v2 is proven against fakes: the semaphore bound, failure
+isolation, ordering, session safety and the wall-clock shape. What is NOT known
+is how Gemini's actual rate limiting responds to three concurrent grading calls
+on the deployment's own quota — whether the full-jitter retry absorbs it, or
+whether the default should be 2. That needs one controlled run with real
+credentials and a real answer script, and it is the last thing standing between
+this and a confident prototype demo.
 
 Still open as policy, deliberately untouched: account deletion cascades through
-institutional academic data (a professor deleting their account erases their
-classrooms and every student's results), and the repository tracks real
-profile-picture files. Both are recorded above; neither belongs in an AI phase.
+institutional academic data, and the repository tracks real profile-picture
+files. Both are recorded above.

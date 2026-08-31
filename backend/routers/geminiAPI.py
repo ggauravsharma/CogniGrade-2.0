@@ -2,9 +2,10 @@ import os
 import uuid
 from typing import List, Optional
 import logging
-import asyncio
 import json
 import re
+import time
+from types import SimpleNamespace
 import aiofiles  # Added for async file operations
 
 from fastapi import APIRouter, File, UploadFile, Depends, HTTPException, Form
@@ -18,7 +19,9 @@ from backend.models.users import User
 from backend.utils.security import get_current_user_required
 from backend.models.tables import QuestionResponse, Question
 from backend.ai import services as ai_services
-from backend.ai.contracts import FilePart, TextPart
+from backend.ai.concurrency import run_bounded
+from backend.ai.config import get_task_settings
+from backend.ai.contracts import AITask, FilePart, TextPart
 from backend.ai.errors import ProviderError
 from backend.ai.prompts.grading import (
     REFERENCE_IMAGE_HEADING,
@@ -534,56 +537,22 @@ async def grade_question(
         )
         raise HTTPException(status_code=500, detail=f"Error grading question: {str(e)}")
 
-@router.post("/grade-question-with-diagram")
-async def grade_question_with_diagram(
-    request: dict,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user_required)
-):
-    print("diagram grade")
-    try:
-        ideal_answer = request.get("ideal_answer")
-        marking_scheme = request.get("marking_scheme")
-        exam_id = request.get("exam_id")
-        student_id = request.get("student_id")
-        question_id = request.get("question_id")
+def _build_diagram_prompt_parts(question, evidence, *, marking_scheme, ideal_answer):
+        """Assemble the ordered prompt for a diagram/table grading call.
 
-        # AUTHORIZATION: exam_id arrives in the request body, so this cannot
-        # be a path-parameter dependency. Grading is a manager-only action.
-        if current_user is not None:
-            await assert_exam_manager(exam_id, current_user, db)
+        PURE: no database, no provider, no network. Extracted from the route
+        body so the exam-wide run can build every question's prompt up front
+        on one session and then run the provider calls concurrently with no
+        ORM object in sight. That separation is what makes bounded
+        concurrency safe here -- see `grade_exam_logic`.
 
-        result = await db.execute(select(QuestionResponse).where(
-            QuestionResponse.question_id == question_id,
-            QuestionResponse.student_id == student_id
-        ))
-        qr = result.scalars().first()
-
-        # The question must be resolved BEFORE any upload work. The previous
-        # order uploaded images first and only then discovered the question was
-        # missing, and it dereferenced question.ms_* before the None check.
-        result = await db.execute(select(Question).where(
-            Question.id == question_id,
-            Question.exam_id == exam_id
-        ))
-        question = result.scalars().first()
-        if not question:
-            raise HTTPException(status_code=404, detail="Question not found.")
-
-        # Reference and student evidence are assembled into ONE immutable,
-        # provider-neutral structure with two clearly separated sides. There is
-        # no longer a single image list that could be spliced into both the
-        # marking-scheme slot and the student-answer slot of the prompt.
-        evidence = build_grading_evidence(
-            question=question,
-            question_response=qr,
-            ideal_answer=ideal_answer,
-            marking_scheme=marking_scheme,
-        )
+        The body is indented to EIGHT spaces, not four, and that is
+        deliberate: the prompt literals below are multi-line f-strings whose
+        continuation lines are part of the string. Re-indenting them would
+        silently change the text sent to the model, so the block was moved
+        verbatim rather than reformatted.
+        """
         student_answer = evidence.student_answer_text
-
-        if not evidence.has_student_evidence:
-            raise HTTPException(status_code=400, detail="Missing required parameters. Provide student_answer and at least one of ideal_answer or marking_scheme.")
 
         # Two independent LISTS OF PATHS. They are never combined, and the
         # route no longer holds a provider file handle at all -- uploading,
@@ -657,6 +626,64 @@ Give marks proportionally based on the level of correctness—giving higher mark
 Maximum Marks Possible: {question.max_marks}.
 
 {output_instruction(question.max_marks)}""")]
+
+        return prompt_content
+
+
+@router.post("/grade-question-with-diagram")
+async def grade_question_with_diagram(
+    request: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user_required)
+):
+    print("diagram grade")
+    try:
+        ideal_answer = request.get("ideal_answer")
+        marking_scheme = request.get("marking_scheme")
+        exam_id = request.get("exam_id")
+        student_id = request.get("student_id")
+        question_id = request.get("question_id")
+
+        # AUTHORIZATION: exam_id arrives in the request body, so this cannot
+        # be a path-parameter dependency. Grading is a manager-only action.
+        if current_user is not None:
+            await assert_exam_manager(exam_id, current_user, db)
+
+        result = await db.execute(select(QuestionResponse).where(
+            QuestionResponse.question_id == question_id,
+            QuestionResponse.student_id == student_id
+        ))
+        qr = result.scalars().first()
+
+        # The question must be resolved BEFORE any upload work. The previous
+        # order uploaded images first and only then discovered the question was
+        # missing, and it dereferenced question.ms_* before the None check.
+        result = await db.execute(select(Question).where(
+            Question.id == question_id,
+            Question.exam_id == exam_id
+        ))
+        question = result.scalars().first()
+        if not question:
+            raise HTTPException(status_code=404, detail="Question not found.")
+
+        # Reference and student evidence are assembled into ONE immutable,
+        # provider-neutral structure with two clearly separated sides. There is
+        # no longer a single image list that could be spliced into both the
+        # marking-scheme slot and the student-answer slot of the prompt.
+        evidence = build_grading_evidence(
+            question=question,
+            question_response=qr,
+            ideal_answer=ideal_answer,
+            marking_scheme=marking_scheme,
+        )
+        # (the prompt builder reads the answer text from `evidence` itself)
+        if not evidence.has_student_evidence:
+            raise HTTPException(status_code=400, detail="Missing required parameters. Provide student_answer and at least one of ideal_answer or marking_scheme.")
+
+        prompt_content = _build_diagram_prompt_parts(
+            question, evidence,
+            marking_scheme=marking_scheme, ideal_answer=ideal_answer,
+        )
 
         try:
             result, raw_text = await ai_services.grade_answer_with_parts(
@@ -861,12 +888,20 @@ async def process_answer_text_images_logic(exam_id: int, student_id: int, db: As
         return batch_result
 
     # print("\n\n\n\nProcessing batches: ", batches, end="\n\n\n\n")
-    results = await asyncio.gather(*(process_batch(b) for b in batches), return_exceptions=True)
-    print("Results: ", results, end="\n\n\n\n")
-    for r in results:
-        if isinstance(r, dict):
-            for qr_id, answers in r.items():
+    # Bounded, not a bare gather: this used to put EVERY batch in flight at
+    # once, so a 60-image paper opened twelve simultaneous provider calls. The
+    # batches never touch the session (writes happen serially below), so the
+    # only thing missing was a ceiling.
+    recognition_limit = get_task_settings(AITask.ANSWER_RECOGNITION).max_concurrency
+    outcomes = await run_bounded(
+        batches, process_batch, limit=recognition_limit, label="answer_recognition"
+    )
+    for outcome in outcomes:
+        if outcome.ok and isinstance(outcome.value, dict):
+            for qr_id, answers in outcome.value.items():
                 extraction_mapping.setdefault(qr_id, []).extend(answers)
+        elif not outcome.ok:
+            logger.error("answer recognition batch failed: %s", type(outcome.error).__name__)
 
     updated = 0
     try:
@@ -987,15 +1022,17 @@ async def process_marking_scheme_text_image(
         
         return batch_extraction_mapping
 
-    batch_tasks = [process_batch(batch) for batch in batches]
-    batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
-
-    for batch_result in batch_results:
-        if isinstance(batch_result, dict):
-            for question_id, texts in batch_result.items():
+    # Same ceiling as the answer batches above, for the same reason.
+    scheme_limit = get_task_settings(AITask.MARKING_SCHEME_RECOGNITION).max_concurrency
+    outcomes = await run_bounded(
+        batches, process_batch, limit=scheme_limit, label="marking_scheme_recognition"
+    )
+    for outcome in outcomes:
+        if outcome.ok and isinstance(outcome.value, dict):
+            for question_id, texts in outcome.value.items():
                 extraction_mapping.setdefault(question_id, []).extend(texts)
-        else:
-            logger.error(f"Batch processing failed: {str(batch_result)}")
+        elif not outcome.ok:
+            logger.error("marking-scheme batch failed: %s", type(outcome.error).__name__)
 
     processed_count = 0
     try:
@@ -1016,48 +1053,183 @@ async def process_marking_scheme_text_image(
     )
 
 
+async def _grade_one_question_compute(plan):
+    """Run ONE question's provider call. No database, no session, no ORM.
+
+    This is the unit that runs concurrently, and it is safe to run concurrently
+    precisely because it touches nothing shared: the prompt was built earlier,
+    the provider adapter keeps no per-invocation state, and the result is a
+    plain dict. Retry and timeout are the AI service's business and are NOT
+    repeated here -- an outer retry would multiply the inner one.
+
+    Returns the same dict shape the routes return, so persistence downstream is
+    unchanged.
+    """
+    try:
+        result, raw_text = await ai_services.grade_answer_with_parts(
+            plan["parts"],
+            max_marks=plan["max_marks"],
+            exam_id=plan["exam_id"],
+            student_id=plan["student_id"],
+            question_id=plan["question_id"],
+        )
+    except ProviderError as exc:
+        # Transport, quota or timeout, after the service layer already
+        # exhausted its retries. Not a validation failure and not a zero.
+        return {
+            "status": "grading_failed", "grade": None, "reasoning": None,
+            "error_code": exc.category, "raw_response": None,
+        }
+    except GradingResponseError as exc:
+        # A response arrived and could not be validated. Also not a zero.
+        return {
+            "status": "grading_failed", "grade": None, "reasoning": None,
+            "error_code": exc.code, "raw_response": exc.raw,
+        }
+
+    return {
+        "status": "graded", "grade": result.score, "reasoning": result.reason,
+        "error_code": None, "raw_response": raw_text,
+    }
+
+
 async def grade_exam_logic(exam_id: int, student_id: int, db: AsyncSession):
+    """Grade every question of one student's paper.
+
+    THREE PHASES, and the split is the whole point
+    ----------------------------------------------
+    Grading used to be one loop that read the database, called the provider and
+    wrote the result, per question, on a single `AsyncSession`. Wrapping that in
+    `asyncio.gather` would have been a data-corruption bug: an `AsyncSession` is
+    NOT safe for concurrent use, and two coroutines sharing one interleave on
+    the same connection.
+
+        1. LOAD    serial, one session. Read the questions and responses and
+                   build every prompt. Ends holding plain data -- no ORM
+                   instance survives into phase 2.
+
+        2. GRADE   concurrent, NO session. Provider calls only, bounded by a
+                   semaphore, each failure isolated to its own question.
+
+        3. PERSIST serial, one session. Write the outcomes in QUESTION ORDER,
+                   then let the caller aggregate.
+
+    So the session is never used by two coroutines at once, and concurrency
+    buys wall-clock time without buying a new class of bug.
+
+    Aggregation (`add_exam_result_internal`) still runs afterwards, in the
+    caller, once every write has landed -- see backend/tasks.py. C6 decides
+    completeness from the persisted marks, so it is unaffected by the order the
+    provider happened to answer in.
+    """
     result = await db.execute(select(Question).where(Question.exam_id == exam_id))
     questions = result.scalars().all()
     if not questions:
         raise HTTPException(status_code=404, detail="No questions found for this exam.")
 
-    results = []
+    # Stable order for everything that follows: question_number, then id as a
+    # tie-break. Completion order must never be visible in the output.
+    questions = sorted(
+        questions,
+        key=lambda q: (q.question_number if q.question_number is not None else 0, q.id),
+    )
+
+    settings = get_task_settings(AITask.GRADING)
+    started = time.monotonic()
+
+    # ---- phase 1: LOAD (serial, one session) -------------------------------
+    plans = []
+    prep_failures = {}
     for question in questions:
-        req = {
-            "ideal_answer": question.ideal_answer,
-            "marking_scheme": question.ideal_marking_scheme,
+        found = await db.execute(select(QuestionResponse).where(
+            QuestionResponse.question_id == question.id,
+            QuestionResponse.student_id == student_id,
+        ))
+        qr = found.scalars().first()
+
+        evidence = build_grading_evidence(
+            question=question,
+            question_response=qr,
+            ideal_answer=question.ideal_answer,
+            marking_scheme=question.ideal_marking_scheme,
+        )
+        if not evidence.has_student_evidence:
+            # Nothing to grade. Recorded as a preparation failure rather than
+            # sent to a provider, and it still blocks finalisation via C6.
+            prep_failures[question.id] = "no_student_evidence"
+            continue
+
+        plans.append({
+            "question_id": question.id,
+            "question_number": question.question_number,
+            "max_marks": question.max_marks,
             "exam_id": exam_id,
             "student_id": student_id,
-            "question_id": question.id
-        }
-        try:
-            grade_res = await grade_question_with_diagram(req, db, None)  # No current_user needed
-        except Exception as exc:
-            # Resilience, deliberately: one question that dies unexpectedly must
-            # not abandon the rest of the paper. Previously this propagated and
-            # every later question was left ungraded with no record of why.
-            # `_record_grading_failure` has already stored a code for this
-            # question, so the professor still learns which one died.
+            "parts": _build_diagram_prompt_parts(
+                question, evidence,
+                marking_scheme=question.ideal_marking_scheme,
+                ideal_answer=question.ideal_answer,
+            ),
+        })
+
+    # ---- phase 2: GRADE (concurrent, no session) ---------------------------
+    outcomes = await run_bounded(
+        plans,
+        _grade_one_question_compute,
+        limit=settings.max_concurrency,
+        label="grading",
+    )
+
+    graded_by_question = {}
+    for outcome in outcomes:
+        question_id = outcome.item["question_id"]
+        if outcome.ok:
+            graded_by_question[question_id] = outcome.value
+        else:
+            # Belt and braces: `_grade_one_question_compute` already converts
+            # the expected failures. Anything reaching here is unforeseen, and
+            # it must still not abandon the other questions.
             logger.error(
                 "grading raised for exam_id=%s student_id=%s question_id=%s: %s",
-                exam_id, student_id, question.id, type(exc).__name__, exc_info=True,
+                exam_id, student_id, question_id, type(outcome.error).__name__,
             )
-            grade_res = {
-                "status": "grading_failed",
-                "grade": None,
-                "reasoning": None,
-                "error_code": UNEXPECTED_ERROR,
+            graded_by_question[question_id] = {
+                "status": "grading_failed", "grade": None, "reasoning": None,
+                "error_code": UNEXPECTED_ERROR, "raw_response": None,
+            }
+
+    # ---- phase 3: PERSIST (serial, one session, question order) ------------
+    results = []
+    for question in questions:
+        outcome = graded_by_question.get(question.id)
+        if outcome is None:
+            outcome = {
+                "status": "grading_failed", "grade": None, "reasoning": None,
+                "error_code": prep_failures.get(question.id, UNEXPECTED_ERROR),
                 "raw_response": None,
             }
+
+        if outcome["status"] == "graded":
+            await _persist_and_report(
+                db=db, question_id=question.id, student_id=student_id,
+                exam_id=exam_id,
+                result=SimpleNamespace(score=outcome["grade"], reason=outcome["reasoning"]),
+                raw_text=outcome["raw_response"],
+            )
+        else:
+            await _record_grading_failure(
+                db, question_id=question.id, student_id=student_id,
+                error_code=outcome["error_code"],
+            )
+
         results.append({
             "question_number": question.question_number,
             "question_id": question.id,
-            "status": grade_res.get("status"),
-            "grade": grade_res["grade"],
-            "reasoning": grade_res["reasoning"],
-            "error_code": grade_res.get("error_code"),
-            "raw": grade_res["raw_response"]
+            "status": outcome["status"],
+            "grade": outcome["grade"],
+            "reasoning": outcome["reasoning"],
+            "error_code": outcome["error_code"],
+            "raw": outcome["raw_response"],
         })
 
     # A question whose provider response could not be validated has NO mark in
@@ -1065,9 +1237,9 @@ async def grade_exam_logic(exam_id: int, student_id: int, db: AsyncSession):
     # Completeness itself is derived from the persisted marks by
     # `aggregate_student_result`, not from this return value, so a run that
     # crashes outright is caught just as well as one that reports politely.
-    # What this summary adds is the REASON, which is now also persisted per
-    # response (`grading_error_code`) and surfaced to the professor.
     failed_questions = [r for r in results if r.get("status") != "graded"]
+    duration_ms = int((time.monotonic() - started) * 1000)
+
     if failed_questions:
         logger.error(
             "grading incomplete for exam_id=%s student_id=%s: %s of %s questions "
@@ -1076,13 +1248,25 @@ async def grade_exam_logic(exam_id: int, student_id: int, db: AsyncSession):
             [(r["question_number"], r.get("error_code")) for r in failed_questions],
         )
 
+    # Orchestration-level telemetry, so concurrency=1 and concurrency=3 can be
+    # compared from logs without a code change. Ids and counts only: no answer
+    # text, no marking scheme, no provider output.
+    logger.info(
+        "exam_grading_run exam_id=%s student_id=%s questions=%s concurrency=%s "
+        "graded=%s failed=%s duration_ms=%s",
+        exam_id, student_id, len(results), settings.max_concurrency,
+        len(results) - len(failed_questions), len(failed_questions), duration_ms,
+    )
+
     return {
         "exam_id": exam_id,
         "student_id": student_id,
         "graded_count": len(results) - len(failed_questions),
         "failed_count": len(failed_questions),
         "failed_questions": failed_questions,
-        "results": results
+        "results": results,
+        "concurrency": settings.max_concurrency,
+        "duration_ms": duration_ms,
     }
 
 @router.post("/{exam_id}/grade-exam")
