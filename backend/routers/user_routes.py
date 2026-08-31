@@ -1,8 +1,10 @@
 from fastapi import Form, APIRouter, HTTPException, Depends, UploadFile, File, Body, status
 from backend.database import get_db
 from backend.models.users import User, UserSettings
+from sqlalchemy import delete as sa_delete
 from sqlalchemy.ext.asyncio import AsyncSession     # ASYNC
 from sqlalchemy.future import select
+import logging
 
 from backend.utils.security import get_current_user_required, get_password_hash, verify_password
 from typing import Optional
@@ -11,6 +13,7 @@ from io import BytesIO
 from PIL import Image
 
 router = APIRouter(tags=["profile-settings"])
+logger = logging.getLogger(__name__)
 PROFILE_PICTURE_DIR = "./profile_pictures"
 
 # Ensure the profile pictures directory exists
@@ -204,64 +207,79 @@ async def delete_account(
     current_user: User = Depends(get_current_user_required),
     db: AsyncSession = Depends(get_db)
 ):
-    """Permanently deletes the user's account."""
-    
+    """Permanently deletes the user's account.
+
+    WHAT WAS WRONG
+    --------------
+    The previous implementation walked `current_user.answer_scripts`,
+    `.question_responses`, `.enrollments` and `.received_notifications` -- four
+    LAZY relationships -- inside async context, so the route raised before it
+    deleted anything. Behind that sat a second defect: six `db.delete(...)`
+    calls and a `db.rollback()` with no `await`. `AsyncSession.delete` is a
+    coroutine; unawaited it builds an object and discards it. Repairing only
+    the lazy loads would therefore have produced the worse failure -- a 200
+    response for an account that was never deleted.
+
+    WHY A CORE DELETE
+    -----------------
+    `await db.delete(user)` would still be wrong here. Most of `User`'s
+    relationships lack `passive_deletes=True`, so the ORM would load every
+    child at flush time to null out its foreign key -- the same lazy IO in the
+    same async context, just moved. A Core `DELETE` statement bypasses ORM
+    relationship processing entirely: one statement, no loading, no surprises.
+
+    WHO DELETES THE REST
+    --------------------
+    The database. Every foreign key pointing at `users.id` is declared
+    `ON DELETE CASCADE` (17 of them across 12 tables), so the schema already
+    states the policy and duplicating it in Python would mean maintaining a
+    second, silently divergent copy. See `backend/database.py` for why SQLite
+    now enforces those cascades too.
+
+    Note the blast radius that policy implies: `classrooms.owner_id` cascades,
+    so deleting a professor's account destroys their classrooms and everything
+    inside them. That is the existing schema's rule, not a choice made here.
+    """
+
     # Verify password for security
     if not verify_password(password, current_user.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Password is incorrect"
         )
-    
-    # Remove profile picture if exists
-    file_name = f"{current_user.id}.jpg"
-    file_path = os.path.join(PROFILE_PICTURE_DIR, file_name)
 
-    if os.path.exists(file_path):
-        os.remove(file_path)
-    
+    # Read what is needed BEFORE the row goes away. `id` is an int from the
+    # database, so the filename it builds cannot escape the pictures directory.
+    user_id = current_user.id
+    picture_path = os.path.join(PROFILE_PICTURE_DIR, f"{user_id}.jpg")
+
     try:
-        # Handle related records manually by clearing relationships
-        # First, handle answer scripts
-        if current_user.answer_scripts:
-            for script in current_user.answer_scripts:
-                db.delete(script)
-        
-        # Handle question responses
-        if current_user.question_responses:
-            for response in current_user.question_responses:
-                db.delete(response)
-        
-        # Clear enrollment relationships
-        if current_user.enrollments:
-            for enrollment in current_user.enrollments:
-                db.delete(enrollment)
-        
-        # Clear notification relationships
-        if current_user.sent_notifications:
-            for notification in current_user.sent_notifications:
-                notification.sender_id = None
-                db.add(notification)
-        
-        if current_user.received_notifications:
-            for notification in current_user.received_notifications:
-                db.delete(notification)
-        
-        # Delete user settings if any
-        result = await db.execute(select(UserSettings).where(UserSettings.user_id == current_user.id))
-        user_settings = result.scalars().first()
-        if user_settings:
-            db.delete(user_settings)
-            
-        # Now delete the user
-        db.delete(current_user)
+        # Detach the ORM instance first: nothing must try to flush or cascade
+        # it while the Core statement does the work.
+        db.expunge(current_user)
+    except Exception:
+        pass
+
+    try:
+        await db.execute(sa_delete(User).where(User.id == user_id))
         await db.commit()
-        
-    except Exception as e:
-        db.rollback()
+    except Exception:
+        await db.rollback()
+        # The detail is for the logs. Echoing str(e) to the client leaked
+        # driver messages, which can carry connection details.
+        logger.error("account deletion failed for user_id=%s", user_id, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error deleting account: {str(e)}"
+            detail="Error deleting account"
         )
-    
+
+    # Only once the deletion is durable. Doing this first, as the old code did,
+    # destroyed the picture even when the account survived. Best effort: a file
+    # that cannot be removed must not turn a completed deletion into an error.
+    try:
+        if os.path.exists(picture_path):
+            os.remove(picture_path)
+    except OSError:
+        logger.warning("could not remove profile picture for deleted user_id=%s", user_id)
+
     return {"message": "Account deleted successfully"}

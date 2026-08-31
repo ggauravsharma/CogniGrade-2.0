@@ -24,7 +24,7 @@ from logging.config import fileConfig
 from pathlib import Path
 
 from alembic import context
-from sqlalchemy import pool
+from sqlalchemy import event, pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
@@ -80,6 +80,39 @@ def _is_async_url(url: str) -> bool:
     return any(marker in driver for marker in ("asyncpg", "aiosqlite", "aiomysql", "asyncmy"))
 
 
+def _disable_sqlite_foreign_keys(sync_engine) -> None:
+    """Turn OFF foreign key enforcement for the duration of a SQLite migration.
+
+    `backend/database.py` switches `PRAGMA foreign_keys` ON for every SQLite
+    connection, so that the schema's ON DELETE CASCADE rules behave the way
+    PostgreSQL makes them behave. That is right for the application and wrong
+    for migrations: alembic's batch mode rebuilds a table by copying it, then
+    DROPping the original -- and SQLite performs an implicit DELETE FROM before
+    a DROP, which with enforcement on fires the cascades and takes the CHILD
+    rows with it. Rebuilding `questions` would silently empty
+    `question_responses`.
+
+    Registered on this engine only, after the global listener, so the last word
+    for a migration connection is OFF. The pragma must be issued at connect
+    time: SQLite ignores it inside a transaction.
+    """
+
+    @event.listens_for(sync_engine, "connect")
+    def _off(dbapi_connection, connection_record):  # pragma: no cover - driver hook
+        import sqlite3
+
+        is_sqlite = isinstance(dbapi_connection, sqlite3.Connection) or (
+            "sqlite" in type(dbapi_connection).__module__.lower()
+        )
+        if not is_sqlite:
+            return
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA foreign_keys=OFF")
+        finally:
+            cursor.close()
+
+
 def do_run_migrations(connection: Connection) -> None:
     context.configure(
         connection=connection,
@@ -116,6 +149,7 @@ async def run_async_migrations() -> None:
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
+    _disable_sqlite_foreign_keys(connectable.sync_engine)
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)
     await connectable.dispose()
@@ -132,6 +166,7 @@ def run_migrations_online() -> None:
     from sqlalchemy import create_engine
 
     connectable = create_engine(url, poolclass=pool.NullPool)
+    _disable_sqlite_foreign_keys(connectable)
     with connectable.connect() as connection:
         do_run_migrations(connection)
     connectable.dispose()

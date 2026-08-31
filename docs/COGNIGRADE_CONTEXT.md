@@ -333,6 +333,74 @@ it is NOT verified beyond compiling and no longer crashing on entry.
 
 - 320 tests (285 + 35).
 
+### Backend Reliability v2 — DONE
+Account deletion (`POST /delete-account`).
+
+The one endpoint that makes a privacy promise, and it kept none of it.
+
+**Confirmed at HEAD before changing anything.** The handler walked four LAZY
+relationships (`answer_scripts`, `question_responses`, `enrollments`,
+`received_notifications`) in async context, so it raised on its first line of
+real work — the observed response was
+`500 … lazy load operation of attribute 'answer_scripts' cannot proceed`.
+Behind that sat six `db.delete(...)` calls and a `db.rollback()` with no
+`await`; `AsyncSession.delete` is a coroutine, so each one built an object and
+threw it away (pytest reported `coroutine 'AsyncSession.rollback' was never
+awaited` directly). Fixing only the lazy loads would therefore have produced
+the WORSE failure: a 200 for an account that was never deleted.
+
+**The fix is one Core DELETE.** `await db.delete(user)` would still have been
+wrong: most `User` relationships lack `passive_deletes=True`, so the ORM would
+load every child at flush time to null its foreign key — the same lazy IO,
+moved. `await db.execute(sa_delete(User).where(User.id == user_id))` bypasses
+ORM relationship processing entirely. The instance is expunged first so nothing
+tries to flush it.
+
+**The database deletes the rest.** All 17 foreign keys pointing at `users.id`
+are declared `ON DELETE CASCADE`, so the schema already states the policy and
+duplicating it in Python would mean maintaining a second, divergent copy.
+
+**SQLite now enforces foreign keys** (`backend/database.py`, a `connect`
+listener on the `Engine` class issuing `PRAGMA foreign_keys=ON`). SQLite ignores
+every FK constraint unless that pragma is set per connection, so on dev and
+test databases every `ondelete=` in this schema had been a dead letter and the
+cascade could not be tested at all. Registered on the class so the app, Alembic
+and test engines agree.
+
+**That change bit immediately, and is handled.** SQLite performs an implicit
+`DELETE FROM` before a `DROP TABLE`, which fires cascades — so alembic batch
+mode rebuilding `questions` silently emptied `question_responses`. Two
+migration tests caught it. `migrations/env.py` now attaches its own `connect`
+listener turning the pragma back OFF for migration connections only (the
+documented practice; the pragma is a no-op inside a transaction, so it must be
+set at connect time).
+
+**Transaction order corrected.** Password check → Core DELETE → commit →
+*then* remove the profile picture. The old code deleted the picture BEFORE the
+transaction, so a failed deletion still destroyed it. File removal is best
+effort and cannot turn a completed deletion into an error. On any exception:
+`await db.rollback()` and a 500 whose body no longer echoes `str(e)` (that
+leaked driver text, which can carry connection details).
+
+**Retention policy: unchanged and NOT invented here.** The old code set
+`notification.sender_id = None`, evidently intending to preserve notifications
+the user had sent — but the FK is `ON DELETE CASCADE`, so the schema deletes
+them. Since that code never ran, there is no established behaviour to preserve;
+the schema is followed and the discrepancy is recorded below.
+
+**Blast radius, recorded not chosen:** `classrooms.owner_id` cascades, so
+deleting a professor's account destroys their classrooms and every exam,
+assignment and result inside them. Existing schema policy, now covered by a
+test so it cannot surprise anyone silently.
+
+**Static guarantee:** an AST scan of all live backend modules finds ZERO
+unawaited `AsyncSession` calls (`delete`/`commit`/`rollback`/`execute`/
+`refresh`/`flush`/`close`). A test keeps it that way.
+
+- 339 tests (320 + 19). Sixteen of the nineteen were verified to fail against
+  the previous handler; the three that passed only assert the response shape,
+  which was never the broken part.
+
 ---
 
 ## Authorization model
@@ -368,13 +436,24 @@ These were discovered while implementing earlier phases and are out of scope
 until their own remediation phase. Items fixed in Backend Reliability v1 have
 been removed from this list.
 
-- `user_routes.delete_account` is thoroughly broken: six `db.delete(...)` calls
-  without `await` (so the account is reported deleted but is not), a
-  `db.rollback()` without `await`, and iteration over lazy relationships
-  (`current_user.answer_scripts`, `.question_responses`, `.enrollments`,
-  `.received_notifications`) in async context, which raises MissingGreenlet.
-  Same defect classes as the ones fixed in Reliability v1, in a route that
-  phase did not scope.
+- **Account deletion has no retention policy of its own.** Deleting a user
+  removes everything that references them, because every FK to `users.id` is
+  `ON DELETE CASCADE` — including a professor's classrooms and every student's
+  exam results inside them, and including notifications the user sent. The
+  pre-fix code hinted at anonymising senders instead (`sender_id = None`) but
+  never ran. If academic records should outlive an account, that needs a
+  deliberate policy and `ON DELETE SET NULL` migrations; it was not invented in
+  Reliability v2.
+- **Deleted accounts' uploaded files are orphaned.** Deletion removes the
+  profile picture (`{user_id}.jpg`) but nothing under `uploads/` — answer
+  scripts, crops and marking-scheme images stay on disk after their rows are
+  gone. Related: uploaded Gemini files are never deleted either. A storage
+  lifecycle is its own phase.
+- **Sessions are not invalidated on deletion.** A JWT already issued to the
+  deleted user stays syntactically valid until it expires, but every
+  authenticated request re-loads the user row, which no longer exists, so the
+  auth dependency returns 401. That is adequate but incidental, not a deliberate
+  revocation mechanism.
 - **Announcement notifications are not sent.** The live
   `classes.create_announcement` never created them; the copy that did was the
   shadowed duplicate removed in Reliability v1. Starting to send them is a
@@ -413,8 +492,11 @@ authorization rather than token signing. The Gemini SDK is stubbed only when the
 real package is absent, and the stub raises if any test reaches a model.
 
 ```
-.venv-test/Scripts/python.exe -m pytest -q      # 320 passed
+.venv-test/Scripts/python.exe -m pytest -q      # 339 passed
 ```
+
+SQLite now enforces foreign keys (see Reliability v2), so cascade behaviour in
+the suite matches PostgreSQL rather than silently doing nothing.
 
 `backend/requirements-dev.txt` holds test-only dependencies; production
 `requirements.txt` is untouched.
@@ -512,6 +594,17 @@ rewrite the table.
 
 ---
 
+### Account deletion (Backend Reliability v2)
+
+Verified on PostgreSQL 15.19 in a disposable container, through the real route:
+a wrong password left the account intact (400); a correct one returned 200 and
+the user row was gone; all seven dependent tables cascaded to zero; a
+bystander's user row, response and the classroom were untouched; deleting the
+classroom OWNER additionally removed their classroom and its exam while leaving
+the bystander intact. Exactly one user remained, as expected.
+
+---
+
 ## Experiments (isolated, not production)
 
 `experiments/` holds three provider-evaluation harnesses that are the reference
@@ -525,10 +618,12 @@ rectification for photographed sheets). Their `results/` and
 
 ## Next approved phase
 
-Not yet approved. Recommended next: **fix `user_routes.delete_account`.** It is
-the last route known to combine both defect classes Reliability v1 removed
-everywhere else — six unawaited `db.delete` calls and lazy-relationship access
-in async context — which means "delete my account" today reports success,
-deletes nothing, and probably 500s on the way. It is a privacy-facing promise
-the product currently breaks, and the fix is the same shape as the ones already
-made, with the same kind of regression test.
+Not yet approved. Recommended next: **decide and implement the data-retention
+policy for account deletion.** The mechanism is now correct, but the policy it
+executes is whatever the schema happens to say, and what it says is severe: a
+professor deleting their account erases their classrooms and every student's
+exam results inside them. That is very likely not what an institution wants, and
+it is the kind of thing discovered only after it happens. The work is a decision
+first (what must outlive an account — results, submissions, announcements?),
+then `ON DELETE SET NULL` migrations plus nullable author columns for whatever
+survives.
