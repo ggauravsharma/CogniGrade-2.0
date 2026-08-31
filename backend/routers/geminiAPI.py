@@ -27,7 +27,8 @@ from backend.ai.prompts.grading import (
     REFERENCE_IMAGE_HEADING,
     STUDENT_IMAGE_HEADING,
 )
-from backend.grading.evidence import build_grading_evidence
+from backend.grading.region_evidence import build_evidence as build_region_aware_evidence
+from backend.regions.cropping import CropWorkspace, RegionEvidenceError
 from backend.grading.failure import UNEXPECTED_ERROR
 from backend.grading.result import GradingResponseError, output_instruction
 from backend.auth.policies import (
@@ -670,61 +671,83 @@ async def grade_question_with_diagram(
         # provider-neutral structure with two clearly separated sides. There is
         # no longer a single image list that could be spliced into both the
         # marking-scheme slot and the student-answer slot of the prompt.
-        evidence = build_grading_evidence(
-            question=question,
-            question_response=qr,
-            ideal_answer=ideal_answer,
-            marking_scheme=marking_scheme,
-        )
-        # (the prompt builder reads the answer text from `evidence` itself)
-        if not evidence.has_student_evidence:
-            raise HTTPException(status_code=400, detail="Missing required parameters. Provide student_answer and at least one of ideal_answer or marking_scheme.")
-
-        prompt_content = _build_diagram_prompt_parts(
-            question, evidence,
-            marking_scheme=marking_scheme, ideal_answer=ideal_answer,
-        )
-
-        try:
-            result, raw_text = await ai_services.grade_answer_with_parts(
-                prompt_content,
-                max_marks=question.max_marks,
-                exam_id=exam_id,
-                student_id=student_id,
-                question_id=question_id,
+        #
+        # The student side prefers ACCEPTED structured regions, cropped from the
+        # original page on demand, and falls back to the legacy crop paths. The
+        # reference side is untouched either way -- audit C1.
+        #
+        # The workspace owns those generated crops; leaving its `with` block
+        # deletes every one of them, on success and on failure alike.
+        with CropWorkspace() as workspace:
+          try:
+            evidence, _evidence_result = await build_region_aware_evidence(
+                question=question, question_response=qr,
+                exam_id=exam_id, student_id=student_id, db=db,
+                workspace=workspace,
+                ideal_answer=ideal_answer, marking_scheme=marking_scheme,
             )
-        except ProviderError as exc:
-            # The call itself failed -- transport, quota, timeout. That is not
-            # a validation failure and emphatically not a zero: record the
-            # provider-neutral category as the failure code and report it in
-            # the same explicit shape.
+          except RegionEvidenceError as exc:
+            # Accepted regions exist but their evidence could not be produced.
+            # A PREPARATION failure, never a zero (audit C6).
             await _record_grading_failure(
                 db, question_id=question_id, student_id=student_id,
-                error_code=exc.category,
-            )
-            logger.error(
-                "grading call failed: category=%s question_id=%s student_id=%s",
-                exc.category, question_id, student_id,
+                error_code=exc.code,
             )
             return {
-                "status": "grading_failed",
-                "grade": None,
-                "reasoning": None,
-                "error_code": exc.category,
-                "error": "the grading service could not be reached",
+                "status": "grading_failed", "grade": None, "reasoning": None,
+                "error_code": exc.code,
+                "error": "the student's answer evidence could not be prepared",
                 "raw_response": None,
             }
-        except GradingResponseError as exc:
-            # An unparseable provider response is a FAILURE, never a zero.
-            await _record_grading_failure(
-                db, question_id=question_id, student_id=student_id, error_code=exc.code
-            )
-            return _grading_failure(exc, question_id=question_id, student_id=student_id)
+          # (the prompt builder reads the answer text from `evidence` itself)
+          if not evidence.has_student_evidence:
+              raise HTTPException(status_code=400, detail="Missing required parameters. Provide student_answer and at least one of ideal_answer or marking_scheme.")
 
-        return await _persist_and_report(
-            db=db, question_id=question_id, student_id=student_id, exam_id=exam_id,
-            result=result, raw_text=raw_text,
-        )
+          prompt_content = _build_diagram_prompt_parts(
+              question, evidence,
+              marking_scheme=marking_scheme, ideal_answer=ideal_answer,
+          )
+
+          try:
+              result, raw_text = await ai_services.grade_answer_with_parts(
+                  prompt_content,
+                  max_marks=question.max_marks,
+                  exam_id=exam_id,
+                  student_id=student_id,
+                  question_id=question_id,
+              )
+          except ProviderError as exc:
+              # The call itself failed -- transport, quota, timeout. That is not
+              # a validation failure and emphatically not a zero: record the
+              # provider-neutral category as the failure code and report it in
+              # the same explicit shape.
+              await _record_grading_failure(
+                  db, question_id=question_id, student_id=student_id,
+                  error_code=exc.category,
+              )
+              logger.error(
+                  "grading call failed: category=%s question_id=%s student_id=%s",
+                  exc.category, question_id, student_id,
+              )
+              return {
+                  "status": "grading_failed",
+                  "grade": None,
+                  "reasoning": None,
+                  "error_code": exc.category,
+                  "error": "the grading service could not be reached",
+                  "raw_response": None,
+              }
+          except GradingResponseError as exc:
+              # An unparseable provider response is a FAILURE, never a zero.
+              await _record_grading_failure(
+                  db, question_id=question_id, student_id=student_id, error_code=exc.code
+              )
+              return _grading_failure(exc, question_id=question_id, student_id=student_id)
+
+          return await _persist_and_report(
+              db=db, question_id=question_id, student_id=student_id, exam_id=exam_id,
+              result=result, raw_text=raw_text,
+          )
         
     except HTTPException:
         # A deliberate 403/404 raised above (question missing, caller not a
@@ -1137,100 +1160,112 @@ async def grade_exam_logic(exam_id: int, student_id: int, db: AsyncSession):
     settings = get_task_settings(AITask.GRADING)
     started = time.monotonic()
 
-    # ---- phase 1: LOAD (serial, one session) -------------------------------
-    plans = []
-    prep_failures = {}
-    for question in questions:
-        found = await db.execute(select(QuestionResponse).where(
-            QuestionResponse.question_id == question.id,
-            QuestionResponse.student_id == student_id,
-        ))
-        qr = found.scalars().first()
+    # One workspace for the whole run: crops generated for phase 1's prompts
+    # must still exist when phase 2 uploads them, and every one of them is
+    # deleted when this block exits -- on success, on failure, on cancellation.
+    with CropWorkspace() as workspace:
+        # ---- phase 1: LOAD (serial, one session) -------------------------------
+        plans = []
+        prep_failures = {}
+        for question in questions:
+            found = await db.execute(select(QuestionResponse).where(
+                QuestionResponse.question_id == question.id,
+                QuestionResponse.student_id == student_id,
+            ))
+            qr = found.scalars().first()
 
-        evidence = build_grading_evidence(
-            question=question,
-            question_response=qr,
-            ideal_answer=question.ideal_answer,
-            marking_scheme=question.ideal_marking_scheme,
+            try:
+                evidence, _evidence_result = await build_region_aware_evidence(
+                    question=question, question_response=qr,
+                    exam_id=exam_id, student_id=student_id, db=db,
+                    workspace=workspace,
+                    ideal_answer=question.ideal_answer,
+                    marking_scheme=question.ideal_marking_scheme,
+                )
+            except RegionEvidenceError as exc:
+                # Accepted regions exist but could not be turned into evidence.
+                # A preparation failure with its own code -- never a zero.
+                prep_failures[question.id] = exc.code
+                continue
+
+            if not evidence.has_student_evidence:
+                # Nothing to grade. Recorded as a preparation failure rather than
+                # sent to a provider, and it still blocks finalisation via C6.
+                prep_failures[question.id] = "no_student_evidence"
+                continue
+
+            plans.append({
+                "question_id": question.id,
+                "question_number": question.question_number,
+                "max_marks": question.max_marks,
+                "exam_id": exam_id,
+                "student_id": student_id,
+                "parts": _build_diagram_prompt_parts(
+                    question, evidence,
+                    marking_scheme=question.ideal_marking_scheme,
+                    ideal_answer=question.ideal_answer,
+                ),
+            })
+
+        # ---- phase 2: GRADE (concurrent, no session) ---------------------------
+        outcomes = await run_bounded(
+            plans,
+            _grade_one_question_compute,
+            limit=settings.max_concurrency,
+            label="grading",
         )
-        if not evidence.has_student_evidence:
-            # Nothing to grade. Recorded as a preparation failure rather than
-            # sent to a provider, and it still blocks finalisation via C6.
-            prep_failures[question.id] = "no_student_evidence"
-            continue
 
-        plans.append({
-            "question_id": question.id,
-            "question_number": question.question_number,
-            "max_marks": question.max_marks,
-            "exam_id": exam_id,
-            "student_id": student_id,
-            "parts": _build_diagram_prompt_parts(
-                question, evidence,
-                marking_scheme=question.ideal_marking_scheme,
-                ideal_answer=question.ideal_answer,
-            ),
-        })
+        graded_by_question = {}
+        for outcome in outcomes:
+            question_id = outcome.item["question_id"]
+            if outcome.ok:
+                graded_by_question[question_id] = outcome.value
+            else:
+                # Belt and braces: `_grade_one_question_compute` already converts
+                # the expected failures. Anything reaching here is unforeseen, and
+                # it must still not abandon the other questions.
+                logger.error(
+                    "grading raised for exam_id=%s student_id=%s question_id=%s: %s",
+                    exam_id, student_id, question_id, type(outcome.error).__name__,
+                )
+                graded_by_question[question_id] = {
+                    "status": "grading_failed", "grade": None, "reasoning": None,
+                    "error_code": UNEXPECTED_ERROR, "raw_response": None,
+                }
 
-    # ---- phase 2: GRADE (concurrent, no session) ---------------------------
-    outcomes = await run_bounded(
-        plans,
-        _grade_one_question_compute,
-        limit=settings.max_concurrency,
-        label="grading",
-    )
+        # ---- phase 3: PERSIST (serial, one session, question order) ------------
+        results = []
+        for question in questions:
+            outcome = graded_by_question.get(question.id)
+            if outcome is None:
+                outcome = {
+                    "status": "grading_failed", "grade": None, "reasoning": None,
+                    "error_code": prep_failures.get(question.id, UNEXPECTED_ERROR),
+                    "raw_response": None,
+                }
 
-    graded_by_question = {}
-    for outcome in outcomes:
-        question_id = outcome.item["question_id"]
-        if outcome.ok:
-            graded_by_question[question_id] = outcome.value
-        else:
-            # Belt and braces: `_grade_one_question_compute` already converts
-            # the expected failures. Anything reaching here is unforeseen, and
-            # it must still not abandon the other questions.
-            logger.error(
-                "grading raised for exam_id=%s student_id=%s question_id=%s: %s",
-                exam_id, student_id, question_id, type(outcome.error).__name__,
-            )
-            graded_by_question[question_id] = {
-                "status": "grading_failed", "grade": None, "reasoning": None,
-                "error_code": UNEXPECTED_ERROR, "raw_response": None,
-            }
+            if outcome["status"] == "graded":
+                await _persist_and_report(
+                    db=db, question_id=question.id, student_id=student_id,
+                    exam_id=exam_id,
+                    result=SimpleNamespace(score=outcome["grade"], reason=outcome["reasoning"]),
+                    raw_text=outcome["raw_response"],
+                )
+            else:
+                await _record_grading_failure(
+                    db, question_id=question.id, student_id=student_id,
+                    error_code=outcome["error_code"],
+                )
 
-    # ---- phase 3: PERSIST (serial, one session, question order) ------------
-    results = []
-    for question in questions:
-        outcome = graded_by_question.get(question.id)
-        if outcome is None:
-            outcome = {
-                "status": "grading_failed", "grade": None, "reasoning": None,
-                "error_code": prep_failures.get(question.id, UNEXPECTED_ERROR),
-                "raw_response": None,
-            }
-
-        if outcome["status"] == "graded":
-            await _persist_and_report(
-                db=db, question_id=question.id, student_id=student_id,
-                exam_id=exam_id,
-                result=SimpleNamespace(score=outcome["grade"], reason=outcome["reasoning"]),
-                raw_text=outcome["raw_response"],
-            )
-        else:
-            await _record_grading_failure(
-                db, question_id=question.id, student_id=student_id,
-                error_code=outcome["error_code"],
-            )
-
-        results.append({
-            "question_number": question.question_number,
-            "question_id": question.id,
-            "status": outcome["status"],
-            "grade": outcome["grade"],
-            "reasoning": outcome["reasoning"],
-            "error_code": outcome["error_code"],
-            "raw": outcome["raw_response"],
-        })
+            results.append({
+                "question_number": question.question_number,
+                "question_id": question.id,
+                "status": outcome["status"],
+                "grade": outcome["grade"],
+                "reasoning": outcome["reasoning"],
+                "error_code": outcome["error_code"],
+                "raw": outcome["raw_response"],
+            })
 
     # A question whose provider response could not be validated has NO mark in
     # the database -- deliberately, so a failure is never scored as zero.

@@ -787,6 +787,85 @@ all six legacy crop columns intact; FK delete rules confirmed
 
 - 510 tests (437 + 73). **NO LIVE PROVIDER CALLS — zero quota.**
 
+### Structured Region Evidence Integration v1 — DONE
+Accepted regions now become the evidence grading actually runs on.
+
+The region contract existed but nothing read it: `build_grading_evidence` still
+took the legacy `ans_*_images` path lists. This connects the two, additively.
+
+```
+AnswerScript (file_path, resolved from the DB -- never a client path)
+  ↓  load_regions_for_question      one JOIN; exam + student + question in SQL
+DocumentRegion[]
+  ↓  select_gradeable_regions       accepted/modified, STUDENT_ANSWER_TYPES,
+  ↓                                 this question only, ordered
+  ↓                                 (page_index, reading_order, id)
+PageRenderer.page                   pypdfium2 for PDFs, Pillow for rasters
+  ↓  crop_region                    normalised 0..1 -> pixels
+CropWorkspace.write                 temp dir, deleted in a `with`
+  ↓  build_region_image_set
+ImageSet  →  GradingEvidence.student_images
+```
+
+Reference evidence is untouched: it still comes from `Question.ms_*_images`.
+No structured-region contract exists for marking schemes and inventing one here
+would be audit C1 in a new costume, so a student region cannot reach the
+reference slot — asserted.
+
+**Precedence** (`backend/grading/region_evidence.build_evidence`):
+usable accepted/modified regions → structured; otherwise → legacy crops,
+byte-for-byte as before. Structured **replaces** the legacy student images, it
+is never added to them, so the same answer is never sent twice.
+
+**Fallback is not a catch-all.** It covers "there is nothing structured to
+use". It does NOT cover "there was, and producing it failed": a render,
+geometry or missing-source failure raises `RegionEvidenceError`, and the caller
+records it as a preparation failure with NO mark (C6). Grading a student
+against stale crops while their teacher believes the new annotations are in
+force would be a quiet wrong answer.
+
+**Excluded from evidence, deliberately:** `proposed` (a model's unreviewed
+guess must not move a mark), `rejected`, `teacher_marking`, `crossed_out`,
+`page_furniture`, `printed_text`, and any region with no `question_id`.
+
+**Crops.** Rectangles are cut at the bounding box. **Polygons** are cut at the
+bounding box with everything outside the polygon painted white — keeping a
+plain rectangular image every consumer handles, while dropping neighbouring
+content a box alone would drag in. White, not transparent, because the
+downstream graders expect an opaque page-like background. Nothing is drawn onto
+the pixels: no question number, part, order or type. Those stay columns.
+
+**Type → bucket:** `handwritten_text → text`, `table → table`,
+`diagram → diagram`, and **`math → diagram`**. That last is a documented
+temporary compromise, not a claim that mathematics is a picture: `ImageSet` has
+three buckets, `text` is reserved for content already converted to `answer_text`
+upstream, and a math crop placed there would be an image the prompt describes as
+text and never mentions. It belongs with diagrams until an HMER stage exists.
+
+**Lifecycle.** `CropWorkspace` is a context manager over a private temp
+directory, removed on success, failure and cancellation alike. Nothing is ever
+written to `uploads/`. `grade_exam_logic` opens one workspace around phases 1–3,
+because crops built for phase 1's prompts must still exist when phase 2 uploads
+them.
+
+**Performance.** One `PageRenderer` per evidence build caches rendered pages, so
+a page carrying four regions is rasterised once (asserted). No global cache.
+
+**Security.** The region query joins `answer_scripts` and constrains exam,
+student and question in SQL, so cross-student and cross-exam regions are
+unreachable by construction. Source paths come from the authoritative
+`AnswerScript` row, never from a client.
+
+**Observability.** One safe line per build: `question_id`, `student_id`,
+`evidence_source`, `region_count`, `page_count`, `rendered_pages`, bucket counts
+— no answer text, no marking scheme, no paths.
+
+**New dependency:** `pypdfium2==4.30.0`, one self-contained wheel with a bundled
+binary and no system dependency (unlike pdf2image/poppler). Its absence is an
+explicit `page_render_unavailable` preparation failure, not a crash.
+
+- 557 tests (510 + 47). **NO LIVE PROVIDER CALLS — zero quota.**
+
 ---
 
 ## Authorization model
@@ -869,10 +948,14 @@ been removed from this list.
   adapter is the deterministic fake used by tests; `get_segmentation_provider`
   has no default, so a real one must be written and named explicitly. The crop
   editor still writes crops, not regions.
-- **Regions are not consumed by grading yet.** `GradingEvidence` still reads
-  the legacy `ans_*_images` / `ms_*_images` path lists. Wiring accepted regions
-  into evidence (and generating crops from geometry on demand) is the next
-  integration, deliberately not done here.
+- **Marking schemes have no structured regions.** Reference evidence still
+  comes only from `Question.ms_*_images`; the region model supports materials
+  but nothing populates or reads them.
+- **`math` regions ride in the diagram bucket** (see Region Evidence v1). The
+  grading prompt therefore describes handwritten mathematics as a diagram until
+  an HMER stage exists.
+- **The crop editor still writes crops, not regions.** Structured evidence only
+  engages for exams somebody has annotated through the region API.
 - **Grading concurrency is per process, not per deployment.** The semaphore
   bounds one exam run. Two Celery workers grading two students simultaneously
   are each bounded to 3, so the real ceiling is `workers × 3`. A distributed
@@ -910,7 +993,7 @@ authorization rather than token signing. The Gemini SDK is stubbed only when the
 real package is absent, and the stub raises if any test reaches a model.
 
 ```
-.venv-test/Scripts/python.exe -m pytest -q      # 510 passed
+.venv-test/Scripts/python.exe -m pytest -q      # 557 passed
 ```
 
 SQLite now enforces foreign keys (see Reliability v2), so cascade behaviour in
@@ -1036,22 +1119,19 @@ rectification for photographed sheets). Their `results/` and
 
 ## Next approved phase
 
-Not yet approved. Two independent tracks are now open, and they do not block
-each other:
-
-**Recommended next: feed accepted regions into grading evidence.** The
-structure exists and is tested but nothing reads it — `build_grading_evidence`
-still takes the legacy `ans_*_images` lists. The work is to let an exam whose
-regions are accepted produce evidence from geometry instead: generate a crop
-per region on demand from the original page, keep `crossed_out` and
-`teacher_marking` out of `student_images` by filtering on
-`STUDENT_ANSWER_TYPES`, and preserve C1's two-sided separation. That turns the
-contract from a stored representation into the thing grading actually runs on,
-and it needs no provider and no quota.
+Not yet approved. Recommended next: **let the crop editor write regions instead
+of only crops.** The backend now prefers accepted structured regions and falls
+back to legacy crops, and the region API and overlay both exist — but the only
+way to create a region today is the API directly, so no real exam benefits. The
+work is to make the existing editor POST geometry (it already computes boxes and
+freehand paths, and `regionToGeometry` in `frontend/region-overlay.js` is the
+conversion) alongside or instead of the cropped PNG, and to let a professor
+accept or correct proposals in the same view. That closes the loop from
+annotation to grading without a provider and without quota.
 
 Still blocked on provisioning, separately: the Gemini free tier allows 20
-requests per day per model, so no real end-to-end grading run — and therefore
-no live segmentation model either — is possible until billing is enabled.
+requests per day per model, so no real end-to-end grading run — and no live
+segmentation model — is possible until billing is enabled.
 
 Still open as policy, deliberately untouched: account deletion cascades through
 institutional academic data, and the repository tracks real profile-picture

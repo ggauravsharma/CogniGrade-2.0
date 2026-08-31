@@ -306,14 +306,39 @@ class _Result:
     def first(self):
         return self._obj
 
+    def all(self):
+        """Region lookups call .all(); a stub row is not a region list."""
+        return []
+
 
 class _DB:
+    """A stub session that answers by WHAT is queried, not by call order.
+
+    The route's query order is an implementation detail -- it changed when
+    structured-region lookup was added -- so a stub that pops from a fixed
+    sequence breaks for reasons unrelated to what these tests assert. This one
+    inspects the statement's target table and returns the matching stub every
+    time, which is both more robust and more honest about what a session does.
+    """
+
     def __init__(self, sequence):
-        self._sequence = list(sequence)
+        # Accepts the historical positional list; the objects are identified by
+        # duck-typing rather than by position.
+        self._question = next((o for o in sequence if hasattr(o, "max_marks")), None)
+        self._response = next((o for o in sequence if hasattr(o, "answer_text")), None)
         self.committed = False
+        self.execute_count = 0
 
     async def execute(self, *a, **kw):
-        return _Result(self._sequence.pop(0))
+        self.execute_count += 1
+        sql = str(a[0]).lower() if a else ""
+        if "document_regions" in sql:
+            return _Result(None)          # no structured regions in these tests
+        if "question_responses" in sql:
+            return _Result(self._response)
+        if "questions" in sql:
+            return _Result(self._question)
+        return _Result(None)
 
     async def commit(self):
         self.committed = True

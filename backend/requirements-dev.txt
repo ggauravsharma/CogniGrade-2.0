@@ -7,3 +7,7 @@ aiosqlite==0.20.0
 # Alembic is a production dependency (backend/requirements.txt) but the test
 # suite exercises the migrations directly, so the test venv needs it too.
 alembic==1.19.1
+# pypdfium2 is a production dependency (backend/requirements.txt); the region
+# crop tests exercise the PDF path directly, so the test venv needs it too.
+# They skip rather than fail if it is absent.
+pypdfium2==4.30.0
