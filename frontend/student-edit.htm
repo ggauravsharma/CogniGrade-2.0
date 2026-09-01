@@ -8,7 +8,7 @@
   <link rel="stylesheet" href="professor-styles.css">
   <link rel="stylesheet" href="crop-edit.css">
   <style>
-     #earlyAccessMsg, #gradingIncompleteMsg{
+     #earlyAccessMsg, #gradingIncompleteMsg, #awaitingGradingMsg, #prepareScriptMsg{
       display:none;
       flex-direction: column;
       height:100%;
@@ -18,8 +18,29 @@
       text-align: center;
       font-family: 'Poppins', sans-serif;
     }
-    #earlyAccessMsg h2, #gradingIncompleteMsg h2{
+    #earlyAccessMsg h2, #gradingIncompleteMsg h2,
+    #awaitingGradingMsg h2, #prepareScriptMsg h2{
       margin-bottom: 5;
+    }
+    #awaitingGradingMsg p, #prepareScriptMsg p{
+      max-width: 560px;
+      margin-left: auto;
+      margin-right: auto;
+      color: #555;
+    }
+    #beginPrepareBtn{
+      background: #1a73e8;
+      color: #fff;
+      border: none;
+      padding: 10px 20px;
+      border-radius: 4px;
+      font-size: 15px;
+      font-weight: 500;
+      font-family: 'Poppins', sans-serif;
+      cursor: pointer;
+    }
+    #beginPrepareBtn:hover{
+      background: #1666d0;
     }
   </style>
 </head>
@@ -35,6 +56,26 @@
       <section id = "gradingIncompleteMsg">
         <h2>Grading Not Yet Complete</h2>
         <p>Some questions on your answer sheet could not be graded yet, so your result is not final. Your instructor has been notified. Kindly check back later.</p>
+      </section>
+      <!-- The script is submitted and the automatic run has not produced a
+           result yet. A student is not responsible for any part of that run,
+           so this is a waiting state and offers nothing to do. -->
+      <section id = "awaitingGradingMsg">
+        <h2>Answer Script Submitted</h2>
+        <p>Your answer script has been submitted. Your instructor will run AI grading,
+           and your result will appear here once it is ready.</p>
+      </section>
+      <!-- Preparation is a real step and cannot be hidden, but it is not the
+           product: it is offered here as one action with an explanation, rather
+           than by dropping the student straight into a cropping workspace. -->
+      <section id = "prepareScriptMsg">
+        <h2>Submit Your Answer Script</h2>
+        <p>Mark where each answer begins on your script and submit it. AI grading then
+           reads your answers, matches them to questions and evaluates them
+           automatically &mdash; your instructor starts that run.</p>
+        <div style="margin-top:18px;">
+          <button id="beginPrepareBtn" class="btn-submit">Submit my answer script</button>
+        </div>
       </section>
       <div class="container" id="container"> 
         <div id="top-controls">
@@ -117,13 +158,29 @@
           alert("Could not fetch status", await res.text());
           return;
         }
-        const { status } = await res.json();
+        const { status, prepared } = await res.json();
         console.log("Submission Status:", status);
         document.getElementById("earlyAccessMsg").style.display = "none";
         document.getElementById("gradingIncompleteMsg").style.display = "none";
         if(status == "pending"){
-          document.getElementById("container").style.display = "flex";
-          await initialise_crop_edit(examId);      
+          // `pending` covers two very different situations now that grading is
+          // started by the instructor rather than by this page: a script nobody
+          // has submitted yet, and one that is submitted and waiting to be
+          // graded. `prepared` separates them, so a student who has already
+          // done their part is shown a waiting state instead of being sent
+          // back into the preparation workspace.
+          if (prepared) {
+            document.getElementById("container").style.display = "none";
+            document.getElementById("awaitingGradingMsg").style.display = "flex";
+            return;
+          }
+          document.getElementById("container").style.display = "none";
+          document.getElementById("prepareScriptMsg").style.display = "flex";
+          document.getElementById("beginPrepareBtn").addEventListener("click", async () => {
+            document.getElementById("prepareScriptMsg").style.display = "none";
+            document.getElementById("container").style.display = "flex";
+            await initialise_crop_edit(examId);
+          }, { once: true });
         }else if(status == "graded"){
           window.location.href = `scriptPage.htm?exam_id=${examId}`;
         }else if(status == "grading_incomplete"){

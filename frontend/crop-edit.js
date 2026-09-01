@@ -941,24 +941,16 @@ async function handleSubmit(examId){
   // }
   
   if (document_type === 'answer_script') {
-    try {
-      const enqueueRes = await authFetch(`/exam/${examId}/enqueue-processing`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' }
-      });
-      if (!enqueueRes.ok) {
-        throw new Error('Failed to enqueue processing');
-      }
-      alert('Responses submitted successfully! Processing and grading have been enqueued.');
-      submitBtn.innerHTML = originalBtnText;
-      submitBtn.disabled = false;
-      window.location.href = `scriptPage.htm?exam_id=${examId}`;
-    } catch (err) {
-      console.error('Error enqueuing processing:', err);
-      alert('Failed to enqueue processing.');
-      submitBtn.innerHTML = originalBtnText;
-      submitBtn.disabled = false;
-    }
+    // Submitting a prepared script no longer starts grading. This call used to
+    // be the ONLY trigger for recognition, mapping, grading and aggregation in
+    // the entire product, which made the whole AI pipeline a side effect of a
+    // student finishing a cropping session -- and made the crop step read as
+    // the product rather than as preparation for it. The instructor starts AI
+    // grading from the exam page once a script is prepared.
+    alert('Answer script submitted. Your instructor will run AI grading; your result will appear here once it is ready.');
+    submitBtn.innerHTML = originalBtnText;
+    submitBtn.disabled = false;
+    window.location.href = `scriptPage.htm?exam_id=${examId}`;
   } else {
     alert('Responses submitted successfully!');
     submitBtn.innerHTML = originalBtnText;

@@ -263,6 +263,7 @@ async def client(session_factory, world):
         exams,
         peopleManagement,
         regions,
+        routingTasks,
         studentBackend,
         studentEdit,
         user_routes,
@@ -281,6 +282,7 @@ async def client(session_factory, world):
     app.include_router(studentEdit.router)
     app.include_router(user_routes.router)
     app.include_router(regions.router)
+    app.include_router(routingTasks.router)
     app.include_router(protected_files.router)
 
     async def _override_db():

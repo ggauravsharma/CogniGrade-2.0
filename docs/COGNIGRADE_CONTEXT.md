@@ -1302,6 +1302,68 @@ they stand and were not modified.
 
 ---
 
+### UI-3 — The instructor starts AI grading — DONE
+
+The product described itself as AI-first while the only thing that could start
+the AI was a student finishing a cropping session. `crop-edit.js` was the sole
+caller of `enqueue-processing` in the whole frontend, and the teacher's final
+setup panel read *"Automatic Grading will begin once students annotate their
+answer scripts."*
+
+**How grading is triggered now.** An instructor opens the exam at stage 6 and
+presses **Start AI grading** against a named student. Submitting a prepared
+script no longer enqueues anything.
+
+**Backend change: yes, and it was necessary.** `POST /exam/{id}/enqueue-
+processing` read `current_user.id` and nothing else, so a manager calling it
+queued a run against their OWN id — no answer script, no responses. The route
+now takes an optional `student_id`, honoured only for exam managers, matching
+the pattern `/protected-files/exam/{id}/document/{type}` already uses. A student
+may still run their own paper and may not name anyone else. One new policy
+helper, `assert_student_enrolled_in_exam`, checks the TARGET the way
+`require_question_in_exam` checks a question belongs to its exam:
+`assert_self_or_exam_manager` says whether the caller may act, not whether the
+id they named is a student of this exam.
+
+**A readiness guard, and it is not tidiness.** `aggregate_student_result`
+finalises when every response that EXISTS carries a mark — vacuously true of
+ZERO responses. A run for a student whose script was never prepared would
+therefore aggregate to `0.0`, stamp `graded` and set `graded_at`: a fabricated
+final zero, exactly what C6 exists to prevent. The old flow could not reach that
+state because the only trigger created the rows; moving the trigger makes it
+reachable, so an unprepared script is refused with **409** and never enters the
+pipeline. Four tests fail against the pre-fix route on this alone.
+
+**`submission_status` gained `prepared`.** `pending` alone could not distinguish
+a script nobody has submitted from one submitted and waiting to be graded — days
+apart now that a human starts the run. One count query, no schema change.
+
+**How preparation is framed.** The crop editor is untouched and still produces
+the evidence grading runs on. What changed is that a student is no longer
+*dropped into* it: the page offers one action, "Submit my answer script", with a
+sentence saying the AI reads and evaluates the answers afterwards. Once prepared,
+the student sees "Answer Script Submitted / awaiting grading" and is given
+nothing to do. Preparation is a step before the product, not the product.
+
+**Known limitation, deliberately not hidden.** Production segmentation still
+does not exist (`CG_AI__SEGMENTATION__PROVIDER` is empty, the only adapter is the
+test fake), so somebody must still mark where each answer is, and that somebody
+is still the student — `POST /exam/{id}/question_response/{type}` writes
+`student_id = current_user.id`, so an instructor cannot prepare a script on a
+student's behalf without a further identity change. The UI does not claim
+otherwise. What is automatic today: recognition, question mapping, grading,
+aggregation and result generation, all from one instructor action.
+
+- 691 tests (670 + 21). Twelve of the 21 fail against the pre-fix route,
+  including a student naming another student getting a silent 200. Frontend
+  driven from page source in a VM harness over 32 checks (endpoint and student
+  id, success state, 409/403/404/500 copy, duplicate-click guard, roster
+  fallbacks, and copy assertions that the annotation framing is gone).
+  **No migration, no live provider calls, zero quota.**
+- C6 PASS · C7 PASS. UI-1 and UI-2 semantics unchanged.
+
+---
+
 ## Authorization model
 
 Two capability ladders, both derived from the real domain model. `is_professor`
@@ -1567,15 +1629,16 @@ a decision, not a task.
 
 ## Next approved phase
 
-**Current phase: UI/demo polish.** UI-1 and UI-2 are done (above). Next
-approved step is **UI-3 — reframe the visible workflow as AI-first**: the
-stage-6 panel still tells the teacher that "Automatic Grading will begin once
-students annotate their answer scripts", the student's normal path opens a
-cropping workspace, and `POST /exam/{id}/enqueue-processing` has exactly one
-caller in the whole frontend -- the tail of `crop-edit.js handleSubmit()`. Part
-of that phase is investigating whether the grading trigger can move to the
-teacher; `enqueue-processing` takes `current_user.id` as the student, so check
-what it accepts before assuming it is frontend-only.
+**Current phase: UI/demo polish.** UI-1, UI-2 and UI-3 are done (above). Next
+approved step is **UI-4 — AI processing and grading status UX**: an instructor
+who presses Start AI grading gets one line of confirmation and nothing further,
+and a student who has submitted sees "awaiting grading" with no sense of whether
+a run is under way. The state to render already exists —
+`/exams/{id}/submission_status` returns `status`/`is_final`/`prepared` and
+`/exams/{id}/stats` returns per-student `status`, `is_final` and
+`grading_failures` — and `exam-stats.htm` already polls the latter every five
+seconds, so this should be frontend-only. Do not fabricate percentages: the
+backend reports stages and outcomes, not progress.
 
 Recommended after the UI phase: **make an incomplete exam recoverable
 without re-running the whole paper.** Re-execution is self-healing but

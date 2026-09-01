@@ -1,6 +1,7 @@
 from typing import Optional, List, Dict
 from fastapi import APIRouter, Depends, HTTPException, Form
 from fastapi.responses import JSONResponse
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
@@ -815,10 +816,35 @@ async def get_student_submission_status(
     result = await db.execute(q)
     status: str | None = result.scalar_one_or_none()
 
+    # Whether this student's script has been prepared into question responses.
+    # `status` alone cannot say: it is PENDING both for a script nobody has
+    # touched and for one that is submitted and waiting to be graded, and since
+    # grading is started by the instructor those two are now days apart. Without
+    # this the student page can only offer the preparation step again, which is
+    # what made preparation look like the product.
+    prepared_rows = await db.execute(
+        select(func.count())
+        .select_from(QuestionResponse)
+        .join(Question, Question.id == QuestionResponse.question_id)
+        .where(
+            Question.exam_id == exam_id,
+            QuestionResponse.student_id == current_user.id,
+        )
+    )
+    prepared = bool(prepared_rows.scalar())
+
     if status is None:
         # no submission record yet
-        return {"status": ExamResultStatus.PENDING, "is_final": False}
+        return {
+            "status": ExamResultStatus.PENDING,
+            "is_final": False,
+            "prepared": prepared,
+        }
 
     # is_final is derived, so a caller never has to hardcode which status
     # strings mean "this is really the student's grade".
-    return {"status": status, "is_final": status in ExamResultStatus.FINAL}
+    return {
+        "status": status,
+        "is_final": status in ExamResultStatus.FINAL,
+        "prepared": prepared,
+    }

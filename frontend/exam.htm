@@ -597,7 +597,69 @@
     .submission-message p {
       font-size: 1.25rem;
       color: #555;
+      max-width: 640px;
+      margin-left: auto;
+      margin-right: auto;
     }
+
+    /* Per-student "Start AI grading" roster on the setup-complete panel. */
+    .grading-roster-wrap {
+      max-width: 720px;
+      margin: 28px auto 8px;
+      overflow-x: auto;
+    }
+
+    #gradingRoster {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.95rem;
+      text-align: left;
+    }
+
+    #gradingRoster th,
+    #gradingRoster td {
+      padding: 10px 12px;
+      border-bottom: 1px solid #e6e8eb;
+      vertical-align: middle;
+    }
+
+    #gradingRoster th {
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: #5f6368;
+      background: #f8f9fa;
+    }
+
+    #gradingRoster td.roster-empty {
+      text-align: center;
+      color: #5f6368;
+      padding: 18px 12px;
+    }
+
+    .roster-state {
+      display: inline-block;
+      padding: 3px 9px;
+      border-radius: 4px;
+      font-size: 0.78rem;
+      font-weight: 500;
+      background: #f1f3f4;
+      color: #5f6368;
+      white-space: nowrap;
+    }
+
+    .roster-state.is-graded { background: #e6f4ea; color: #137333; }
+    .roster-state.is-partial { background: #fef7e0; color: #b06000; }
+
+    .roster-note {
+      display: block;
+      margin-top: 5px;
+      font-size: 0.78rem;
+      color: #5f6368;
+    }
+
+    .roster-note.is-error { color: #b3261e; }
+    .roster-note.is-started { color: #137333; }
     
     /* --- Responsive for modals, etc. --- */
     @media only screen and (max-width: 768px) {
@@ -759,8 +821,23 @@
       
   
       <section class="submission-message" id = "submitMsg">
-        <h1>Congratulations!</h1>
-        <p>Exam submitted, Automatic Grading will begin once students annotate their answer scripts.</p>
+        <h1>Exam setup complete</h1>
+        <p>The question paper and reference material are saved. Start AI grading for a
+           student and the system reads their answers, maps them to questions, grades
+           them and produces the result.</p>
+        <div class="grading-roster-wrap">
+          <table id="gradingRoster">
+            <thead>
+              <tr><th>Student</th><th>Result</th><th>AI grading</th></tr>
+            </thead>
+            <tbody>
+              <tr><td colspan="3" class="roster-empty">Loading students&hellip;</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="button-row" style="justify-content:center;">
+          <button class="btn-submit" id="viewResultsBtn">View results</button>
+        </div>
       </section>
       
 
@@ -2395,7 +2472,8 @@
             uploadStudent.classList.add('active');
         } else if (stage === 6) {
             submitMsg.style.display = "flex";
-            backBtn.style.display = 'block';  
+            backBtn.style.display = 'block';
+            loadGradingRoster();
         } else if (stage >= 7) {
             window.location.href = `exam-stats.htm?exam_id=${examId}`;
         }
@@ -2422,7 +2500,134 @@
         }
 
     }
-    
+
+    /* ---------------------------------------------------------------------
+       Starting AI grading.
+
+       Grading used to begin only when a STUDENT finished a cropping session --
+       `crop-edit.js` was the single caller of enqueue-processing in the whole
+       product. That made the AI pipeline a side effect of an annotation task
+       and left the instructor with no way to run, or re-run, a paper. The
+       instructor now starts it explicitly, per student.
+
+       Preparing a script is still a separate step and is still done on the
+       student's side; this button starts the automatic part that follows it,
+       and refuses (409) for a script with nothing prepared rather than
+       aggregating an empty paper into a final zero.
+       --------------------------------------------------------------------- */
+
+    function rosterStateCell(result) {
+      if (!result) return '<span class="roster-state">Not graded</span>';
+      if (result.status === "graded") {
+        return '<span class="roster-state is-graded">Graded</span>';
+      }
+      if (result.status === "grading_incomplete") {
+        return '<span class="roster-state is-partial">Needs attention</span>';
+      }
+      return '<span class="roster-state">Not graded</span>';
+    }
+
+    async function loadGradingRoster() {
+      const examId = getQueryParam("exam_id");
+      const tbody = document.querySelector("#gradingRoster tbody");
+      if (!examId || !tbody) return;
+
+      try {
+        const res = await authFetch(`/exams/${examId}/students`);
+        if (!res.ok) throw new Error(`students unavailable (${res.status})`);
+        const data = await res.json();
+        const students = data.students || [];
+
+        // Result state is a nicety, not a precondition: if the stats call fails
+        // the roster still renders and grading can still be started.
+        let resultsById = {};
+        try {
+          const statsRes = await authFetch(`/exams/${examId}/stats`);
+          if (statsRes.ok) {
+            const stats = await statsRes.json();
+            (stats.students || []).forEach(s => { resultsById[s.id] = s; });
+          }
+        } catch (e) {
+          console.error("Could not load result states:", e);
+        }
+
+        if (students.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="3" class="roster-empty">No students are enrolled in this class yet.</td></tr>';
+          return;
+        }
+
+        tbody.innerHTML = "";
+        students.forEach(student => {
+          const tr = document.createElement("tr");
+          const nameTd = document.createElement("td");
+          nameTd.innerHTML = `${student.name}<span class="roster-note">${student.email || ""}</span>`;
+          const stateTd = document.createElement("td");
+          stateTd.innerHTML = rosterStateCell(resultsById[student.id]);
+          const actionTd = document.createElement("td");
+
+          const btn = document.createElement("button");
+          btn.className = "btn-submit";
+          btn.type = "button";
+          btn.innerText = "Start AI grading";
+          const note = document.createElement("span");
+          note.className = "roster-note";
+          btn.addEventListener("click", () => startAiGrading(student.id, btn, note));
+
+          actionTd.appendChild(btn);
+          actionTd.appendChild(note);
+          tr.appendChild(nameTd);
+          tr.appendChild(stateTd);
+          tr.appendChild(actionTd);
+          tbody.appendChild(tr);
+        });
+      } catch (err) {
+        console.error("Error loading grading roster:", err);
+        tbody.innerHTML = '<tr><td colspan="3" class="roster-empty">Could not load the student list. Please reload the page.</td></tr>';
+      }
+    }
+
+    async function startAiGrading(studentId, btn, note) {
+      // The button is the duplicate guard: there is no per-student job record to
+      // consult, and re-running a paper is a legitimate and self-healing action,
+      // so this prevents a double click rather than a second deliberate run.
+      if (btn.disabled) return;
+      const originalText = btn.innerText;
+      btn.disabled = true;
+      btn.innerText = "Starting…";
+      note.className = "roster-note";
+      note.innerText = "";
+
+      try {
+        const res = await authFetch(
+          `/exam/${getQueryParam("exam_id")}/enqueue-processing?student_id=${studentId}`,
+          { method: "POST", headers: { "Content-Type": "application/json" } }
+        );
+        if (!res.ok) {
+          // Safe, specific copy per outcome. Nothing from the response body is
+          // rendered: a backend detail string is not user-facing text.
+          let message = "Unable to start grading. Please try again.";
+          if (res.status === 409) message = "This answer script is not ready for grading yet.";
+          else if (res.status === 403) message = "You do not have permission to grade this script.";
+          else if (res.status === 404) message = "This exam or student could not be found.";
+          throw new Error(message);
+        }
+        note.className = "roster-note is-started";
+        note.innerText = "AI grading started";
+        btn.innerText = "Run again";
+        btn.disabled = false;
+      } catch (err) {
+        console.error("Error starting AI grading:", err);
+        note.className = "roster-note is-error";
+        note.innerText = err.message || "Unable to start grading. Please try again.";
+        btn.innerText = originalText;
+        btn.disabled = false;
+      }
+    }
+
+    document.getElementById("viewResultsBtn").addEventListener("click", () => {
+      window.location.href = `exam-stats.htm?exam_id=${getQueryParam("exam_id")}`;
+    });
+
     // Back button functionality
     document.getElementById('backBtn').addEventListener('click', async () => {
       console.log("Back button clicked");

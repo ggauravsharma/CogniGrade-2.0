@@ -271,6 +271,41 @@ async def require_question_access_for_student(
     return ctx
 
 
+async def assert_student_enrolled_in_exam(
+    exam_id: int, student_id: int, user: User, db: AsyncSession
+) -> None:
+    """The TARGET of an action must be a student of this exam's classroom.
+
+    `assert_self_or_exam_manager` answers "may the caller act here"; it says
+    nothing about who they named. A manager may legitimately act on any student
+    in their own exam, so without this second half a manager could pass any user
+    id in the database -- another classroom's student, another professor, or
+    their own id by accident -- and have work queued against it. Same shape as
+    `require_question_in_exam`: authorize the caller, then check that the named
+    resource actually belongs to the exam.
+    """
+    result = await db.execute(select(Exam).where(Exam.id == exam_id))
+    exam = result.scalars().first()
+    if not exam:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exam not found")
+
+    if exam.classroom_id is None:
+        raise _deny("exam has no classroom, so no student can belong to it",
+                    user_id=user.id, resource=f"exam:{exam_id}/student:{student_id}")
+
+    result = await db.execute(
+        select(Enrollment).where(
+            Enrollment.classroom_id == exam.classroom_id,
+            Enrollment.student_id == student_id,
+            Enrollment.status == EnrollmentStatus.ACCEPTED,
+            Enrollment.role == Role.STUDENT,
+        )
+    )
+    if result.scalars().first() is None:
+        raise _deny("target is not an accepted student of this exam's classroom",
+                    user_id=user.id, resource=f"exam:{exam_id}/student:{student_id}")
+
+
 # ---------------------------------------------------------------------------
 # response-level helper
 # ---------------------------------------------------------------------------

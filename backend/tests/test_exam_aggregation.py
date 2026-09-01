@@ -386,7 +386,13 @@ async def test_submission_status_with_no_row_is_pending_and_not_final(client, wo
         headers=as_user(world["student_b"]),
     )
     assert res.status_code == 200
-    assert res.json() == {"status": ExamResultStatus.PENDING, "is_final": False}
+    body = res.json()
+    assert body["status"] == ExamResultStatus.PENDING
+    assert body["is_final"] is False
+    # UI-3 added `prepared` alongside these two: `pending` alone cannot tell a
+    # script nobody has submitted from one that is submitted and waiting for the
+    # instructor to start grading. student_b has a response row in the fixture.
+    assert body["prepared"] is True
 
 
 @pytest.mark.asyncio
