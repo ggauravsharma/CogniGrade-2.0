@@ -559,10 +559,18 @@
             // Card footer
             const cardFooter = document.createElement('div');
             cardFooter.className = 'card-footer';
+            // `marks_obtained || '0'` showed a student 0/5 for a question that
+            // was never graded: null is falsy, so a grading FAILURE and an
+            // earned zero rendered identically. That is the one distinction
+            // the backend refuses to blur (it stores NULL, never 0, when
+            // grading fails), and it was being erased in the last line that
+            // touches it. Compare against null explicitly so a real 0 still
+            // shows as 0.
+            const graded = row.marks_obtained !== null && row.marks_obtained !== undefined;
             cardFooter.innerHTML = `
               <div class="marks">
-                <span class="marks-badge">${row.marks_obtained || '0'}/${row.max_marks}</span>
-                <span class="marks-label">Marks</span>
+                <span class="marks-badge">${graded ? `${row.marks_obtained}/${row.max_marks}` : 'Not graded'}</span>
+                <span class="marks-label">${graded ? 'Marks' : `out of ${row.max_marks}`}</span>
               </div>
               <button class="post-query-btn" onclick="openModal('${row.question_id}', '${row.query || ''}')">
                 <i class="fas fa-comment-dots"></i> ${row.query ? 'Edit Query' : 'Post Query'}

@@ -634,8 +634,9 @@ unbenchmarked** — the retired model made any comparison impossible.
 `401 … Expected OAuth 2 access token`. The key in the repository-root `.env`
 works, but is named `GEMINI_API_KEY` while the code has always read
 `GEMINI_API_KEY_1`, so that file alone would configure nothing. Both are the
-newer `AQ.`-format keys, not legacy `AIza`. Not fixed here: `.env` is
-user-owned and gitignored.
+newer `AQ.`-format keys, not legacy `AIza`. **FIXED** in MVP Deployment v1:
+`GEMINI_API_KEY` is now the canonical variable, with the numbered form kept as
+an explicit legacy fallback.
 
 **FINDING 3 — quota, not concurrency, is the binding constraint.** Three
 consecutive runs of the same workload:
@@ -1110,6 +1111,90 @@ PostgreSQL runtime verification.
 
 ---
 
+### MVP Deployment & Live Demo v1 — DONE
+
+**COGNIGRADE GRADED A REAL EXAM, LIVE, END TO END.** Five questions, real
+Gemini, real orchestration, six provider requests, one clean pass.
+
+```
+Q1  5 marks  text answer                 -> 5.0
+Q2  4 marks  half answered               -> 3.5     fractional
+Q3  3 marks  marking-scheme + student diagram -> 2.5   fractional, C1 pair
+Q4  2 marks  wrong answer                -> 0.0     a REAL zero
+Q5  2 marks  short correct answer        -> 2.0
+                                   ExamResult 13.0 / graded / graded_at set
+                                   exam stage 7 (Graded)
+                                   no grading_error_code anywhere
+```
+
+Run through `tasks._process_and_grade` — the exact coroutine the Celery task
+runs — against a disposable SQLite file with synthetic rendered answer sheets.
+No real student work, no production database, `gemini-3.6-flash`, grading
+concurrency 1, one retry.
+
+**Three configuration blockers, all fixed before any quota was spent:**
+
+1. **The credential was never read.** `.env` holds `GEMINI_API_KEY`; the
+   adapter read only `GEMINI_API_KEY_1..n`, so a deployment with a valid key
+   configured nothing. `GEMINI_API_KEY` is now canonical, the numbered form is
+   an explicit legacy fallback, values are stripped (a trailing space in a
+   `.env` line reads as a bad key), and the missing-credential error names the
+   VARIABLE, never a value.
+2. **SQL echo was hard-coded on.** `create_async_engine(..., echo=True)` logged
+   every statement with its bound parameters — recognised answers, grading
+   reasons, marking-scheme text. Now `DATABASE_ECHO`, default **false**.
+3. **The Celery entry point could not start.** `get_event_loop()` has raised
+   `RuntimeError` since Python 3.12, so grading would not launch on anything
+   newer than the container's 3.11. Now `asyncio.run`, with the engine disposed
+   per task so pooled connections never outlive their loop.
+
+**Then the live blocker, found by running it:**
+
+4. **The File API rejects the key that generation accepts.** With everything
+   configured, every call carrying an image still failed `authentication` while
+   text-only grading worked. `genai.upload_file` in google-generativeai 0.8.4
+   goes through the REST discovery client, which authenticates by appending
+   `?key=` and rejects the newer `AQ.`-format keys outright:
+
+   ```
+   HttpError 400 ... "API key not valid. Please pass a valid API key."
+   reason: API_KEY_INVALID
+   ```
+
+   while gRPC `generate_content` accepts the same key and answers normally.
+   Since every recognition call and every diagram question carries an image,
+   this failed the entire product on a working key. **Media is now sent inline**
+   (`{"mime_type", "data"}`) over the path that works. That also retires the
+   upload/delete lifecycle: nothing is created provider-side, so nothing can
+   leak. Ceiling: `MAX_INLINE_REQUEST_BYTES` (15MB/request), which page crops
+   are nowhere near; oversize media gets an explicit provider-neutral refusal.
+
+**A false zero in the student UI — fixed.** `scriptPage.htm` rendered
+`${row.marks_obtained || '0'}/${row.max_marks}`. `null` is falsy, so a question
+that FAILED grading showed the student `0/5` — identical to an earned zero.
+That is the one distinction the whole backend refuses to blur, erased in the
+last line that touches it. Now compared against null explicitly: a real 0 still
+shows as `0/2`, an ungraded question shows "Not graded". Verified against the
+rendering logic for earned-zero, fractional, full, null and absent.
+
+**Quota discipline.** Budget computed before calling: 1 recognition batch + 5
+grading = 6 requests, worst case 12 with one retry each, against a free-tier
+cap of 20/day/model/project. The runner carries a HARD LOCAL CAP that refuses
+call 13 before it reaches the network. A dry run against a stub proved the
+fixture first, for free. Total live requests consumed on the successful day:
+**6 for the run**, plus 4 spent diagnosing (2 in the failed pre-fix attempt, 2
+isolating upload vs inline).
+
+**Live status:** C1 PASS (marking scheme in the reference slot, student diagram
+in the student slot, different files, reference first — checked on the parts
+actually sent). C6 PASS (the pre-fix failed run produced NULL marks, safe
+codes, `grading_incomplete`, `graded_at` NULL and stage 6 — never a zero, never
+a false final). C7 PASS (3.5 and 2.5 persisted and aggregated to 13.0).
+
+- 647 tests (621 + 26). **No migration.**
+
+---
+
 ## Authorization model
 
 Two capability ladders, both derived from the real domain model. `is_professor`
@@ -1238,7 +1323,7 @@ authorization rather than token signing. The Gemini SDK is stubbed only when the
 real package is absent, and the stub raises if any test reaches a model.
 
 ```
-.venv-test/Scripts/python.exe -m pytest -q      # 621 passed
+.venv-test/Scripts/python.exe -m pytest -q      # 647 passed
 ```
 
 SQLite now enforces foreign keys (see Reliability v2), so cascade behaviour in
@@ -1362,18 +1447,28 @@ rectification for photographed sheets). Their `results/` and
 
 ---
 
+## MVP status
+
+**COGNIGRADE MVP IS WORKABLE.** A small real exam goes from answer images
+through AI recognition, grading, aggregation and a correct final result. The
+remaining limit is commercial, not architectural: the free tier allows 20
+requests per day per model per project, so a real 33-question paper needs
+roughly 34 and cannot complete. Nothing in the code prevents it.
+
+**Blocker to a full-size demo: enable billing on the Gemini project.** That is
+a decision, not a task.
+
 ## Next approved phase
 
 Not yet approved. Recommended next: **make an incomplete exam recoverable
-without re-running the whole paper.** The harness proved re-execution is
-self-healing but also that it is all-or-nothing: recovering one failed question
-re-runs recognition and grading for every question, spending quota on work
-already done. The task is a re-grade path that selects only the responses
-carrying a `grading_error_code` (or no mark), grades those, and re-aggregates —
-reusing `grade_exam_logic`'s three phases rather than adding a second
-orchestration. That turns the failure path from "start again" into "finish the
-job", which is the difference between a demo and something a teacher can rely
-on. Zero new schema: the failure-code column already carries the state.
+without re-running the whole paper.** Re-execution is self-healing but
+all-or-nothing: recovering one failed question re-runs recognition and grading
+for every question, spending quota on work already done. On a 20/day cap that
+is the difference between one recoverable mistake and none. The task is a
+re-grade path that selects only the responses carrying a `grading_error_code`
+(or no mark), grades those, and re-aggregates — reusing `grade_exam_logic`'s
+three phases rather than adding a second orchestration. Zero new schema: the
+failure-code column already carries the state.
 
 Explicitly NOT recommended: region-editor development. Regions should arrive
 from a segmentation model and deterministic validation, not from a drawing
