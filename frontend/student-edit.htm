@@ -8,7 +8,7 @@
   <link rel="stylesheet" href="professor-styles.css">
   <link rel="stylesheet" href="crop-edit.css">
   <style>
-     #earlyAccessMsg{
+     #earlyAccessMsg, #gradingIncompleteMsg{
       display:none;
       flex-direction: column;
       height:100%;
@@ -18,7 +18,7 @@
       text-align: center;
       font-family: 'Poppins', sans-serif;
     }
-    #earlyAccessMsg h2{
+    #earlyAccessMsg h2, #gradingIncompleteMsg h2{
       margin-bottom: 5;
     }
   </style>
@@ -31,6 +31,10 @@
       <section id = "earlyAccessMsg">
         <h2>Answer Sheet Not Yet Available</h2>
         <p>The professor has not uploaded your answer sheet yet. Kindly check back later.</p>
+      </section>
+      <section id = "gradingIncompleteMsg">
+        <h2>Grading Not Yet Complete</h2>
+        <p>Some questions on your answer sheet could not be graded yet, so your result is not final. Your instructor has been notified. Kindly check back later.</p>
       </section>
       <div class="container" id="container"> 
         <div id="top-controls">
@@ -116,11 +120,20 @@
         const { status } = await res.json();
         console.log("Submission Status:", status);
         document.getElementById("earlyAccessMsg").style.display = "none";
+        document.getElementById("gradingIncompleteMsg").style.display = "none";
         if(status == "pending"){
           document.getElementById("container").style.display = "flex";
           await initialise_crop_edit(examId);      
         }else if(status == "graded"){
           window.location.href = `scriptPage.htm?exam_id=${examId}`;
+        }else if(status == "grading_incomplete"){
+          // Grading ran but at least one question produced no valid mark, so
+          // the recorded total is NOT the student's result. Deliberately does
+          // not open the script page (that presents a final grade) and does not
+          // re-enter the crop flow (the sheet is already submitted).
+          document.getElementById("container").style.display = "none";
+          document.getElementById("gradingIncompleteMsg").style.display = "flex";
+          return;
         }else{
           alert("Invalid submission status");
           return;

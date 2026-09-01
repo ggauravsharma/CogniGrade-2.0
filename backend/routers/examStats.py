@@ -11,7 +11,23 @@ from backend.models.tables import Exam, ExamResult, Enrollment, Question, Questi
 from backend.models.files import AnswerScript
 from backend.models.users import User
 from backend.utils.security import get_current_user_required
+from backend.utils.marks_input import parse_mark_input
+from backend.grading.aggregation import (
+    ExamResultStatus,
+    aggregate_student_result,
+    log_incomplete,
+)
+from backend.grading.failure import GradingFailure, describe
+from backend.auth.policies import (
+    ExamContext,
+    require_exam_manager,
+    require_exam_participant,
+    require_question_access_for_student,
+    require_question_in_exam,
+    require_self_or_exam_manager,
+)
 from backend.routers.geminiAPI import grade_question, grade_question_with_diagram, extract_single_answer_text
+import math
 import re
 
 router = APIRouter(tags=["exam-stats"])
@@ -19,6 +35,7 @@ router = APIRouter(tags=["exam-stats"])
 @router.get("/exams/{exam_id}/stats")
 async def get_exam_stats(exam_id: int,
                         db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_exam_manager),
                         current_user: User = Depends(get_current_user_required)):
     if not current_user.is_professor:
         raise HTTPException(status_code=403, detail="Access denied")
@@ -37,7 +54,36 @@ async def get_exam_stats(exam_id: int,
         )
     )
     enrollments = result.scalars().all()
-    
+
+    # Which questions have no validated mark, and why -- for every student in
+    # one query rather than one per student, so surfacing the reason does not
+    # make this endpoint slower per head. The rule for "failed" is the same one
+    # aggregation uses (no mark at all), so the list can never contradict the
+    # status shown beside it, and a legitimate 0 is never listed (audit C6).
+    failed_rows = await db.execute(
+        select(
+            QuestionResponse.student_id,
+            QuestionResponse.question_id,
+            Question.question_number,
+            QuestionResponse.grading_error_code,
+        )
+        .join(Question, Question.id == QuestionResponse.question_id)
+        .where(
+            Question.exam_id == exam_id,
+            QuestionResponse.marks_obtained.is_(None),
+        )
+        .order_by(Question.question_number)
+    )
+    failures_by_student: Dict[int, List[dict]] = {}
+    for student_id, question_id, question_number, error_code in failed_rows.all():
+        failures_by_student.setdefault(student_id, []).append(
+            GradingFailure(
+                question_id=question_id,
+                question_number=question_number,
+                error_code=error_code,
+            ).as_dict()
+        )
+
     students = []
     total_answer_scripts = 0
     graded_scripts = 0
@@ -50,31 +96,56 @@ async def get_exam_stats(exam_id: int,
         result = result.scalars().first()
         total_marks = result.marks_obtained if result and result.marks_obtained is not None else 0
         percentage = round((total_marks / exam.points_possible) * 100, 2) if exam.points_possible else 0
+        # A result with an incomplete grading run does carry a running total, but
+        # that total is partial. It is reported to the professor (progress is
+        # useful) and flagged, never counted as a finished script.
+        status = result.status if result else ExamResultStatus.PENDING
+        is_final = status in ExamResultStatus.FINAL
+        grading_failures = failures_by_student.get(student.id, [])
         students.append({
             "id": student.id,
             "email": student.email,
             "name": student.full_name,
             "roll": getattr(student, "entry_number", None),
             "total_marks": total_marks,
-            "percentage": percentage
+            "percentage": percentage,
+            "status": status,
+            "is_final": is_final,
+            # Manager-only endpoint, so this is professor-facing detail. Codes
+            # and short sentences only -- never the provider's raw output.
+            "grading_failures": grading_failures,
+            "failed_question_labels": [f["label"] for f in grading_failures],
         })
-        if result and result.marks_obtained is not None:
+        if is_final:
             graded_scripts += 1
         total_answer_scripts += 1
 
-    buckets = [0] * (exam.points_possible*2 + 1)
+    # The distribution is a claim about achieved scores, so a partial total must
+    # not enter it -- it would understate the cohort and move the mean.
+    # Half-mark buckets. `points_possible` is now NUMERIC, so the bucket COUNT
+    # has to be derived rather than assumed to be an int -- and a total that
+    # lands between buckets (2.25) is floored into the bucket it belongs to and
+    # clamped, so a mark above the nominal maximum cannot index off the end.
+    bucket_count = int(math.floor(float(exam.points_possible or 0) * 2)) + 1
+    buckets = [0] * bucket_count
+    excluded_from_distribution = 0
     for s in students:
-        bucket = int(s["total_marks"]*2)
+        if not s["is_final"]:
+            excluded_from_distribution += 1
+            continue
+        bucket = int(math.floor(float(s["total_marks"]) * 2))
+        bucket = max(0, min(bucket, bucket_count - 1))
         buckets[bucket] += 1
     distribution = {
-        "labels": [f"{i/2}" for i in range(exam.points_possible*2 + 1)],
+        "labels": [f"{i/2}" for i in range(bucket_count)],
         "data": buckets
     }
     grading_progress = graded_scripts / total_answer_scripts if total_answer_scripts else 0
     return JSONResponse({
         "students": students,
         "grading_progress": grading_progress,
-        "marks_distribution": distribution
+        "marks_distribution": distribution,
+        "excluded_from_distribution": excluded_from_distribution
     })
 
 # ---------------------------------------------------------------------------
@@ -119,6 +190,7 @@ async def edit_marks(
     student_id: int,
     payload: dict,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_question_in_exam),
     current_user: User = Depends(get_current_user_required)
 ):
     """
@@ -126,7 +198,10 @@ async def edit_marks(
     Receives the new marks and optional reasoning from form data. After updating,
     it calls the internal function to update the overall exam result.
     """
-    grade = payload["grade"]
+    # The manual-edit control posts `marksInput.value`, i.e. a string such as
+    # "1.5". Normalising here means a bad value is a 400 naming the field
+    # instead of a driver error at flush time, and a fractional value survives.
+    grade = parse_mark_input(payload.get("grade"), field="grade")
     # Ensure the professor is making the request
     if not current_user.is_professor:
         raise HTTPException(status_code=403, detail="Access denied")
@@ -140,7 +215,11 @@ async def edit_marks(
     if not response:
         raise HTTPException(status_code=404, detail="Response not found for this student and question.")
     
-    response.marks_obtained = payload["grade"]
+    response.marks_obtained = grade
+    if grade is not None:
+        # The professor has graded it by hand; whatever the provider failed at
+        # is no longer true of this response.
+        response.grading_error_code = None
     await db.commit()
     
     await add_exam_result_internal(exam_id, student_id, db) #, current_user)
@@ -158,6 +237,7 @@ async def get_student_evaluation(
     exam_id: int,
     student_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_self_or_exam_manager),
     current_user: User = Depends(get_current_user_required)
 ):
     result = await db.execute(select(Question).where(Question.exam_id == exam_id))
@@ -169,7 +249,7 @@ async def get_student_evaluation(
             QuestionResponse.student_id == student_id
         ))
         response = result.scalars().first()
-        evaluation.append({
+        entry = {
             "question_id": q.id,
             "question_number": q.question_number,
             "text": q.text[:50] + "..." if len(q.text) > 50 else q.text,
@@ -180,7 +260,19 @@ async def get_student_evaluation(
             "marking_scheme": q.ideal_marking_scheme,
             "marks_obtained": response.marks_obtained if response else None,
             "max_marks": q.max_marks
-        })
+        }
+        # Why grading produced nothing is operational detail for whoever has to
+        # fix it. This route is `require_self_or_exam_manager`, so a student can
+        # legitimately reach their own row -- they get the marks, not the
+        # diagnostics. Only a manager sees the failure fields at all.
+        if ctx.is_manager:
+            error_code = response.grading_error_code if response else None
+            has_mark = response is not None and response.marks_obtained is not None
+            entry["grading_error_code"] = None if has_mark else error_code
+            entry["grading_error"] = (
+                None if (has_mark or error_code is None) else describe(error_code)
+            )
+        evaluation.append(entry)
     return JSONResponse(evaluation)
 
 # ---------------------------------------------------------------------------
@@ -193,6 +285,7 @@ async def update_question(
     question_id: int,
     update_data: dict,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_question_in_exam),
     current_user: User = Depends(get_current_user_required)
 ):
     result = await db.execute(select(Question).where(
@@ -227,6 +320,7 @@ async def update_student_response(
     student_id: int,
     update_data: dict,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_question_in_exam),
     current_user: User = Depends(get_current_user_required)
 ):
     result = await db.execute(select(QuestionResponse).where(
@@ -234,18 +328,23 @@ async def update_student_response(
         QuestionResponse.student_id == student_id
     ))
     response = result.scalars().first()
+    # Same normalisation as edit_marks: a JSON client may send 1.5, "1.5" or 1.
+    marks_given = "marks_obtained" in update_data
+    new_marks = parse_mark_input(update_data.get("marks_obtained"), field="marks_obtained")
     if not response:
         response = QuestionResponse(
             question_id=question_id,
             student_id=student_id,
             answer_text=update_data.get("response", ""),
-            marks_obtained=update_data.get("marks_obtained"),
+            marks_obtained=new_marks,
             reasoning=update_data.get("reasoning", "")
         )
         db.add(response)
     else:
         response.answer_text = update_data.get("response", response.answer_text)
-        response.marks_obtained = update_data.get("marks_obtained", response.marks_obtained)
+        response.marks_obtained = new_marks if marks_given else response.marks_obtained
+    if response.marks_obtained is not None:
+        response.grading_error_code = None
         response.reasoning = update_data.get("reasoning", response.reasoning)
     await db.commit()
     await add_exam_result_internal(exam_id, student_id, db) #, current_user)
@@ -260,6 +359,7 @@ async def send_for_reevaluation(
     question_id: int,
     student_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_question_in_exam),
     current_user: User = Depends(get_current_user_required)
 ):  
     print("CALLED")
@@ -270,6 +370,7 @@ async def send_for_reevaluation(
     response = result.scalars().first()
     if not response:
         raise HTTPException(status_code=404, detail="Response not found")
+    previous_marks = response.marks_obtained
     response.marks_obtained = None
     response.reasoning = "Sent for re-evaluation"
     await db.commit()
@@ -287,8 +388,19 @@ async def send_for_reevaluation(
         "ideal_answer": question.ideal_answer,
         "marking_scheme": question.ideal_marking_scheme
     }, db, current_user)
-    response.marks_obtained = result.get("grade")
-    response.reasoning = result.get("reasoning")
+    if result.get("status") == "graded":
+        response.marks_obtained = result.get("grade")
+        response.reasoning = result.get("reasoning")
+        response.grading_error_code = None
+    else:
+        # Provider failure: restore the mark this route nulled before
+        # re-grading, so a failed re-evaluation is non-destructive rather than
+        # leaving a NULL that aggregation would later count as zero.
+        response.marks_obtained = previous_marks
+        response.reasoning = (
+            f"Re-evaluation failed to produce a valid grade "
+            f"({result.get('error_code', 'unknown')}). Previous marks restored."
+        )
     await db.commit()
     await add_exam_result_internal(exam_id, student_id, db) #, current_user)
     return {"message": "Sent for re-evaluation and exam result updated"}
@@ -299,6 +411,7 @@ async def send_all_for_reevaluation(
     exam_id: int,
     student_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_exam_manager),
     current_user: User = Depends(get_current_user_required)
 ):
     # 1. fetch all questions for this exam
@@ -326,6 +439,7 @@ async def send_all_for_reevaluation(
             )
 
         # 2b. mark it as pending re‑evaluation
+        previous_marks = response.marks_obtained
         response.marks_obtained = None
         response.reasoning = "Sent for re-evaluation"
         await db.commit()
@@ -346,9 +460,17 @@ async def send_all_for_reevaluation(
             "marking_scheme": question.ideal_marking_scheme
         }, db, current_user)
 
-        # 2e. update with the new grade
-        response.marks_obtained = grade.get("grade")
-        response.reasoning = grade.get("reasoning")
+        # 2e. update with the new grade, only if the provider produced one
+        if grade.get("status") == "graded":
+            response.marks_obtained = grade.get("grade")
+            response.reasoning = grade.get("reasoning")
+            response.grading_error_code = None
+        else:
+            response.marks_obtained = previous_marks
+            response.reasoning = (
+                f"Re-evaluation failed to produce a valid grade "
+                f"({grade.get('error_code', 'unknown')}). Previous marks restored."
+            )
         await db.commit()
 
     # 3. update the overall exam result once all questions are done
@@ -362,6 +484,7 @@ async def reevaluate_question_for_all_students(
     exam_id: int,
     question_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_question_in_exam),
     current_user: User = Depends(get_current_user_required)
 ):
     # 1. Fetch the question and its exam
@@ -404,6 +527,7 @@ async def reevaluate_question_for_all_students(
             continue  # Skip if no response exists
 
         # 3b. Mark for re-evaluation
+        previous_marks = response.marks_obtained
         response.marks_obtained = None
         response.reasoning = "Sent for re-evaluation"
         await db.commit()
@@ -423,9 +547,17 @@ async def reevaluate_question_for_all_students(
             "marking_scheme": question.ideal_marking_scheme
         }, db, current_user)
 
-        # 3d. Save results
-        response.marks_obtained = grade.get("grade")
-        response.reasoning = grade.get("reasoning")
+        # 3d. Save results, only if the provider produced a valid grade
+        if grade.get("status") == "graded":
+            response.marks_obtained = grade.get("grade")
+            response.reasoning = grade.get("reasoning")
+            response.grading_error_code = None
+        else:
+            response.marks_obtained = previous_marks
+            response.reasoning = (
+                f"Re-evaluation failed to produce a valid grade "
+                f"({grade.get('error_code', 'unknown')}). Previous marks restored."
+            )
         await db.commit()
 
         # 3e. Update exam result for student
@@ -437,6 +569,7 @@ async def reevaluate_question_for_all_students(
 async def get_question_metrics(
     exam_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_exam_manager),
     current_user: User = Depends(get_current_user_required)
 ):
     result = await db.execute(select(Question).where(Question.exam_id == exam_id))
@@ -464,12 +597,14 @@ async def drop_question(
     exam_id: int,
     question_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_question_in_exam),
     current_user: User = Depends(get_current_user_required)
 ):
     result = await db.execute(select(QuestionResponse).where(QuestionResponse.question_id == question_id))
     responses = result.scalars().all()
     for r in responses:
         r.marks_obtained = 0
+        r.grading_error_code = None
         await add_exam_result_internal(exam_id, r.student_id, db) #, current_user)
         r.reasoning = "Question Dropped by professor"
     await db.commit()
@@ -483,6 +618,7 @@ async def give_full_marks(
     exam_id: int,
     question_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_question_in_exam),
     current_user: User = Depends(get_current_user_required)
 ):
     result = await db.execute(select(Question).where(Question.id == question_id))
@@ -493,6 +629,7 @@ async def give_full_marks(
     responses = result.scalars().all()
     for r in responses:
         r.marks_obtained = question.max_marks
+        r.grading_error_code = None
         await add_exam_result_internal(exam_id, r.student_id, db) #, current_user)
         r.reasoning = "Full marks awarded by professor"
     await db.commit()
@@ -505,6 +642,7 @@ async def give_full_marks(
 async def get_grading_status(
     exam_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_exam_manager),
     current_user: User = Depends(get_current_user_required)
 ):
     from sqlalchemy import func
@@ -527,10 +665,27 @@ async def add_exam_result(
     exam_id: int,
     student_id: Optional[int] = Form(None),
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_exam_manager),
     current_user: User = Depends(get_current_user_required)
 ):
     student_id = student_id or current_user.id
     return await add_exam_result_internal(exam_id, student_id, db)#, current_user)
+
+async def exam_result_is_final(exam_id: int, student_id: int, db: AsyncSession) -> bool:
+    """Whether this student's result has been finalised, read from the row.
+
+    `add_exam_result_internal` returns a `JSONResponse`, which a background job
+    would have to decode to learn what it decided. Asking the persisted row
+    instead keeps ONE authority for the answer: the status the aggregation
+    actually wrote.
+    """
+    found = await db.execute(select(ExamResult).where(
+        ExamResult.exam_id == exam_id,
+        ExamResult.student_id == student_id,
+    ))
+    result = found.scalars().first()
+    return result is not None and result.status in ExamResultStatus.FINAL
+
 
 async def add_exam_result_internal(exam_id: int, student_id: int, db: AsyncSession):#, current_user: User):
     result = await db.execute(select(Exam).where(Exam.id == exam_id))
@@ -545,27 +700,48 @@ async def add_exam_result_internal(exam_id: int, student_id: int, db: AsyncSessi
         QuestionResponse.question_id.in_(question_ids)
     ))
     responses = result.scalars().all()
-    total_marks = sum(r.marks_obtained for r in responses if r.marks_obtained is not None)
-    print(f"Total Marks for Student {student_id}: {total_marks}")
+
+    # A response whose grading produced no validated mark carries None. The old
+    # sum filtered those out, which made a provider failure contribute exactly
+    # zero while the result was still stamped "graded" (audit C6). Completeness
+    # is now decided deterministically before anything is finalised.
+    aggregation = aggregate_student_result(
+        expected_question_ids=question_ids,
+        responses=responses,
+    )
+    total_marks = aggregation.total_score
+
     result = await db.execute(select(ExamResult).where(
         ExamResult.exam_id == exam_id,
         ExamResult.student_id == student_id
     ))
     exam_result = result.scalars().first()
-    
+    previous_status = exam_result.status if exam_result else None
+
+    if not aggregation.complete:
+        log_incomplete(
+            aggregation, exam_id=exam_id, student_id=student_id,
+            previous_status=previous_status,
+        )
+
+    # The running total is still recorded so partial progress is visible, but
+    # graded_at is set only on a final result: a timestamp means "this is the
+    # student's grade", and an incomplete run has not earned one.
+    graded_at = datetime.now(timezone.utc) if aggregation.complete else None
+
     if exam_result:
         exam_result.marks_obtained = total_marks
   #      exam_result.graded_by = current_user.id
-        exam_result.graded_at = datetime.now(timezone.utc)
-        exam_result.status = "graded"
+        exam_result.graded_at = graded_at
+        exam_result.status = aggregation.status
     else:
         exam_result = ExamResult(
             exam_id=exam_id,
             student_id=student_id,
             marks_obtained=total_marks,
    #         graded_by=current_user.id,
-            graded_at=datetime.now(timezone.utc),
-            status="graded"
+            graded_at=graded_at,
+            status=aggregation.status
         )
         db.add(exam_result)
     
@@ -576,7 +752,12 @@ async def add_exam_result_internal(exam_id: int, student_id: int, db: AsyncSessi
         "result": {
             "student_id": student_id,
             "marks_obtained": total_marks,
-            "graded_at": exam_result.graded_at.isoformat()
+            "status": aggregation.status,
+            "complete": aggregation.complete,
+            "is_final": aggregation.is_final,
+            "graded_count": aggregation.graded_count,
+            "ungraded_question_ids": aggregation.ungraded_question_ids,
+            "graded_at": exam_result.graded_at.isoformat() if exam_result.graded_at else None
         }
     })
 
@@ -586,6 +767,7 @@ async def get_student_question_details(
     student_id: int,
     question_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_question_access_for_student),
     current_user: User = Depends(get_current_user_required)
 ):
     result = await db.execute(select(Exam).where(Exam.id == exam_id))
@@ -619,6 +801,11 @@ async def get_student_question_details(
 async def get_student_submission_status(
     exam_id: int,
     db: AsyncSession = Depends(get_db),
+    # Participant, not manager: this endpoint returns ONLY the caller's own row
+    # (student_id == current_user.id), and its sole caller is the student-facing
+    # edit page. Security Foundation v1 gated it on require_exam_manager, which
+    # made it 403 for exactly the students it exists to serve.
+    ctx: ExamContext = Depends(require_exam_participant),
     current_user: User = Depends(get_current_user_required),
 ):
     q = select(ExamResult.status).where(
@@ -630,6 +817,8 @@ async def get_student_submission_status(
 
     if status is None:
         # no submission record yet
-        return {"status": "pending"}
+        return {"status": ExamResultStatus.PENDING, "is_final": False}
 
-    return {"status": status}
+    # is_final is derived, so a caller never has to hardcode which status
+    # strings mean "this is really the student's grade".
+    return {"status": status, "is_final": status in ExamResultStatus.FINAL}

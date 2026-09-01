@@ -438,6 +438,24 @@
     .btn:hover {
       background-color: #0056b3; /* Darker blue on hover */
     }
+    /* Names the questions a professor has to go and fix. Deliberately terse:
+       the reason lives in the tooltip, never a stack trace or model output. */
+    .failed-questions{
+      margin-top:3px;
+      font-size:0.78em;
+      color:#8a5a00;
+      cursor:help;
+    }
+    .incomplete-flag{
+      display:inline-block;
+      margin-left:6px;
+      padding:1px 6px;
+      border-radius:8px;
+      font-size:0.75em;
+      background:#fdecc8;
+      color:#8a5a00;
+      vertical-align:middle;
+    }
   </style>
 </head>
 <body>
@@ -674,10 +692,22 @@
       data.forEach(student => {
         let tr = document.createElement('tr');
         tr.onclick = () => openStudentDetail(student);
+        // A partial total is shown so progress stays visible, but it must never
+        // read as a finished score. is_final comes from the exam result status.
+        const incomplete = student.is_final === false && student.status === "grading_incomplete";
+        // Which questions have no mark, and why. Codes are already turned into
+        // short sentences by the backend; nothing here renders model output.
+        const failures = student.grading_failures || [];
+        const failureNote = failures.length
+          ? `<div class="failed-questions" title="${failures.map(f => `${f.label}: ${f.message}`).join(' — ').replace(/"/g, '&quot;')}">Failed: ${failures.map(f => f.label).join(', ')}</div>`
+          : '';
+        const marksCell = incomplete
+          ? `${student.total_marks} <span class="incomplete-flag" title="Grading did not complete for every question. This total is partial, not final.">partial</span>${failureNote}`
+          : `${student.total_marks}${failureNote}`;
         tr.innerHTML = `<td>${student.name}</td>
                         <td>${student.roll || student.email}</td>
-                        <td>${student.total_marks}</td>
-                        <td>${student.percentage}%</td>
+                        <td>${marksCell}</td>
+                        <td>${incomplete ? "&mdash;" : student.percentage + "%"}</td>
                         <td>
                           <button class="btn" onclick="event.stopPropagation(); reevaluateStudent(this, ${student.id});">
                             Re-Evaluate Student
@@ -793,7 +823,7 @@
                 <td class="question-number">Question ${q.question_number}</td>
                 <td class="marks-cell">
                   <span class="marks-text">${q.marks_obtained !== null ? q.marks_obtained : 'N/A'}</span>
-                  <input type="number" class="marks-input" value="${q.marks_obtained !== null ? q.marks_obtained : ''}" style="display: none;">
+                  <input type="number" step="any" class="marks-input" value="${q.marks_obtained !== null ? q.marks_obtained : ''}" style="display: none;">
                 </td>
               </tr>
             `;
@@ -966,9 +996,11 @@
   }
     // Export functions
     function exportCSV() {
-      let csvContent = "data:text/csv;charset=utf-8,Name,Roll/Email,Total Marks,Percentage\n";
+      let csvContent = "data:text/csv;charset=utf-8,Name,Roll/Email,Total Marks,Percentage,Finalised\n";
       studentData.forEach(s => {
-        csvContent += `${s.name},${s.roll || s.email},${s.total_marks},${s.percentage}\n`;
+        // Without this column the "partial" flag is lost the moment marks leave the page.
+        const finalised = s.is_final === false ? "partial" : "final";
+        csvContent += `${s.name},${s.roll || s.email},${s.total_marks},${s.percentage},${finalised}\n`;
       });
       const encodedUri = encodeURI(csvContent);
       const link = document.createElement("a");

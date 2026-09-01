@@ -16,6 +16,11 @@ from backend.models.tables import Exam, Classroom, Enrollment, Question, Questio
 from backend.models.files import AnswerScript, Material, FileTypeEnum
 from backend.models.users import User
 from backend.utils.security import get_current_user_required
+from backend.auth.policies import (
+    ExamContext,
+    require_exam_manager,
+    require_exam_participant,
+)
 from backend.models.notifications import Notification, NotificationType
 
 UPLOAD_DIRECTORY = "./uploads"
@@ -25,25 +30,52 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["exams"])
 
 @router.get("/exams/{exam_id}/stage")
-async def get_exam_stage(exam_id: int, db: AsyncSession = Depends(get_db)):
+async def get_exam_stage(
+    exam_id: int,
+    db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_exam_participant),
+):
     result = await db.execute(select(Exam).where(Exam.id == exam_id))
     exam = result.scalars().first()
     if not exam:
         raise HTTPException(status_code=404, detail="Exam not found")
     return {"exam_stage": exam.exam_stage}
 
-@router.post("/exams/{exam_id}/stage")
-async def update_exam_stage(exam_id: int, exam_stage: int, db: AsyncSession = Depends(get_db)):
+#: The two stages the automatic pipeline moves an exam between. `exam_stage` is
+#: a plain integer column whose meaning is documented on `Exam.exam_stage`;
+#: naming the two the background job uses keeps a bare 7 out of `tasks.py`,
+#: where it read as "done" without saying so.
+EXAM_STAGE_GRADING = 6
+EXAM_STAGE_GRADED = 7
+
+
+async def set_exam_stage(exam_id: int, exam_stage: int, db: AsyncSession):
+    """Core stage transition, callable from background jobs.
+
+    Kept separate from the HTTP route so that the Celery task does not have to
+    invoke a route handler whose signature carries FastAPI Depends defaults.
+    Authorization is the ROUTE's responsibility; the background job already runs
+    on behalf of an authorized enqueue request.
+    """
     result = await db.execute(select(Exam).where(Exam.id == exam_id))
     exam = result.scalars().first()
     if not exam:
         raise HTTPException(status_code=404, detail="Exam not found")
-    
+
     exam.exam_stage = exam_stage
     await db.commit()
     await db.refresh(exam)
-
     return {"message": "Exam stage updated successfully", "exam_stage": exam.exam_stage}
+
+
+@router.post("/exams/{exam_id}/stage")
+async def update_exam_stage(
+    exam_id: int,
+    exam_stage: int,
+    db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_exam_manager),
+):
+    return await set_exam_stage(exam_id, exam_stage, db)
 
 @router.patch("/exam/update-extracted-text")
 async def update_extracted_text(
@@ -160,7 +192,7 @@ async def create_exam(
     class_id: int, 
     title: str = Form(...),
     exam_date: Optional[str] = Form(None),
-    points_possible: Optional[int] = Form(100),
+    points_possible: Optional[float] = Form(100),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user_required)
 ):  
@@ -253,6 +285,11 @@ async def create_exam(
                 "points_possible": new_exam.points_possible
             }
         })
+    except HTTPException:
+        # A 403/404 raised deliberately above is an ANSWER, not a fault.
+        # Without this, the broad handler below relabels it 500 and the caller
+        # is told the server broke when it was actually told "no".
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -489,7 +526,7 @@ async def get_exam_questions(
 class UpdatePartLabels(BaseModel):
     questionId: int
     partLabels: List[str]
-    maxMarks: Optional[int]
+    maxMarks: Optional[float]
 
 class UpdatesPayload(BaseModel):
     updates: List[UpdatePartLabels]
@@ -498,7 +535,8 @@ class UpdatesPayload(BaseModel):
 async def update_question_parts(
     exam_id: int,
     payload: UpdatesPayload,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    ctx: ExamContext = Depends(require_exam_manager),
 ):
     for update in payload.updates:
         result = await db.execute(select(Question).where(

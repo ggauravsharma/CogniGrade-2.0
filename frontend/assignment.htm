@@ -1974,7 +1974,7 @@
                                 <div class="form-group">
                                     <label for="gradeInput">Grade:</label>
                                     <div class="grade-input-container">
-                                    <input type="number" id="gradeInput" min="0" max="100" class="form-control">
+                                    <input type="number" step="any" id="gradeInput" min="0" max="100" class="form-control">
                                     <span>/ <span id="maxPoints">100</span></span>
                                     </div>
                                 </div>
@@ -3939,7 +3939,8 @@
                 }
             }
             
-            const grade = parseInt(gradeInput.value);
+            // parseFloat, not parseInt: half marks are a real grade.
+            const grade = parseFloat(gradeInput.value);
             if (isNaN(grade) || grade < 0 || grade > assignment.points_possible) {
                 alert(`Please enter a valid grade between 0 and ${assignment.points_possible}`);
                 return;

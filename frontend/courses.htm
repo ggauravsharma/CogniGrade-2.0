@@ -719,6 +719,31 @@
             padding: 4px 8px;
             border-radius: 4px;
         }
+
+        /* An exam whose grading did not finish, and one that has not been
+           graded at all, must not read as a completed result. Same badge,
+           different state -- green is reserved for a final score. */
+        .graded-label.state-partial {
+            background-color: #fef7e0;
+            color: #b06000;
+        }
+
+        .graded-label.state-ungraded {
+            background-color: #f1f3f4;
+            color: #5f6368;
+        }
+
+        /* The student card carries one real column now that the fabricated
+           "Highest" and "Average" are gone. */
+        .marks-section.marks-section-single {
+            grid-template-columns: 1fr;
+        }
+
+        .score-state {
+            font-weight: 500;
+            color: #5f6368;
+            font-size: 16px;
+        }
         .exam-results-btn {
             background: #1a73e8;
             color: #fff;
@@ -1180,6 +1205,17 @@
             }
         }
 
+        // Render a mark exactly as the backend sent it. Marks are NUMERIC(7,2)
+        // and arrive as JSON numbers, so an earned 0 stays 0 and 2.5 stays 2.5
+        // -- no rounding, no truncation. Compared against null rather than
+        // tested for truthiness, because 0 is a real mark. Anything that is not
+        // a finite number is missing data and is shown as a dash, never as 0.
+        function formatMark(value) {
+            if (value === null || value === undefined) return "—";
+            const n = Number(value);
+            return Number.isFinite(n) ? String(n) : "—";
+        }
+
         // Display assignments in the assignments tab
         function displayAssignments(assignments, isProfessor) {
             const profList = document.getElementById("profAssignmentsList");
@@ -1299,7 +1335,15 @@
                         hour: "numeric",
                         minute: "numeric"
                     }) : "";
-                    console.log(exam.class_id);
+                    // Only fields this payload actually carries. The card used
+                    // to show "Uploaded: 45", "Checked: 42", "Average Marks: 25"
+                    // and an unconditional completion tick -- all string
+                    // literals, none of them derived from anything. The
+                    // classwork endpoint supplies no submission, grading or
+                    // cohort statistics, so those rows are gone rather than
+                    // guessed; the per-exam Results page is where real numbers
+                    // live. `points_possible` is a genuine field.
+                    const totalMarks = formatMark(exam.points_possible);
                     profHtml += `
                     <div class="exam-box" onclick="enterExam(${exam.id})" style="position: relative;">
                         <div class="exam-header">
@@ -1308,22 +1352,11 @@
                                 <p>${examDate}</p>
                                 <p><small>Created: ${createdDate}</small></p>
                             </div>
-                            <div class="exam-status">
-                                <img src="checkmark.svg" alt="Completed" width="24" height="24">
-                            </div>
-                        </div>
-                        <div class="info-box">
-                            <h3>Answer Scripts</h3>
-                            <div class="stats-grid">
-                                <div class="stat-item"><span>Uploaded:</span><span>45</span></div>
-                                <div class="stat-item"><span>Checked:</span><span>42</span></div>
-                            </div>
                         </div>
                         <div class="info-box">
                             <h3>Marks Overview</h3>
                             <div class="stats-grid">
-                                <div class="stat-item"><span>Total Marks:</span><span>${exam.points_possible}</span></div>
-                                <div class="stat-item"><span>Average Marks:</span><span>25</span></div>
+                                <div class="stat-item"><span>Total Marks:</span><span>${totalMarks}</span></div>
                             </div>
                         </div>
                         <button class="exam-results-btn" onclick="event.stopPropagation(); window.location.href='exam-stats.htm?exam_id=${exam.id}';">Results</button>
@@ -1351,7 +1384,45 @@
                         hour: "numeric",
                         minute: "numeric"
                     }) : "";
-                    
+
+                    // The score is READ, never derived. This card used to print
+                    // `points_possible * 3/4` as "Your Score", `* 7/8` as
+                    // "Highest" and `/ 2` as "Average", so every student saw a
+                    // fabricated 75% on every exam -- including a student whose
+                    // grading had failed, which is exactly the distinction the
+                    // backend refuses to blur.
+                    //
+                    // `user_result` comes from the classwork endpoint and is
+                    // null when no result row exists. When a result IS present
+                    // the backend already withholds `score` unless the run
+                    // finished (`is_final`), so a partial total cannot reach
+                    // here to be mistaken for a final one. Highest and average
+                    // are simply not in this payload and are therefore not
+                    // shown at all.
+                    const result = exam.user_result;
+                    const hasFinalScore = !!result && result.is_final === true
+                        && result.score !== null && result.score !== undefined;
+
+                    let scoreCell, stateLabel, stateClass;
+                    if (hasFinalScore) {
+                        // `formatMark` is compared against null, never truthiness:
+                        // an earned 0 is a grade and prints as 0, and 2.5 stays 2.5.
+                        scoreCell = `<div class="your-score">
+                                        <div>${formatMark(result.score)}</div>
+                                        <div class="total">/${formatMark(exam.points_possible)}</div>
+                                     </div>`;
+                        stateLabel = "Graded";
+                        stateClass = "";
+                    } else if (result && result.status === "grading_incomplete") {
+                        scoreCell = `<div class="score-state">Not final</div>`;
+                        stateLabel = "Partial";
+                        stateClass = " state-partial";
+                    } else {
+                        scoreCell = `<div class="score-state">&mdash;</div>`;
+                        stateLabel = "Not graded";
+                        stateClass = " state-ungraded";
+                    }
+
                     studentHtml += `
                     <div class="exam-box" onclick="viewScripts(${exam.id})">
                         <div class="exam-info">
@@ -1365,37 +1436,18 @@
                                 <br><small>Created: ${createdDate}</small>
                             </div>
                         </div>
-                        
-                        <div class="marks-section">
+
+                        <div class="marks-section marks-section-single">
                             <div class="marks-column">
                                 <div class="marks-label">
                                 <span class="marks-icon"></span>
                                 Your Score
                                 </div>
-                                <div class="your-score">
-                                <div>${exam.points_possible * 3 / 4}</div>
-                                <div class="total">/${exam.points_possible}</div>
-                                </div>
-                            </div>
-                            
-                            <div class="marks-column">
-                                <div class="marks-label">
-                                <span class="marks-icon"></span>
-                                Highest
-                                </div>
-                                <div class="marks-value">${exam.points_possible * 7 / 8}</div>
-                            </div>
-                            
-                            <div class="marks-column">
-                                <div class="marks-label">
-                                <span class="marks-icon"></span>
-                                Average
-                                </div>
-                                <div class="marks-value">${exam.points_possible / 2}</div>
+                                ${scoreCell}
                             </div>
                         </div>
-                        
-                        <div class="graded-label">Graded</div>
+
+                        <div class="graded-label${stateClass}">${stateLabel}</div>
                     </div>`;
                 });
 

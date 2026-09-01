@@ -8,6 +8,7 @@ from typing import List, Optional
 from pydantic import BaseModel
 
 from backend.utils.security import get_current_user_required
+from backend.auth.policies import ExamContext, require_exam_participant
 from backend.models.tables import QuestionResponse, Question
 from backend.database import get_db
 from backend.models.users import User
@@ -82,6 +83,7 @@ async def submit_question_response(
     document_type: str,
     payload: QuestionResponsePayload,
     db: AsyncSession = Depends(get_db),                          # Import your get_db dependency
+    ctx: ExamContext = Depends(require_exam_participant),
     current_user: User = Depends(get_current_user_required)  # Import your get_current_user_required dependency
 ):
     document_type = document_type.lower()

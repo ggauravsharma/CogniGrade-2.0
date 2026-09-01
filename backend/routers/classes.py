@@ -16,7 +16,17 @@ from backend.database import get_db
 from backend.models.tables import Classroom, Enrollment, Assignment, Submission, Announcement
 from backend.models.users import User
 from backend.utils.security import get_current_user_required
+from backend.utils.marks_input import parse_mark_input
+from backend.auth.policies import (
+    ClassroomContext,
+    assert_assignment_access,
+    assert_submission_access,
+    require_announcement_in_classroom,
+    require_classroom_manager,
+    require_classroom_participant,
+)
 from backend.models.tables import Exam, ExamResult, Query  # Added ExamResult for classwork endpoint
+from backend.grading.aggregation import ExamResultStatus
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["classes"])
@@ -28,13 +38,15 @@ class AssignmentCreate(BaseModel):
     title: str
     description: Optional[str] = None
     due_date: Optional[str] = None  # as ISO string
-    max_marks: Optional[int] = None
+    max_marks: Optional[float] = None
 
 class SubmissionCreate(BaseModel):
     content: str
 
 class GradeSubmission(BaseModel):
-    grade: int
+    # float, not int: partial credit is a real grade (audit C7). Storage is
+    # NUMERIC(7,2) via the `Marks` column type, which quantises on write.
+    grade: float
     feedback: Optional[str] = None
 
 class AnnouncementCreate(BaseModel):
@@ -148,6 +160,11 @@ async def create_class(request: Request, name: str = Form(...), subject: str = F
             "description": new_class.description,
             "class_code": new_class.class_code
         }})
+    except HTTPException:
+        # A 403/404 raised deliberately above is an ANSWER, not a fault.
+        # Without this, the broad handler below relabels it 500 and the caller
+        # is told the server broke when it was actually told "no".
+        raise
     except Exception as e:
         logger.error(f"Error creating class: {str(e)}", exc_info=True)
         return JSONResponse(status_code=500, content={"success": False, "error": "An error occurred while creating the class"})
@@ -189,7 +206,7 @@ async def join_class(class_code: str = Form(...), db: AsyncSession = Depends(get
         return JSONResponse(status_code=500, content={"success": False, "error": "An error occurred while joining the class"})
 
 @router.post("/classes/{class_id}/assignments")
-async def create_assignment(class_id: int, assignment: AssignmentCreate, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user_required)):
+async def create_assignment(class_id: int, assignment: AssignmentCreate, db: AsyncSession = Depends(get_db), ctx: ClassroomContext = Depends(require_classroom_manager), current_user: User = Depends(get_current_user_required)):
     try:
         # Check if class exists
         result = await db.execute(select(Classroom).where(
@@ -240,6 +257,8 @@ async def create_assignment(class_id: int, assignment: AssignmentCreate, db: Asy
             "due_date": new_assignment.due_date.isoformat() if new_assignment.due_date else None,
             "points_possible": new_assignment.points_possible
         }})
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error creating assignment: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while creating the assignment")
@@ -311,6 +330,8 @@ async def get_assignment_submissions(
             })
 
         return {"submissions": formatted_submissions}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching submissions: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while fetching submissions")
@@ -323,6 +344,11 @@ async def get_my_submission(
 ):
     """Get current user's submission for an assignment"""
     try:
+        # AUTHORIZATION: classroom membership is resolved from the assignment
+        # itself. Without this an outsider could submit to, or read a
+        # submission in, a classroom they are not enrolled in.
+        await assert_assignment_access(assignment_id, current_user, db)
+
         # Fetch the assignment
         result = await db.execute(select(Assignment).where(
             Assignment.id == assignment_id
@@ -377,6 +403,8 @@ async def get_my_submission(
         }
 
         return {"submission": formatted_submission, "status": "submitted"}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching submission: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while fetching the submission")
@@ -488,6 +516,8 @@ async def get_assignment(
             "user_role": user_role,
             "user_submission": formatted_submission
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching assignment: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while fetching the assignment")
@@ -542,6 +572,8 @@ async def get_assignment_comments(
             })
 
         return {"comments": formatted_comments}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching comments: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while fetching comments")
@@ -589,8 +621,10 @@ async def delete_assignment_comment(
         if not (is_author or is_owner or is_ta):
             raise HTTPException(status_code=403, detail="You can only delete your own comments")
         
-        # Delete the comment
-        db.delete(comment)
+        # Delete the comment. `AsyncSession.delete` is a COROUTINE: unawaited
+        # it scheduled nothing, so this endpoint reported a successful delete
+        # while the row was still there.
+        await db.delete(comment)
         await db.commit()
         
         return {"success": True, "message": "Comment deleted successfully"}
@@ -609,6 +643,11 @@ async def submit_assignment_file(
 ):
     """Submit an assignment with a file attachment"""
     try:
+        # AUTHORIZATION: classroom membership is resolved from the assignment
+        # itself. Without this an outsider could submit to, or read a
+        # submission in, a classroom they are not enrolled in.
+        await assert_assignment_access(assignment_id, current_user, db)
+
         # Check if assignment exists
         result = await db.execute(select(Assignment).where(
             Assignment.id == assignment_id
@@ -682,6 +721,8 @@ async def submit_assignment_file(
                 "submitted_at": submission.submitted_at.isoformat() if submission.submitted_at else None
             }
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error submitting assignment file: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while submitting the assignment file")
@@ -693,6 +734,11 @@ async def unsubmit_assignment(
     current_user: User = Depends(get_current_user_required)
 ):
     try:
+        # AUTHORIZATION: classroom membership is resolved from the assignment
+        # itself. Without this an outsider could submit to, or read a
+        # submission in, a classroom they are not enrolled in.
+        await assert_assignment_access(assignment_id, current_user, db)
+
         # Find the assignment
         result = await db.execute(select(Assignment).where(
             Assignment.id == assignment_id
@@ -747,6 +793,8 @@ async def unsubmit_assignment(
             "files": file_paths,
             "has_files": len(file_paths) > 0
         })
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error unsubmitting assignment: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while unsubmitting the assignment")
@@ -760,6 +808,11 @@ async def grade_submission(
 ):
     """Grade a submission"""
     try:
+        # AUTHORIZATION: no class_id in the path, so resolve the classroom from
+        # the submission itself. Previously `current_user.is_professor` alone
+        # was accepted, letting any professor grade in any classroom.
+        await assert_submission_access(submission_id, current_user, db, manager_only=True)
+
         result = await db.execute(select(Submission).where(Submission.id == submission_id))
         submission = result.scalars().first()
         if not submission:
@@ -787,11 +840,12 @@ async def grade_submission(
                 raise HTTPException(status_code=403, detail="Only professors and TAs can grade submissions")
 
         # Validate grade
-        if assignment.points_possible and grade_data.grade > assignment.points_possible:
+        graded_value = parse_mark_input(grade_data.grade, field="grade")
+        if assignment.points_possible and graded_value > assignment.points_possible:
             raise HTTPException(status_code=400, detail=f"Grade cannot exceed maximum points: {assignment.points_possible}")
 
         # Update submission with grade
-        submission.grade = grade_data.grade
+        submission.grade = graded_value
         submission.feedback = grade_data.feedback
         submission.graded_by = current_user.id
         submission.graded_at = datetime.now(timezone.utc)
@@ -817,7 +871,7 @@ async def grade_submission(
         raise HTTPException(status_code=500, detail="An error occurred while grading the submission")
 
 @router.post("/classes/{class_id}/announcements")
-async def create_announcement(class_id: int, announcement: AnnouncementCreate, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user_required)):
+async def create_announcement(class_id: int, announcement: AnnouncementCreate, db: AsyncSession = Depends(get_db), ctx: ClassroomContext = Depends(require_classroom_manager), current_user: User = Depends(get_current_user_required)):
     try:
         result = await db.execute(select(Classroom).where(Classroom.id == class_id))
         classroom = result.scalars().first()
@@ -856,6 +910,8 @@ async def create_announcement(class_id: int, announcement: AnnouncementCreate, d
             "title": new_announcement.title,
             "content": new_announcement.content
         }})
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error creating announcement: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while creating the announcement")
@@ -866,6 +922,7 @@ async def update_announcement(
     announcement_id: int, 
     announcement: AnnouncementCreate, 
     db: AsyncSession = Depends(get_db), 
+    ctx: ClassroomContext = Depends(require_announcement_in_classroom),
     current_user: User = Depends(get_current_user_required)
 ):
     try:
@@ -915,12 +972,14 @@ async def update_announcement(
                 "content": existing_announcement.content
             }
         })
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error updating announcement: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while updating the announcement")
 
 @router.get("/classes/{class_id}")
-async def view_class(class_id: int, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_user_required)):
+async def view_class(class_id: int, db: AsyncSession = Depends(get_db), ctx: ClassroomContext = Depends(require_classroom_participant), current_user: User = Depends(get_current_user_required)):
     try:
         result = await db.execute(select(Classroom).where(Classroom.id == class_id))
         classroom = result.scalars().first()
@@ -1048,6 +1107,8 @@ async def view_class(class_id: int, db: AsyncSession = Depends(get_db), current_
             "ta_enrollments": [e.id for e in ta_enrollments],
             "student_enrollments": [e.id for e in student_enrollments]
         })
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error loading class data: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while loading the class data")
@@ -1056,6 +1117,7 @@ async def view_class(class_id: int, db: AsyncSession = Depends(get_db), current_
 async def get_class_members(
     class_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ClassroomContext = Depends(require_classroom_participant),
     current_user: User = Depends(get_current_user_required)
 ):
     """Get all members (teachers and students) of a class"""
@@ -1143,6 +1205,7 @@ async def get_announcement_queries(
     class_id: int,
     announcement_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ClassroomContext = Depends(require_classroom_participant),
     current_user: User = Depends(get_current_user_required)
 ):
     """Get queries (comments) for a specific announcement"""
@@ -1236,6 +1299,7 @@ async def create_query(
     class_id: int,
     query: QueryCreate,
     db: AsyncSession = Depends(get_db),
+    ctx: ClassroomContext = Depends(require_classroom_participant),
     current_user: User = Depends(get_current_user_required)
 ):
     """Create a new query (comment) for a class"""
@@ -1337,6 +1401,7 @@ async def create_query(
 async def get_class_classwork(
     class_id: int,
     db: AsyncSession = Depends(get_db),
+    ctx: ClassroomContext = Depends(require_classroom_participant),
     current_user: User = Depends(get_current_user_required)
 ):
     """Get all classwork (assignments and exams) for a class"""
@@ -1451,9 +1516,16 @@ async def get_class_classwork(
                 user_result_obj = result.scalars().first()
                 
                 if user_result_obj:
+                    # A running total from an incomplete grading run must never
+                    # reach a student as "your score". The status is reported so
+                    # the UI can say why, but the score itself stays absent
+                    # until the result is final.
+                    result_is_final = user_result_obj.status in ExamResultStatus.FINAL
                     user_result = {
                         "id": user_result_obj.id,
-                        "score": user_result_obj.marks_obtained,
+                        "score": user_result_obj.marks_obtained if result_is_final else None,
+                        "status": user_result_obj.status,
+                        "is_final": result_is_final,
                         "feedback": user_result_obj.feedback,
                         "graded_at": user_result_obj.graded_at.isoformat() if user_result_obj.graded_at else None
                     }
@@ -1497,6 +1569,8 @@ async def get_class_classwork(
             "user_role": user_role
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error retrieving classwork: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"An error occurred while retrieving classwork: {str(e)}")
@@ -1552,6 +1626,8 @@ async def upload_assignment_materials(
             "message": f"{material_type} materials uploaded successfully",
             "files": saved_files
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error uploading assignment materials: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"An error occurred while uploading materials: {str(e)}")
