@@ -27,6 +27,13 @@ class Settings:
     DATABASE_POOL_SIZE = int(os.getenv("DATABASE_POOL_SIZE", 20))
     DATABASE_MAX_OVERFLOW = int(os.getenv("DATABASE_MAX_OVERFLOW", 10))
     DATABASE_POOL_TIMEOUT = int(os.getenv("DATABASE_POOL_TIMEOUT", 30))
+    # SQLAlchemy statement echo. OFF unless a developer asks for it: echo logs
+    # every statement WITH ITS BOUND PARAMETERS, which for this schema means
+    # recognised answer text, grading reasons and marking-scheme content in
+    # plain sight. It was unconditionally on.
+    DATABASE_ECHO = os.getenv("DATABASE_ECHO", "false").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
     
     # Email settings (for future use)
     SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")

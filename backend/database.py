@@ -39,7 +39,11 @@ def _enforce_sqlite_foreign_keys(dbapi_connection, connection_record):
         cursor.close()
 
 # note the asyncpgù in the URL
-engine = create_async_engine(settings.DATABASE_URL, echo=True)
+# `echo` is configuration, not a constant. It was hard-coded True, so every
+# deployment logged every statement together with its bound parameters --
+# student answer text, grading reasons and marking-scheme content among
+# them. Default off; a developer opts in with DATABASE_ECHO=true.
+engine = create_async_engine(settings.DATABASE_URL, echo=settings.DATABASE_ECHO)
 
 # use AsyncSession for async ORM
 AsyncSessionLocal = sessionmaker(
