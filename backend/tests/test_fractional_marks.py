@@ -632,3 +632,101 @@ async def test_the_student_evaluation_endpoint_reports_fractional_marks(client, 
     entry = next(e for e in res.json() if e["question_id"] == q.id)
     assert entry["marks_obtained"] == 0.5
     assert entry["max_marks"] == 10
+
+
+# ---------------------------------------------------------------------------
+# the STUDENT-facing evaluation contract (UI-1)
+#
+# `GET /student/exam/{id}/evaluation` is what `scriptPage.htm` renders a
+# student's own result from. It used to coerce a missing mark to an empty
+# STRING, which passed the page's `!== null && !== undefined` guard and printed
+# "/5" under the label "Marks" -- a claim that an ungraded question had been
+# graded. The numeric field must carry a number or nothing, so that the three
+# states stay distinguishable at the last place that touches them.
+# ---------------------------------------------------------------------------
+
+async def _student_evaluation(client, exam, student):
+    res = await client.get(
+        f"/student/exam/{exam.id}/evaluation", headers=as_user(student)
+    )
+    assert res.status_code == 200
+    return {e["question_id"]: e for e in res.json()}
+
+
+@pytest.mark.asyncio
+async def test_student_evaluation_reports_an_earned_zero_as_zero(client, db, world):
+    """0.0 is a grade. It must arrive as the number 0, not as null or "".""" 
+    exam, student = world["exam_a"], world["student_a"]
+    q = await _add_question(db, exam.id, 81, max_marks=4)
+    db.add(QuestionResponse(question_id=q.id, student_id=student.id, marks_obtained=0))
+    await db.commit()
+
+    entry = (await _student_evaluation(client, exam, student))[q.id]
+    assert entry["marks_obtained"] == 0
+    assert entry["marks_obtained"] is not None
+    assert not isinstance(entry["marks_obtained"], str)
+
+
+@pytest.mark.asyncio
+async def test_student_evaluation_reports_an_ungraded_question_as_null(client, db, world):
+    """The regression this phase exists for: "" is neither null nor a number."""
+    exam, student = world["exam_a"], world["student_a"]
+    q = await _add_question(db, exam.id, 82, max_marks=5)
+    db.add(QuestionResponse(question_id=q.id, student_id=student.id, marks_obtained=None))
+    await db.commit()
+
+    entry = (await _student_evaluation(client, exam, student))[q.id]
+    assert entry["marks_obtained"] is None, "an ungraded mark must serialise to JSON null"
+    assert entry["marks_obtained"] != "", "the empty string defeats the frontend null guard"
+    assert entry["max_marks"] == 5, "the maximum is still known and still reported"
+
+
+@pytest.mark.asyncio
+async def test_student_evaluation_reports_a_question_with_no_response_as_null(client, db, world):
+    """Nothing submitted is not a zero either."""
+    exam, student = world["exam_a"], world["student_a"]
+    q = await _add_question(db, exam.id, 83, max_marks=6)
+
+    entry = (await _student_evaluation(client, exam, student))[q.id]
+    assert entry["marks_obtained"] is None
+    assert entry["marks_obtained"] != ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [0.5, 1.5, 2.25, 3.75])
+async def test_student_evaluation_preserves_fractional_marks(client, db, world, value):
+    exam, student = world["exam_a"], world["student_a"]
+    q = await _add_question(db, exam.id, 84, max_marks=5)
+    db.add(QuestionResponse(question_id=q.id, student_id=student.id, marks_obtained=value))
+    await db.commit()
+
+    entry = (await _student_evaluation(client, exam, student))[q.id]
+    assert entry["marks_obtained"] == value, "a fraction must not be rounded or truncated"
+
+
+@pytest.mark.asyncio
+async def test_student_evaluation_keeps_a_failure_distinct_from_a_zero(client, db, world):
+    """C6, on the surface a student actually reads.
+
+    A question that failed grading carries an error code and no mark; a
+    question genuinely worth nothing carries a mark of 0 and no code. The two
+    must not render alike, so they must not serialise alike.
+    """
+    exam, student = world["exam_a"], world["student_a"]
+    earned_zero = await _add_question(db, exam.id, 85, max_marks=2)
+    failed = await _add_question(db, exam.id, 86, max_marks=4)
+    db.add_all([
+        QuestionResponse(question_id=earned_zero.id, student_id=student.id,
+                         marks_obtained=0, reasoning="Nothing correct."),
+        QuestionResponse(question_id=failed.id, student_id=student.id,
+                         marks_obtained=None, grading_error_code="malformed_json"),
+    ])
+    await db.commit()
+
+    entries = await _student_evaluation(client, exam, student)
+    assert entries[earned_zero.id]["marks_obtained"] == 0
+    assert entries[failed.id]["marks_obtained"] is None
+    # The student's own view carries no diagnostics -- the code stays with the
+    # professor-facing endpoints. What matters here is only that the mark field
+    # tells the two apart.
+    assert entries[earned_zero.id]["marks_obtained"] != entries[failed.id]["marks_obtained"]

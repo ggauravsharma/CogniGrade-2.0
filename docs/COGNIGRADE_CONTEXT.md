@@ -1195,6 +1195,53 @@ a false final). C7 PASS (3.5 and 2.5 persisted and aggregated to 13.0).
 
 ---
 
+### UI-1 — Stop the UI lying about marks — DONE
+
+First task of the UI/demo phase, after a read-only frontend audit. Two
+correctness defects, both on surfaces that report a student's marks. No styling,
+no workflow change, no new architecture.
+
+**A — the course card invented every number it showed.** `displayExams` in
+`frontend/courses.htm` derived the student's result from the maximum:
+`points_possible * 3/4` as "Your Score", `* 7/8` as "Highest", `/ 2` as
+"Average", with an unconditional "Graded" badge. Every student saw a fabricated
+75% on every exam — including a student whose grading had FAILED, which is the
+one distinction C6 exists to protect, erased on the first screen of the product.
+The professor card was the same illness in literals: `Uploaded: 45`,
+`Checked: 42`, `Average Marks: 25`, and a completion tick on every exam.
+
+The card now READS instead of deriving. `GET /classes/{id}/classwork` already
+carried `user_result` = `{score, status, is_final, ...}` per exam, and already
+withholds `score` unless `is_final` — so a partial total could never have
+reached the page to be mistaken for a final one; nothing consumed the field.
+Three states: a final score (an earned `0` prints as `0`, `2.5` stays `2.5`),
+`Partial`/"Not final" for `grading_incomplete`, `Not graded` otherwise. Highest
+and average are not in that payload and were therefore **removed rather than
+approximated** — the per-exam Results page is where real cohort numbers live.
+Same for the professor card: only `points_possible`, which is a real field.
+
+**B — the C6 student-facing fix was defeated by its own endpoint.** MVP
+Deployment v1 changed `scriptPage.htm` to compare `marks_obtained` against
+`null` explicitly. But `studentBackend.get_exam_evaluation` coerced a missing
+mark to the empty STRING, which passes a `!== null && !== undefined` guard — so
+an ungraded question rendered as `/5` under the label "Marks", still claiming a
+grade that does not exist. One line: `else ""` → `else None`, matching the
+contract the manager-facing `/exam/{id}/student-evaluation/{sid}` has always
+used. The numeric field now carries a number or nothing.
+
+**Semantics verified, both surfaces:** `0.0` is an earned zero and shows as `0`;
+`0.5 / 1.5 / 2.25 / 3.75` survive unrounded; a `NULL` mark serialises to JSON
+`null` and shows "Not graded"; a failed question stays distinguishable from a
+zero; an incomplete run never renders as graded.
+
+- 655 tests (647 + 8). Three of the eight were verified to FAIL against the
+  pre-fix endpoint. The frontend logic was driven directly with a DOM stub over
+  seven cases (earned zero, three fractions, full marks, no result row, pending,
+  `grading_incomplete`). **No migration, no live provider calls, zero quota.**
+- C6 PASS · C7 PASS, now at the last line that touches a mark.
+
+---
+
 ## Authorization model
 
 Two capability ladders, both derived from the real domain model. `is_professor`
@@ -1460,7 +1507,13 @@ a decision, not a task.
 
 ## Next approved phase
 
-Not yet approved. Recommended next: **make an incomplete exam recoverable
+**Current phase: UI/demo polish.** UI-1 is done (above). Next approved step is
+**UI-2 — fix the broken document viewers**: Security Foundation v1 removed the
+`/uploads` StaticFiles mount, but only `crop-edit.js` was migrated to
+`/protected-files/...`; `scriptPage.htm` and seven sites in `exam.htm` still
+build `/api/` + the raw `file_path` and therefore 404.
+
+Recommended after the UI phase: **make an incomplete exam recoverable
 without re-running the whole paper.** Re-execution is self-healing but
 all-or-nothing: recovering one failed question re-runs recognition and grading
 for every question, spending quota on work already done. On a 20/day cap that
@@ -1482,5 +1535,6 @@ Still open as policy, deliberately untouched: account deletion cascades through
 institutional academic data, and the repository tracks real profile-picture
 files and answer-script PDFs committed before those paths were gitignored.
 
-**FOUNDATION PR STILL DEFERRED** — the merge to `main` waits on a complete real
-end-to-end grading run, which waits on provisioning.
+**FOUNDATION PR IS OPEN.** The complete real end-to-end grading run it was
+waiting on happened (MVP Deployment & Live Demo v1), and the PR into `main` has
+been created. It is not merged.

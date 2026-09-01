@@ -201,7 +201,15 @@ async def get_exam_evaluation(
     evaluation = []
     for q in questions:
         response = response_dict.get(q.id)
-        marks_obtained = response.marks_obtained if response and response.marks_obtained is not None else ""
+        # `else ""` here used to defeat the whole C6 distinction one layer up.
+        # A missing mark left this endpoint as an empty STRING, and
+        # `scriptPage.htm` guards with `marks_obtained !== null && !== undefined`
+        # -- which "" passes -- so an ungraded question rendered as "/5" under
+        # the label "Marks", claiming a grade that does not exist. The numeric
+        # field now carries a number or nothing: 0.0 is an earned zero, None is
+        # the absence of a grading result. Same contract the manager-facing
+        # `/exam/{id}/student-evaluation/{sid}` has always used.
+        marks_obtained = response.marks_obtained if response else None
         query_text = response.query if response and response.query else ""
         
         # Clean and format question text
