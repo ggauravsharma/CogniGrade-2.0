@@ -320,6 +320,19 @@
     .view-image-btn i {
       margin-right: 5px;
   }
+
+    /* Shown in the document pane when a file cannot be fetched, so a failed
+       load reads as a stated outcome rather than an empty panel. */
+    .viewer-message {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      padding: 24px;
+      text-align: center;
+      color: #5f6368;
+      font-size: 14px;
+    }
   </style>
 </head>
 <body>
@@ -436,35 +449,80 @@
           window.currentDocIndex = 0;
           updateViewerContent();
         })
-        .catch(error => console.error("Error loading document:", error));
+        .catch(error => {
+          console.error("Error loading document:", error);
+          showViewerMessage("This document is not available.");
+        });
+    }
+
+    /* The viewer used to point straight at "/api/" + file_path. That only ever
+       worked because ./uploads was a public StaticFiles mount serving every
+       answer script to anyone who guessed a URL; Security Foundation v1 removed
+       it, so this pane has been blank ever since. Documents are now fetched
+       through the authorized route, addressed by exam and document type, and
+       the server resolves the path itself -- a filesystem path is never put in
+       a URL and never has to be trusted coming back. */
+
+    // One object URL at a time: the viewer shows one document, and paging with
+    // the prev/next buttons would otherwise leak a blob per page.
+    let viewerObjectUrl = null;
+    let viewerLoadToken = 0;
+
+    function showViewerMessage(message) {
+      const docContent = document.getElementById("docContent");
+      docContent.innerHTML = "";
+      const note = document.createElement("div");
+      note.className = "viewer-message";
+      note.innerText = message;
+      docContent.appendChild(note);
     }
 
     function updateViewerContent() {
       if (!window.documents || window.documents.length === 0) return;
       const doc = window.documents[window.currentDocIndex];
       const docContent = document.getElementById("docContent");
+      const examId = getQueryParameter('exam_id');
+      const docType = document.getElementById("docTypeSelect").value;
       docContent.innerHTML = "";
-      
-      let isPdf = doc.file_path && doc.file_path.toLowerCase().endsWith(".pdf");
-      
-      if (isPdf) {
-        const iframe = document.createElement("iframe");
-        iframe.src = "/api/" + doc.file_path.replace("./", "");
-        iframe.style.width = "100%";
-        iframe.style.height = "100%";
-        iframe.style.border = "none";
-        iframe.style.zIndex = "1";
-        docContent.appendChild(iframe);
-      } else {
-        const img = document.createElement("img");
-        img.src = "/api/" + doc.file_path.replace("./", "");
-        img.alt = "Document Preview";
-        docContent.appendChild(img);
-      }
-      
+
+      const token = ++viewerLoadToken;
+      const isPdf = (doc.file_path || "").toLowerCase().endsWith(".pdf");
+
+      authFetch(`/protected-files/exam/${examId}/document/${encodeURIComponent(docType)}`)
+        .then(response => {
+          if (!response.ok) throw new Error(`Document unavailable (${response.status})`);
+          return response.blob();
+        })
+        .then(blob => {
+          if (token !== viewerLoadToken) return;   // the user changed document
+          if (viewerObjectUrl) URL.revokeObjectURL(viewerObjectUrl);
+          viewerObjectUrl = URL.createObjectURL(blob);
+
+          if (isPdf) {
+            const iframe = document.createElement("iframe");
+            iframe.src = viewerObjectUrl;
+            iframe.style.width = "100%";
+            iframe.style.height = "100%";
+            iframe.style.border = "none";
+            iframe.style.zIndex = "1";
+            docContent.appendChild(iframe);
+          } else {
+            const img = document.createElement("img");
+            img.src = viewerObjectUrl;
+            img.alt = "Document Preview";
+            img.onerror = () => showViewerMessage("This document could not be displayed.");
+            docContent.appendChild(img);
+          }
+        })
+        .catch(error => {
+          if (token !== viewerLoadToken) return;
+          console.error("Error loading document:", error);
+          showViewerMessage("This document could not be loaded.");
+        });
+
       // const viewerTextContainer = document.querySelector(".viewer-text");
       // viewerTextContainer.innerHTML = marked.parse(doc.extracted_text || "");
-      
+
       updateNavButtons();
     }
 
@@ -480,17 +538,17 @@
       nextBtn.disabled = (window.currentDocIndex === window.documents.length - 1);
     }
 
-    // Function to show answer image in modal
-    function viewAnswerImage(questionId, type) {
-      // Here you would normally fetch the image URL for this answer
-      // For demonstration, we'll just show a placeholder modal with a message
-      const title = type === 'correct' ? 'Correct Answer Image' : 'Your Answer Image';
-      const content = `
-            ## ${title}
-            ![${title}](/api/placeholder/600/400)`;
-      
-      openDetailModal(title, content);
-    }
+    // The two "View ... Image" buttons that used to sit on every question card
+    // are gone. They called a stub whose own comment read "for demonstration",
+    // and it rendered /api/placeholder/600/400 -- a URL that does not exist --
+    // under the heading "Your Answer Image". Presenting a placeholder as a
+    // student's own evidence is worse than not offering it.
+    //
+    // Real per-question crops ARE servable: /protected-files/response/{id}/
+    // {kind}/{index} for a student's own images, and the marking-scheme
+    // equivalent for managers only. Wiring them up needs the response id and
+    // the kind/index split, neither of which this endpoint returns today, so
+    // it is a feature rather than a URL migration and is not done here.
 
     // Evaluation Data Loading
     function loadEvaluationData() {
@@ -541,15 +599,9 @@
               </div>
               <div id="correctAnswer-${row.question_id}" class="tab-content">
                 <p>${row.correct_answer || 'Correct answer not provided'}</p>
-                <button class="view-image-btn" onclick="viewAnswerImage('${row.question_id}', 'correct')">
-                  <i class="fas fa-image"></i> View Answer Scheme Image
-                </button>
               </div>
               <div id="yourAnswer-${row.question_id}" class="tab-content">
                 <p>${row.student_answer || 'No answer provided'}</p>
-                <button class="view-image-btn" onclick="viewAnswerImage('${row.question_id}', 'your')">
-                  <i class="fas fa-image"></i> View Your Answer Image
-                </button>
               </div>
               <div id="reasoning-${row.question_id}" class="tab-content">
                 <p>${row.reasoning || 'No reasoning provided'}</p>

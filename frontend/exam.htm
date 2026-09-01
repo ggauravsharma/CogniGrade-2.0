@@ -238,6 +238,20 @@
       object-fit: contain;
     }
 
+    /* Shown in place of a document that could not be fetched, so a failed
+       load reads as a stated outcome rather than an empty panel. */
+    .preview-unavailable {
+      font-size: 13px;
+      color: #9aa0a6;
+      text-align: center;
+      padding: 8px 12px;
+    }
+
+    .extracted-modal .preview-unavailable {
+      color: #bdc1c6;
+      font-size: 14px;
+    }
+
     .extracted-modal .arrow-btn {
       position: absolute;
       top: 50%;
@@ -844,6 +858,118 @@
     =======================================
     */
 
+    /* ---------------------------------------------------------------------
+       Reading a stored file.
+
+       Uploaded files used to be reachable at "/api/" + file_path, which worked
+       only because ./uploads was a public StaticFiles mount serving every
+       answer script and marking scheme to anyone who guessed a URL. Security
+       Foundation v1 removed that mount, so every one of those URLs has been a
+       404 since: previews rendered blank and the re-upload paths below dropped
+       the file and posted an empty request.
+
+       Files are now addressed by their DATABASE ROW, never by a path. The
+       server resolves the path itself and authorizes the caller against the
+       owning exam first, so a filesystem path never leaves the backend and
+       never has to be trusted coming back in.
+       --------------------------------------------------------------------- */
+
+    function protectedFileUrl(fileObj) {
+      if (!fileObj || fileObj.id === undefined || fileObj.id === null) return null;
+      if (fileObj.kind === "answer_script") return `/protected-files/answer-script/${fileObj.id}`;
+      if (fileObj.kind === "material") return `/protected-files/material/${fileObj.id}`;
+      return null;
+    }
+
+    // Fetch a stored file's bytes through the authorized route. Throws on any
+    // non-OK response so callers can show a state rather than a blank frame;
+    // authFetch already turns a 401 into the login redirect.
+    async function fetchProtectedBlob(fileObj) {
+      const url = protectedFileUrl(fileObj);
+      if (!url) throw new Error("This file has no stored address.");
+      const response = await authFetch(url);
+      if (!response.ok) {
+        throw new Error(`Could not load this file (${response.status}).`);
+      }
+      return await response.blob();
+    }
+
+    // A stored file turned back into a File, for the paths that re-post it.
+    async function protectedFileAsFile(fileObj) {
+      const blob = await fetchProtectedBlob(fileObj);
+      return new File([blob], fileObj.name, { type: blob.type });
+    }
+
+    /* --- the extracted-text modal's document pane ------------------------- */
+
+    // One object URL is alive at a time: the modal shows one file, and paging
+    // through a section with the prev/next buttons would otherwise accumulate
+    // a blob per page for the life of the tab.
+    let modalObjectUrl = null;
+    // Bumped on every load so a slow fetch cannot overwrite the pane after the
+    // user has already paged past it.
+    let modalLoadToken = 0;
+
+    function setModalNotice(container, message) {
+      let notice = container.querySelector(".preview-unavailable");
+      if (!message) {
+        if (notice) notice.remove();
+        return;
+      }
+      if (!notice) {
+        notice = document.createElement("div");
+        notice.className = "preview-unavailable";
+        container.appendChild(notice);
+      }
+      notice.innerText = message;
+    }
+
+    function applyModalSource(element, url, container) {
+      if (modalObjectUrl) URL.revokeObjectURL(modalObjectUrl);
+      modalObjectUrl = url;
+      element.style.display = "block";
+      // An <img> handed something it cannot decode renders a broken-image
+      // glyph and nothing else. Say what happened instead.
+      if (element.tagName === "IMG") {
+        element.onerror = () => {
+          element.style.display = "none";
+          setModalNotice(container, "Preview unavailable. This file could not be displayed.");
+        };
+      }
+      element.src = url;
+    }
+
+    // `file` is either a freshly picked File or a stored row. Both end up as an
+    // object URL; only the stored one has to go through the authorized route,
+    // and only that one can fail in a way the user needs told about.
+    function showFileInModal(element, file, container) {
+      const token = ++modalLoadToken;
+      setModalNotice(container, null);
+
+      if (file instanceof File) {
+        applyModalSource(element, URL.createObjectURL(file), container);
+        return;
+      }
+      if (!protectedFileUrl(file)) {
+        element.style.display = "none";
+        element.removeAttribute("src");
+        setModalNotice(container, "Preview unavailable for this file.");
+        return;
+      }
+      fetchProtectedBlob(file)
+        .then(blob => {
+          if (token !== modalLoadToken) return;   // the user paged away
+          applyModalSource(element, URL.createObjectURL(blob), container);
+        })
+        .catch(err => {
+          if (token !== modalLoadToken) return;
+          console.error("Error loading document preview:", err);
+          element.style.display = "none";
+          element.removeAttribute("src");
+          setModalNotice(container, "Preview unavailable. This file could not be loaded.");
+        });
+    }
+
     async function loadExam() {
       const examId = getQueryParam("exam_id");
       if (!examId) {
@@ -916,6 +1042,10 @@
             // Create a simulated file object with the necessary properties.
             const fileObj = {
               id: material.id,
+              // Which protected-file route addresses this row. Recorded here,
+              // where the answer is known for certain, rather than re-derived
+              // from a section name at each of the six places that need it.
+              kind: "material",
               name: material.filename,    // stored in db as title
               size: material.file_size,
               file_path: material.file_path,
@@ -963,6 +1093,7 @@
           if (sectionKey) {
             const fileObj = {
               id: ans.id,
+              kind: "answer_script",
               name: ans.filename,
               size: ans.file_size,
               file_path: ans.file_path,
@@ -1029,17 +1160,10 @@
         if (fileObj instanceof File) {
           return fileObj;
         }
-        // Otherwise, assume it has a file_path property and convert it.
-        if (fileObj.file_path) {
-          const src = "/api/" + fileObj.file_path.replace("./", "");
+        // Otherwise it is a stored row; fetch it back through the authorized route.
+        if (protectedFileUrl(fileObj)) {
           try {
-            const response = await fetch(src);
-            if (!response.ok) {
-              throw new Error("Failed to fetch file from " + fileObj.file_path);
-            }
-            const blob = await response.blob();
-            // Create a new File with the original name and blob's type.
-            return new File([blob], fileObj.name, { type: blob.type });
+            return await protectedFileAsFile(fileObj);
           } catch (e) {
             console.error("Error converting file:", e);
             return null;
@@ -1622,13 +1746,29 @@
           } else if (firstFile.type.startsWith("image/")) {
             img.src = URL.createObjectURL(firstFile);
           }
-        } else if (firstFile && firstFile.file_path) {
+        } else if (firstFile && protectedFileUrl(firstFile)) {
           // For backend-loaded files, check the file extension
-          if (firstFile.file_path.toLowerCase().endsWith(".pdf")) {
+          if ((firstFile.name || "").toLowerCase().endsWith(".pdf")) {
             img.src = "pdf-icon.svg";
           } else {
-            console.log("BACKEND LOAD ", firstFile.file_path);
-            img.src = "/api/" + firstFile.file_path.replace("./", "");
+            // The bytes have to be fetched through the authorized route, so the
+            // thumbnail arrives after the tile is already on screen. If it does
+            // not arrive, say so instead of leaving a broken-image glyph.
+            img.alt = "Preview unavailable";
+            fetchProtectedBlob(firstFile)
+              .then(blob => {
+                const objectUrl = URL.createObjectURL(blob);
+                img.onload = () => URL.revokeObjectURL(objectUrl);
+                img.src = objectUrl;
+              })
+              .catch(err => {
+                console.error("Error loading file preview:", err);
+                img.remove();
+                const note = document.createElement("div");
+                note.className = "preview-unavailable";
+                note.innerText = "Preview unavailable";
+                previewContainer.insertBefore(note, previewContainer.firstChild);
+              });
           }
         }
         
@@ -1714,16 +1854,9 @@
       for (let file of filesArray) {
         if (file instanceof File) {
           formData.append("files", file);
-        } else if (file.file_path) {
+        } else if (protectedFileUrl(file)) {
           try {
-            src = "/api/" + file.file_path.replace("./", "");
-            const response = await fetch(src);
-            if (!response.ok) {
-              throw new Error("Failed to fetch file from " + file.file_path);
-            }
-            const blob = await response.blob();
-            const newFile = new File([blob], file.name, { type: blob.type });
-            formData.append("files", newFile);
+            formData.append("files", await protectedFileAsFile(file));
           } catch (e) {
             console.error("Error fetching backend file:", e);
           }
@@ -1817,13 +1950,7 @@
           container.appendChild(pdfFrame);
         }
         // Set the source of the PDF.
-        let pdfUrl = "";
-        if (file instanceof File) {
-          pdfUrl = URL.createObjectURL(file);
-        } else if (file.file_path) {
-          pdfUrl = "/api/" + file.file_path.replace("./", "");
-        }
-        pdfFrame.src = pdfUrl;
+        showFileInModal(pdfFrame, file, container);
       } else {
         // For non-PDF files, ensure any existing PDF iframe is removed.
         if (pdfFrame) {
@@ -1837,13 +1964,7 @@
         } else {
           imgElement.style.display = "block";
         }
-        let imgSrc = "";
-        if (file instanceof File && file.type && file.type.startsWith("image/")) {
-          imgSrc = URL.createObjectURL(file);
-        } else if (file && file.file_path) {
-          imgSrc = "/api/" + file.file_path.replace("./", "");
-        }
-        imgElement.src = imgSrc;
+        showFileInModal(imgElement, file, container);
       }
       
       // Update the modal text on the right side
@@ -1943,16 +2064,9 @@
           }
           if (file instanceof File) {
             formData.append("files", file);
-          } else if (file.file_path) {
+          } else if (protectedFileUrl(file)) {
             try {
-              src = "/api/" + file.file_path.replace("./", "");
-              const response = await fetch(src);
-              if (!response.ok) {
-                throw new Error("Failed to fetch file from " + file.file_path);
-              }
-              const blob = await response.blob();
-              const newFile = new File([blob], file.name, { type: blob.type });
-              formData.append("files", newFile);
+              formData.append("files", await protectedFileAsFile(file));
             } catch (e) {
               console.error("Error fetching backend file:", e);
             }
@@ -2418,16 +2532,9 @@
       for (let file of filesArray) {
         if (file instanceof File) {
           formData.append("files", file);
-        } else if (file.file_path) {
+        } else if (protectedFileUrl(file)) {
           try {
-            const src = "/api/" + file.file_path.replace("./", "");
-            const response = await fetch(src);
-            if (!response.ok) {
-              throw new Error("Failed to fetch file from " + file.file_path);
-            }
-            const blob = await response.blob();
-            const newFile = new File([blob], file.name, { type: blob.type });
-            formData.append("files", newFile);
+            formData.append("files", await protectedFileAsFile(file));
           } catch (e) {
             console.error("Error fetching backend file:", e);
           }

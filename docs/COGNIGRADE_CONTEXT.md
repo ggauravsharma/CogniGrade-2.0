@@ -1242,6 +1242,66 @@ zero; an incomplete run never renders as graded.
 
 ---
 
+### UI-2 — Fix the broken document viewers — DONE
+
+Security Foundation v1 removed the public `/uploads` StaticFiles mount, but only
+`crop-edit.js` was migrated to `/protected-files/...`. Nine other live call
+sites still built `"/api/" + file_path` by hand, so every one of them had been a
+404 since that commit. **The public mount was NOT restored** — this phase moved
+the callers onto the authorized route.
+
+**What was actually broken.** Two viewers rendered blank: the student's document
+pane in `scriptPage.htm` and the extracted-text modal in `exam.htm`, plus the
+drop-zone thumbnail. Worse, four *re-upload* paths (`saveAllFiles`,
+`extractTextForSection`, `openModifyModal`'s per-file extract,
+`extractQuestionLabels`) fetch a stored file back and re-post it — and caught the
+404 with a bare `console.error`, dropping the file from the `FormData`. The
+request still went out, just without that file, so re-processing an exam whose
+files came from the database asked the model to extract from nothing.
+
+**Files are addressed by row, never by path.** Uploaded documents now go through
+`authFetch` → `response.ok` → `blob()` → object URL. A filesystem path never
+appears in a URL and never has to be trusted coming back in.
+
+**Two routes added to `backend/auth/files.py`** — `GET /protected-files/material/
+{id}` and `GET /protected-files/answer-script/{id}`. The existing doc_type route
+answers "the marking scheme for exam 5" and returns the FIRST match, but
+`POST /exam/save-files` deduplicates by (title, exam, type), so an exam can
+legitimately hold several question-paper files and the multi-file upload UI
+needs to address the second one. The id form applies **exactly** the same
+capability table — question paper to participants, marking scheme and solution
+script to managers only, an answer script to its owner or a manager (enrolment
+required, matching the doc_type branch rather than the looser `ctx.owns`) — so
+holding an id grants nothing that holding the exam id would not. Both resolve
+the exam FROM the row, and both pass through `_resolve_within_root`.
+
+**Failure is stated, not blank.** A document that cannot be fetched shows
+"This document could not be loaded." / "Preview unavailable." Nothing renders a
+status code, a stack trace, a provider error or a path. One object URL is alive
+per viewer, revoked when paging; a load token discards a slow fetch whose page
+the user has already left.
+
+**Not fabricated:** `scriptPage.htm`'s two "View ... Image" buttons rendered
+`/api/placeholder/600/400` — a URL that never existed — under the heading "Your
+Answer Image". The buttons and their stub are removed rather than pointed at
+something plausible. Real per-question crops ARE servable
+(`/protected-files/response/{id}/{kind}/{index}`), but the student evaluation
+endpoint returns neither the response id nor the kind/index split, so wiring
+them up is a feature and not this phase.
+
+**Profile pictures untouched:** they resolve to `./profile_pictures/...` and
+`/profile_pictures` is still mounted, so those four call sites are correct as
+they stand and were not modified.
+
+- 670 tests (655 + 15). The 15 cover the new routes' capability table,
+  anonymous access, cross-exam authority, missing ids, non-exam material types
+  and the upload-root containment guard. Frontend behaviour was driven from the
+  files' own source in a VM harness over 34 checks (addressing, authenticated
+  request, success, 403/404/500/network failure, object-URL revocation, stale
+  in-flight load). **No migration, no live provider calls, zero quota.**
+
+---
+
 ## Authorization model
 
 Two capability ladders, both derived from the real domain model. `is_professor`
@@ -1507,11 +1567,15 @@ a decision, not a task.
 
 ## Next approved phase
 
-**Current phase: UI/demo polish.** UI-1 is done (above). Next approved step is
-**UI-2 — fix the broken document viewers**: Security Foundation v1 removed the
-`/uploads` StaticFiles mount, but only `crop-edit.js` was migrated to
-`/protected-files/...`; `scriptPage.htm` and seven sites in `exam.htm` still
-build `/api/` + the raw `file_path` and therefore 404.
+**Current phase: UI/demo polish.** UI-1 and UI-2 are done (above). Next
+approved step is **UI-3 — reframe the visible workflow as AI-first**: the
+stage-6 panel still tells the teacher that "Automatic Grading will begin once
+students annotate their answer scripts", the student's normal path opens a
+cropping workspace, and `POST /exam/{id}/enqueue-processing` has exactly one
+caller in the whole frontend -- the tail of `crop-edit.js handleSubmit()`. Part
+of that phase is investigating whether the grading trigger can move to the
+teacher; `enqueue-processing` takes `current_user.id` as the student, so check
+what it accepts before assuming it is frontend-only.
 
 Recommended after the UI phase: **make an incomplete exam recoverable
 without re-running the whole paper.** Re-execution is self-healing but

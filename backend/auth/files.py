@@ -188,6 +188,77 @@ async def get_exam_document(
 
 
 # ---------------------------------------------------------------------------
+# individual stored documents, addressed by their own row id
+#
+# The route above answers "the marking scheme for exam 5" and returns the FIRST
+# matching row. That is the right shape for a viewer that wants "the" document,
+# but `POST /exam/save-files` deduplicates by (title, exam, type), so an exam
+# genuinely can hold several question-paper files -- a scanned paper split
+# across images is the ordinary case. Nothing could address the second one.
+#
+# These two routes close that gap without widening access: the id names a row,
+# the exam is resolved FROM that row, and the capability required is the same
+# one the doc_type route applies to the same file_type. A material id from
+# another exam therefore grants nothing here that it would not grant there.
+# ---------------------------------------------------------------------------
+
+@router.get("/material/{material_id}")
+async def get_material_file(
+    material_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user_required),
+):
+    """One exam material by its own id. Same capability table as by doc type."""
+    result = await db.execute(select(Material).where(Material.id == material_id))
+    material = result.scalars().first()
+    if not material:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    file_type = getattr(material.file_type, "value", material.file_type)
+    if file_type in MANAGER_ONLY_DOC_TYPES:
+        await assert_exam_manager(material.related_exam_id, current_user, db)
+    elif file_type in STUDENT_READABLE_DOC_TYPES:
+        await assert_exam_participant(material.related_exam_id, current_user, db)
+    else:
+        # Assignment materials and anything else are not served here; they have
+        # no capability rule in this module and must not inherit one by default.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    return _serve(_resolve_within_root(material.file_path))
+
+
+@router.get("/answer-script/{answer_script_id}")
+async def get_answer_script_file(
+    answer_script_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user_required),
+):
+    """One answer script by its own id. Owning student, or an exam manager."""
+    result = await db.execute(
+        select(AnswerScript).where(AnswerScript.id == answer_script_id)
+    )
+    script = result.scalars().first()
+    if not script:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail="Answer script not found")
+
+    # Deliberately the same two conditions the doc_type route applies to
+    # `answer_script`, in the same order, rather than the looser `ctx.owns`:
+    # a non-manager must be an ENROLLED student AND the owner. A student whose
+    # enrolment has gone must not keep reading the script through a stale id.
+    ctx = await load_exam_context(script.exam_id, current_user, db)
+    if not ctx.is_manager:
+        if not ctx.is_enrolled_student or script.student_id != current_user.id:
+            logger.warning(
+                "authz denied: answer script not readable by caller "
+                "(user_id=%s answer_script_id=%s)", current_user.id, answer_script_id
+            )
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+
+    return _serve(_resolve_within_root(script.file_path))
+
+
+# ---------------------------------------------------------------------------
 # cropped region images
 # ---------------------------------------------------------------------------
 
