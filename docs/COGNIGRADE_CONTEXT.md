@@ -995,6 +995,121 @@ real segmentation integration should decide that policy, not this phase.
 
 ---
 
+### Offline Pipeline Harness v1 — DONE
+
+Every earlier phase validated one stage in isolation. This one runs the whole
+automatic pipeline joined up, offline, and asserts what comes out the far end.
+
+**The production path exercised**, with nothing replaced but the vendor call:
+
+```
+tasks._process_and_grade                          the Celery task body
+  -> geminiAPI.process_answer_text_images_logic    recognition (batched)
+       -> ai_services.recognise_answer_images
+            -> ai.services.run_task -> run_with_retries -> PROVIDER
+  -> geminiAPI.grade_exam_logic                    grading, three phases
+       1 LOAD     build_region_aware_evidence -> _build_diagram_prompt_parts
+       2 GRADE    run_bounded(_grade_one_question_compute)
+                    -> grade_answer_with_parts -> PROVIDER
+                    -> grading.result.parse_grading_response
+       3 PERSIST  _persist_and_report / _record_grading_failure
+  -> examStats.add_exam_result_internal            aggregation
+       -> grading.aggregation.aggregate_student_result
+  -> exams.set_exam_stage                          workflow state
+```
+
+The stub is installed at the `TextTaskProvider` seam (conftest's
+`RecordingProvider` place), so prompt assembly, part ordering, evidence
+composition, batching, retry, telemetry, validation, persistence, aggregation
+and the stage transition are all real. `AsyncSessionLocal` is pointed at the
+test engine; the Celery BROKER is the only uncovered link — the task body is
+invoked directly, exactly as `process_and_grade_exam` invokes it.
+
+**The synthetic exam** (`backend/tests/test_offline_pipeline.py`), six
+questions, no real student data:
+
+```
+CG-Q1  5   text-only, no regions               legacy path       -> 4.0
+CG-Q2  3   marking-scheme AND student diagram  the C1 pair       -> 2.5
+CG-Q3  2   accepted math + handwritten region
+           + a legacy table                    structured/mixed  -> 1.25
+CG-Q4  2   a wrong answer                      a REAL zero       -> 0.0
+CG-Q5  4   failure injection                                     -> NULL
+CG-Q6  3   no response row at all              nothing submitted
+```
+
+**Complete success:** all five marks persist, `answer_text` lands from
+recognition, no failure codes, `ExamResult` = 11.25 / `graded` / `graded_at`
+set, exam stage 7. CG-Q6 does not block finalisation — an absent response row
+means nothing was submitted, which is not a grading failure (the documented
+`aggregate_student_result` rule).
+
+**Partial failure:** CG-Q5 alone has `marks_obtained = NULL` and
+`grading_error_code = invalid_request`; its four siblings keep their marks and
+carry no code; `ExamResult` = 7.75 / `grading_incomplete` / `graded_at` NULL;
+exam stage 6. Per-question isolation is real: a sibling's failure rolls nothing
+back.
+
+**Real zero vs failure:** CG-Q4 keeps `0.0` with a reason and no code while
+CG-Q5 stays NULL with a code, and the 7.75 total proves neither was mistaken
+for the other.
+
+**Structured vs legacy:** CG-Q1 attaches nothing (text only). CG-Q3 sends the
+structured maths crop AND the legacy table — an accepted maths region does not
+erase an unrelated legacy category — while its accepted handwritten-text region
+attaches nothing, because the recognised `answer_text` is already in the
+prompt. The prompt says "mathematical working" and never "diagram". Crops are
+asserted to still exist at the moment of the provider call.
+
+**Fail-closed:** with the answer script missing, CG-Q3 fails `source_missing`
+with no mark and no provider call, while the region-free siblings still grade.
+
+**Provider calls:** one recognition batch (5 images, batch size 5) and exactly
+one grading call per question with evidence — 5, never 6, never a repeat. A
+retryable error is retried exactly to the budget (1 + 2); a non-retryable one
+is not retried at all.
+
+**Re-execution is safe and self-healing.** A second complete run creates no
+duplicate `ExamResult` or `QuestionResponse` rows and does not double the
+total. Re-running after a failure clears the stale `grading_error_code`, writes
+the mark, finalises the result and advances the stage — the documented recovery
+path, now proven rather than assumed.
+
+**Logging:** across a whole run, CogniGrade's own loggers carry ids, counts and
+provider-neutral categories, never the recognised answers, the marking scheme,
+provider output or evidence paths. (The SQLite driver's DEBUG statement log is
+out of scope: every driver echoes bound parameters at DEBUG.)
+
+**BUG FOUND AND FIXED — the exam stage ignored the outcome.**
+`_process_and_grade` ended in an unconditional `set_exam_stage(exam_id, 7, db)`
+— stage 7 being "Graded" — which ran even when aggregation had just written
+`grading_incomplete` with no `graded_at`. Two persisted records of the same
+fact then disagreed. Fixed narrowly: `exam_result_is_final` reads the status
+the aggregation actually wrote, and the task sets `EXAM_STAGE_GRADED` or
+`EXAM_STAGE_GRADING` accordingly — named constants, so no bare `7` remains.
+This REVERSES the earlier "correct as it stands" note, whose premise was wrong:
+the vocabulary on `Exam.exam_stage` gives 6 = "Grading", 7 = "Graded". Severity
+MEDIUM, not high: `exam_stage` gates nothing in the backend, and result release
+is still gated by `ExamResult.status`.
+
+**Still open, deliberately not fixed:** `exam_stage` is EXAM-wide while
+`_process_and_grade` is PER-student, so across many students the stage reflects
+whoever ran last. That was true before this fix and remains true after it; a
+correct exam-wide signal needs an all-students completion query and is a
+product decision, not a bug fix.
+
+**Not covered:** the Celery broker itself, and PostgreSQL — the harness runs on
+the suite's in-memory SQLite because no Docker daemon was available in this
+environment. SQLite's dynamic typing means this proves the ORCHESTRATION
+carries 2.5 / 1.25 / 11.25 without truncation, not that the column type is
+NUMERIC; that half stays covered by the static assertions and the earlier
+PostgreSQL runtime verification.
+
+- 621 tests (607 + 14). **NO LIVE PROVIDER CALLS — zero quota. No migration.**
+- C1 PASS · C6 PASS · C7 PASS, now end to end rather than per unit.
+
+---
+
 ## Authorization model
 
 Two capability ladders, both derived from the real domain model. `is_professor`
@@ -1094,10 +1209,13 @@ been removed from this list.
 - **`process_marking_scheme_text_image` is still unexercised end to end.** It
   no longer crashes on entry (Reliability v1) and now runs through the service
   layer, but proving it needs a live provider call.
-- `tasks.py` advances the exam to stage 7 after grading regardless of outcome.
-  That is correct as it stands — stage 7 is "grading started", an exam-wide
-  workflow marker, and result release is gated per student by
-  `ExamResult.status` — but the exam stage alone never signals trouble.
+- ~~`tasks.py` advances the exam to stage 7 after grading regardless of
+  outcome. That is correct as it stands — stage 7 is "grading started"...~~
+  **REVERSED and FIXED** in Offline Pipeline Harness v1. The premise was wrong:
+  `Exam.exam_stage`'s own comment lists eight labels for stages 0–7, so 6 is
+  "Grading" and 7 is "Graded". The stage is now conditional on the
+  aggregation's verdict. The residual multi-student limitation is unchanged and
+  still open — see that phase.
 - `backend/routers/old/` is dead and does not compile. Excluded from
   `compileall` runs; it should simply be deleted at some point.
 
@@ -1120,7 +1238,7 @@ authorization rather than token signing. The Gemini SDK is stubbed only when the
 real package is absent, and the stub raises if any test reaches a model.
 
 ```
-.venv-test/Scripts/python.exe -m pytest -q      # 607 passed
+.venv-test/Scripts/python.exe -m pytest -q      # 621 passed
 ```
 
 SQLite now enforces foreign keys (see Reliability v2), so cascade behaviour in
@@ -1246,20 +1364,20 @@ rectification for photographed sheets). Their `results/` and
 
 ## Next approved phase
 
-Not yet approved. Recommended next: **an offline end-to-end reliability harness
-for the automatic pipeline** — one deterministic run of upload → recognition →
-grading → aggregation → results against stubbed providers, asserting that a
-whole exam completes, that a single failed question yields NULL marks and a
-failure code rather than a zero, and that aggregation refuses to finalise while
-any mark is missing. Every stage is unit-tested in isolation today and none of
-them is tested joined up, which is where a real run will break first. Zero
-quota, no new schema.
+Not yet approved. Recommended next: **make an incomplete exam recoverable
+without re-running the whole paper.** The harness proved re-execution is
+self-healing but also that it is all-or-nothing: recovering one failed question
+re-runs recognition and grading for every question, spending quota on work
+already done. The task is a re-grade path that selects only the responses
+carrying a `grading_error_code` (or no mark), grades those, and re-aggregates —
+reusing `grade_exam_logic`'s three phases rather than adding a second
+orchestration. That turns the failure path from "start again" into "finish the
+job", which is the difference between a demo and something a teacher can rely
+on. Zero new schema: the failure-code column already carries the state.
 
-Explicitly NOT recommended: region-editor development. The previous
-recommendation here (making the crop editor POST geometry) would have made
-manual annotation part of the normal workflow, which is the opposite of the
-AI-first goal — see **What CogniGrade is**. Regions should arrive from a
-segmentation model and deterministic validation, not from a drawing task.
+Explicitly NOT recommended: region-editor development. Regions should arrive
+from a segmentation model and deterministic validation, not from a drawing
+task — see **What CogniGrade is**.
 
 Still blocked on provisioning, separately: the Gemini free tier allows 20
 requests per day per model, so no real end-to-end grading run — and no live
