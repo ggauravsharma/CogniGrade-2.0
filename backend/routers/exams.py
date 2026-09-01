@@ -41,6 +41,14 @@ async def get_exam_stage(
         raise HTTPException(status_code=404, detail="Exam not found")
     return {"exam_stage": exam.exam_stage}
 
+#: The two stages the automatic pipeline moves an exam between. `exam_stage` is
+#: a plain integer column whose meaning is documented on `Exam.exam_stage`;
+#: naming the two the background job uses keeps a bare 7 out of `tasks.py`,
+#: where it read as "done" without saying so.
+EXAM_STAGE_GRADING = 6
+EXAM_STAGE_GRADED = 7
+
+
 async def set_exam_stage(exam_id: int, exam_stage: int, db: AsyncSession):
     """Core stage transition, callable from background jobs.
 

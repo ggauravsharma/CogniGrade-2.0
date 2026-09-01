@@ -589,8 +589,15 @@ async def test_aggregation_runs_only_after_every_question_is_graded(monkeypatch)
     async def _aggregate(exam_id, student_id, db):
         calls.append("aggregate")
 
+    async def _is_final(exam_id, student_id, db):
+        calls.append("check_final")
+        return True
+
+    stages = []
+
     async def _stage(exam_id, stage, db):
         calls.append("stage")
+        stages.append(stage)
 
     class _Session:
         async def __aenter__(self):
@@ -602,15 +609,63 @@ async def test_aggregation_runs_only_after_every_question_is_graded(monkeypatch)
     monkeypatch.setattr(tasks, "process_answer_text_images_logic", _recognise)
     monkeypatch.setattr(tasks, "grade_exam_logic", _grade)
     monkeypatch.setattr(tasks, "add_exam_result_internal", _aggregate)
+    monkeypatch.setattr(tasks, "exam_result_is_final", _is_final)
     monkeypatch.setattr(tasks, "set_exam_stage", _stage)
     monkeypatch.setattr(tasks, "AsyncSessionLocal", lambda: _Session())
 
     await tasks._process_and_grade(1, 2)
 
-    assert calls == ["recognise", "grade_start", "grade_end", "aggregate", "stage"]
+    assert calls == [
+        "recognise", "grade_start", "grade_end", "aggregate", "check_final", "stage",
+    ]
     assert calls.index("grade_end") < calls.index("aggregate"), (
         "the exam result was computed while grading was still running"
     )
+    assert calls.index("aggregate") < calls.index("check_final"), (
+        "finality was read before aggregation had written it"
+    )
+    assert stages == [tasks.EXAM_STAGE_GRADED]
+
+
+@pytest.mark.asyncio
+async def test_an_incomplete_result_does_not_reach_the_graded_stage(monkeypatch):
+    """The stage must come from the aggregation's verdict, not from arriving.
+
+    The task used to end in an unconditional `set_exam_stage(exam_id, 7, db)`,
+    so a run that had just written `grading_incomplete` still marked the exam
+    Graded -- two records of the same fact disagreeing.
+    """
+    import backend.tasks as tasks
+
+    stages = []
+
+    async def _noop(*a, **kw):
+        return None
+
+    async def _not_final(exam_id, student_id, db):
+        return False
+
+    async def _stage(exam_id, stage, db):
+        stages.append(stage)
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    monkeypatch.setattr(tasks, "process_answer_text_images_logic", _noop)
+    monkeypatch.setattr(tasks, "grade_exam_logic", _noop)
+    monkeypatch.setattr(tasks, "add_exam_result_internal", _noop)
+    monkeypatch.setattr(tasks, "exam_result_is_final", _not_final)
+    monkeypatch.setattr(tasks, "set_exam_stage", _stage)
+    monkeypatch.setattr(tasks, "AsyncSessionLocal", lambda: _Session())
+
+    await tasks._process_and_grade(1, 2)
+
+    assert stages == [tasks.EXAM_STAGE_GRADING]
+    assert tasks.EXAM_STAGE_GRADED not in stages
 
 
 def test_the_concurrency_primitive_holds_no_module_level_loop_state():

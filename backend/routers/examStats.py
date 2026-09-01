@@ -671,6 +671,22 @@ async def add_exam_result(
     student_id = student_id or current_user.id
     return await add_exam_result_internal(exam_id, student_id, db)#, current_user)
 
+async def exam_result_is_final(exam_id: int, student_id: int, db: AsyncSession) -> bool:
+    """Whether this student's result has been finalised, read from the row.
+
+    `add_exam_result_internal` returns a `JSONResponse`, which a background job
+    would have to decode to learn what it decided. Asking the persisted row
+    instead keeps ONE authority for the answer: the status the aggregation
+    actually wrote.
+    """
+    found = await db.execute(select(ExamResult).where(
+        ExamResult.exam_id == exam_id,
+        ExamResult.student_id == student_id,
+    ))
+    result = found.scalars().first()
+    return result is not None and result.status in ExamResultStatus.FINAL
+
+
 async def add_exam_result_internal(exam_id: int, student_id: int, db: AsyncSession):#, current_user: User):
     result = await db.execute(select(Exam).where(Exam.id == exam_id))
     exam = result.scalars().first()
