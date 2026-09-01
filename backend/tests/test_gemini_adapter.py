@@ -112,12 +112,31 @@ def _request(paths=(), *, task=AITask.GRADING, text="prompt"):
     return ProviderRequest(task=task, parts=parts, prompt_version="test/v1")
 
 
+def _inline_parts(sdk, call=0):
+    """The media blobs sent in one generate_content call.
+
+    Media travels INLINE rather than through the File API -- see
+    `GeminiProvider._inline`. A blob is a plain
+    `{"mime_type": ..., "data": ...}` mapping, so tests read it directly
+    instead of through an upload handle.
+    """
+    return [
+        c for c in sdk.generate_calls[call]["contents"]
+        if isinstance(c, dict) and "mime_type" in c
+    ]
+
+
 # ---------------------------------------------------------------------------
 # file lifecycle
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_uploads_are_deleted_after_a_successful_call(adapter, sdk, tmp_path):
+async def test_media_is_sent_inline_and_leaves_nothing_behind(adapter, sdk, tmp_path):
+    """Nothing is created provider-side, so nothing can be left there.
+
+    This replaces an upload/delete pair. The guarantee is the same one --
+    whatever we create, we remove -- reached by creating nothing.
+    """
     a = tmp_path / "a.png"
     b = tmp_path / "b.png"
     a.write_bytes(b"a")
@@ -127,13 +146,40 @@ async def test_uploads_are_deleted_after_a_successful_call(adapter, sdk, tmp_pat
         _request([str(a), str(b)]), get_task_settings(AITask.GRADING)
     )
     assert response.text
-    assert sdk.uploaded == [str(a), str(b)]
-    assert len(sdk.deleted) == 2, "every uploaded file must be removed"
+    assert sdk.uploaded == [], "the File API was used"
+    assert sdk.deleted == []
+    assert response.uploaded_file_count == 0
+
+    blobs = _inline_parts(sdk)
+    assert [blob["data"] for blob in blobs] == [b"a", b"b"]
+    assert all(blob["mime_type"] == "image/png" for blob in blobs)
 
 
 @pytest.mark.asyncio
-async def test_uploads_are_deleted_when_the_model_call_fails(adapter, sdk, tmp_path):
-    """The leak that mattered: a failed grading still leaves files behind."""
+async def test_the_file_api_is_never_called(adapter, sdk, tmp_path):
+    """THE live blocker.
+
+    `genai.upload_file` reaches the REST discovery client, which authenticates
+    with `?key=` and rejects the newer AQ.-format keys outright:
+
+        HttpError 400 ... API_KEY_INVALID
+
+    while gRPC `generate_content` accepts the same key. Every recognition call
+    and every diagram question carries an image, so routing media through the
+    File API failed the entire product on a key that works.
+    """
+    a = tmp_path / "answer.png"
+    a.write_bytes(b"a")
+
+    await adapter.run_text_task(_request([str(a)]), get_task_settings(AITask.GRADING))
+
+    assert sdk.uploaded == []
+    assert _inline_parts(sdk), "the image never reached the model"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_call_leaves_nothing_provider_side(adapter, sdk, tmp_path):
+    """The leak that mattered: a failed grading used to leave files behind."""
     a = tmp_path / "a.png"
     a.write_bytes(b"a")
     sdk.raise_on_generate = RuntimeError("503 service unavailable")
@@ -141,8 +187,7 @@ async def test_uploads_are_deleted_when_the_model_call_fails(adapter, sdk, tmp_p
     with pytest.raises(ProviderTemporaryError):
         await adapter.run_text_task(_request([str(a)]), get_task_settings(AITask.GRADING))
 
-    assert sdk.uploaded == [str(a)]
-    assert len(sdk.deleted) == 1, "a failed call must still clean up its uploads"
+    assert sdk.uploaded == [] and sdk.deleted == []
 
 
 @pytest.mark.asyncio
@@ -169,19 +214,17 @@ async def test_local_files_are_never_deleted(adapter, sdk, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_the_same_file_is_uploaded_once_per_call(adapter, sdk, tmp_path):
+async def test_the_same_file_is_read_once_per_call(adapter, sdk, tmp_path):
     a = tmp_path / "shared.png"
     a.write_bytes(b"a")
 
     request = _request([str(a), str(a)])
-    response = await adapter.run_text_task(request, get_task_settings(AITask.GRADING))
+    await adapter.run_text_task(request, get_task_settings(AITask.GRADING))
 
-    assert sdk.uploaded == [str(a)], "a repeated path must not be uploaded twice"
-    assert response.uploaded_file_count == 1
-    # ... and it still appears at BOTH positions in the prompt.
-    contents = sdk.generate_calls[0]["contents"]
-    handles = [c for c in contents if isinstance(c, FakeHandle)]
-    assert len(handles) == 2 and handles[0] is handles[1]
+    # One read, and the SAME object at both positions -- so the bytes are not
+    # carried twice in the request either.
+    blobs = _inline_parts(sdk)
+    assert len(blobs) == 2 and blobs[0] is blobs[1]
 
 
 @pytest.mark.asyncio
@@ -192,7 +235,7 @@ async def test_a_missing_file_is_skipped_not_fatal(adapter, sdk, tmp_path):
     response = await adapter.run_text_task(
         _request([str(a), str(tmp_path / "gone.png")]), get_task_settings(AITask.GRADING)
     )
-    assert sdk.uploaded == [str(a)]
+    assert [blob["data"] for blob in _inline_parts(sdk)] == [b"a"]
     assert "missing_file" in response.warnings
 
 
@@ -222,10 +265,11 @@ async def test_part_order_is_preserved_exactly(adapter, sdk, tmp_path):
 
     contents = sdk.generate_calls[0]["contents"]
     assert contents[0] == "scheme text"
-    assert contents[1].path == str(ref)
+    assert contents[1]["data"] == b"r", "the reference image left its slot"
     assert contents[2] == "student answer"
-    assert contents[3].path == str(stu)
+    assert contents[3]["data"] == b"s", "the student image left its slot"
     assert contents[4] == "tail"
+    assert contents[1] is not contents[3], "the two sides collapsed into one part"
 
 
 # ---------------------------------------------------------------------------
@@ -399,13 +443,17 @@ async def test_concurrent_invocations_do_not_share_per_call_state(adapter, sdk, 
 
     assert len(responses) == 10
     for response in responses:
-        assert response.uploaded_file_count == 1, (
-            "an invocation saw another invocation's uploads"
+        assert response.warnings == (), (
+            "an invocation saw another invocation's warnings"
         )
-        assert response.warnings == ()
-    # Every file uploaded once and deleted once, nothing lost or doubled.
-    assert sorted(sdk.uploaded) == sorted(paths)
-    assert len(sdk.deleted) == 10
+    # Every file read once and sent once, nothing lost, doubled or crossed.
+    sent = [
+        blob["data"]
+        for call in range(10)
+        for blob in _inline_parts(sdk, call)
+    ]
+    assert len(sent) == 10, "an invocation carried another invocation's media"
+    assert sdk.uploaded == [] and sdk.deleted == []
 
 
 def test_the_adapter_holds_no_global_mutable_call_state():

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import mimetypes
 import os
 import time
 from typing import Any, List, Optional, Sequence, Tuple
@@ -56,13 +57,45 @@ logger = logging.getLogger(__name__)
 
 PROVIDER_NAME = "gemini"
 
+#: Ceiling on the total inline media in one request. The documented limit for
+#: inline data is 20MB for the whole request; this leaves headroom for the
+#: prompt text and protobuf overhead. An answer-sheet crop is tens of
+#: kilobytes, so a whole question is nowhere near it -- but a caller that
+#: attached a 30MB scan should get an explicit, provider-neutral refusal
+#: rather than a truncated request or an opaque SDK error.
+MAX_INLINE_REQUEST_BYTES = 15 * 1024 * 1024
+
+
+#: The one variable a deployment is expected to set.
+API_KEY_ENV = "GEMINI_API_KEY"
+#: Accepted for compatibility with the older numbered convention. Read only
+#: when the canonical variable is unset -- NOT rotation, which this adapter
+#: cannot do (see the constructor).
+LEGACY_API_KEY_ENV = "GEMINI_API_KEY_1"
+
 
 def _read_api_keys() -> List[str]:
-    """`GEMINI_API_KEY_1`, `_2`, ... in order, stopping at the first gap."""
+    """The configured Gemini key: `GEMINI_API_KEY`, else the legacy numbered form.
+
+    WHY BOTH. Live validation found the deployed container authenticating with
+    `GEMINI_API_KEY_1` and failing, while the working key in the repository
+    `.env` was named `GEMINI_API_KEY` -- which this function did not read at
+    all. A deployment could therefore hold a valid key and configure nothing,
+    and the first sign of it was a 401 partway through grading a paper. One
+    canonical name fixes that; the numbered form stays readable so existing
+    deployments keep working.
+
+    Values are stripped: a trailing space in a `.env` line is invisible in an
+    editor and produces an authentication failure that looks like a bad key.
+    """
+    canonical = (os.getenv(API_KEY_ENV) or "").strip()
+    if canonical:
+        return [canonical]
+
     keys: List[str] = []
     index = 1
     while True:
-        key = os.getenv(f"GEMINI_API_KEY_{index}")
+        key = (os.getenv(f"GEMINI_API_KEY_{index}") or "").strip()
         if not key:
             break
         keys.append(key)
@@ -111,8 +144,12 @@ class GeminiProvider:
         if not keys:
             # Not fatal at construction: a deployment that never calls Gemini
             # (a test run, a future local-model install) must still import.
-            # The failure surfaces as an authentication error at call time.
-            logger.warning("no GEMINI_API_KEY_n configured; Gemini calls will fail")
+            # The failure surfaces as an authentication error at call time --
+            # before any upload, see `run_text_task`.
+            logger.warning(
+                "no Gemini credential configured (set %s); Gemini calls will fail",
+                API_KEY_ENV,
+            )
             self._api_key = None
             return
 
@@ -126,6 +163,19 @@ class GeminiProvider:
             )
         self._api_key = keys[0]
 
+    @staticmethod
+    def _not_configured() -> ProviderAuthenticationError:
+        """The failure for "no credential", named so it cannot be misread.
+
+        Provider-neutral category (`authentication`), so the grading path
+        records a missing mark with a safe code rather than a zero, and no key
+        material can reach the message: it names the VARIABLE, never a value.
+        """
+        return ProviderAuthenticationError(
+            f"no Gemini credential is configured; set {API_KEY_ENV}",
+            provider=PROVIDER_NAME,
+        )
+
     # -- client -----------------------------------------------------------
     def _model_for(self, model_name: str):
         """One `GenerativeModel` per model name, built once.
@@ -134,9 +184,7 @@ class GeminiProvider:
         would make the global `configure` race with itself under concurrency.
         """
         if self._api_key is None:
-            raise ProviderAuthenticationError(
-                "no Gemini API key configured", provider=PROVIDER_NAME
-            )
+            raise self._not_configured()
         if not self._configured:
             genai.configure(api_key=self._api_key)
             self._configured = True
@@ -145,26 +193,57 @@ class GeminiProvider:
         return self._models[model_name]
 
     # -- files ------------------------------------------------------------
-    async def _upload(self, path: str):
-        """Upload one local file, returning the provider handle."""
+    async def _inline(self, path: str) -> dict:
+        """Read one local file as an inline part.
+
+        WHY NOT `genai.upload_file`. The File API in google-generativeai 0.8.4
+        is reached through the REST discovery client, which authenticates by
+        appending `?key=` to the URL. That path rejects the newer `AQ.`-format
+        keys outright:
+
+            HttpError 400 ... "API key not valid. Please pass a valid API key."
+            reason: API_KEY_INVALID
+
+        while the gRPC `generate_content` path accepts the same key and answers
+        normally. Live validation reproduced exactly that split: text-only
+        grading worked and every call carrying an image failed as
+        `authentication`, which is every recognition call and every diagram
+        question -- the whole point of the product.
+
+        Inline bytes go over the working path, and they also remove the
+        upload/delete lifecycle that used to leak provider-side files. The cost
+        is the request-size ceiling above, which page crops do not approach.
+        """
+        def _read():
+            with open(path, "rb") as handle:
+                return handle.read()
+
         try:
-            return await asyncio.to_thread(
-                genai.upload_file, path=path, display_name=os.path.basename(path)
+            data = await asyncio.to_thread(_read)
+        except OSError as exc:
+            raise ProviderInvalidRequestError(
+                f"could not read a local file for the request ({type(exc).__name__})",
+                provider=PROVIDER_NAME, cause=exc,
             )
-        except Exception as exc:  # noqa: BLE001 - SDK raises assorted types
-            raise _classify(exc)
+        mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        return {"mime_type": mime, "data": data}
 
     async def _build_contents(self, request: ProviderRequest) -> Tuple[List[Any], List[Any], List[str]]:
-        """Turn ordered prompt parts into SDK contents, uploading files in place.
+        """Turn ordered prompt parts into SDK contents, inlining files in place.
 
         Returns `(contents, handles, warnings)`. ORDER IS PRESERVED: a file part
-        becomes an uploaded handle at exactly the position it occupied, because
-        diagram grading depends on each image sitting immediately after the text
-        that introduces it.
+        becomes its bytes at exactly the position it occupied, because diagram
+        grading depends on each image sitting immediately after the text that
+        introduces it.
 
-        Each DISTINCT path is uploaded once per call -- a question that names
-        the same reference image twice costs one upload, not two. Per-invocation
-        only; a cross-request cache would need invalidation nobody has designed.
+        Each DISTINCT path is read once per call -- a question that names the
+        same reference image twice costs one read and is sent once.
+        Per-invocation only; a cross-request cache would need invalidation
+        nobody has designed.
+
+        `handles` is now always empty: nothing is created provider-side, so
+        there is nothing to clean up. It is still returned so the caller's
+        `finally` stays in place for any future path that does upload.
 
         Audit C1 note: dedup is by resolved PATH, so a reference image and a
         student image collapse only when they are literally the same file. It
@@ -174,6 +253,7 @@ class GeminiProvider:
         handles: List[Any] = []
         warnings: List[str] = []
         seen = {}
+        total_bytes = 0
 
         for part in request.parts:
             if isinstance(part, TextPart):
@@ -188,22 +268,30 @@ class GeminiProvider:
                 continue
             if not os.path.exists(path):
                 warnings.append("missing_file")
-                logger.warning("skipping a missing file for provider upload")
+                logger.warning("skipping a missing file for the provider request")
                 continue
-            handle = await self._upload(path)
-            seen[key] = handle
-            handles.append(handle)
-            contents.append(handle)
+            blob = await self._inline(path)
+            total_bytes += len(blob["data"])
+            if total_bytes > MAX_INLINE_REQUEST_BYTES:
+                raise ProviderInvalidRequestError(
+                    "request media exceeds the inline size limit "
+                    f"({total_bytes} > {MAX_INLINE_REQUEST_BYTES} bytes)",
+                    provider=PROVIDER_NAME,
+                )
+            seen[key] = blob
+            contents.append(blob)
 
         return contents, handles, warnings
 
     async def _delete_uploads(self, handles: Sequence[Any]) -> None:
-        """Remove the provider-side copies. Best effort, never fatal.
+        """Remove any provider-side copies. Best effort, never fatal.
 
-        Historically `upload_file` was called from five places and `delete_file`
-        from none, so every graded diagram question left files behind forever.
-        Cleanup failure is logged and swallowed: losing a remote temp file must
-        never destroy a grading result that was already produced.
+        Now a no-op in practice: media is sent inline, so `_build_contents`
+        produces no handles and nothing is left provider-side to leak. Kept
+        because the guarantee -- whatever we create, we delete -- is the one
+        that was missing when `upload_file` was called from five places and
+        `delete_file` from none, and it should already be here if a large-media
+        path ever brings uploads back.
 
         Only provider handles are touched. The LOCAL file is not deleted here --
         it is the student's answer script and belongs to the application.
@@ -276,7 +364,15 @@ class GeminiProvider:
         *,
         timeout_seconds: Optional[float] = None,
     ) -> ProviderResponse:
-        """One attempt: upload, generate, read, clean up. Retries live elsewhere."""
+        """One attempt: upload, generate, read, clean up. Retries live elsewhere.
+
+        The credential is checked FIRST. `_build_contents` uploads every file
+        in the request to the provider, so an unconfigured deployment used to
+        push a student's whole answer set over the wire before discovering it
+        could not authenticate.
+        """
+        if self._api_key is None:
+            raise self._not_configured()
         budget = timeout_seconds if timeout_seconds is not None else settings.timeout_seconds
         started = time.monotonic()
         handles: List[Any] = []
