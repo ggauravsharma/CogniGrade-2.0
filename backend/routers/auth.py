@@ -13,7 +13,12 @@ import smtplib
 from email.message import EmailMessage
 
 # Existing imports
-from backend.config import settings
+from backend.config import (
+    google_oauth_enabled,
+    google_redirect_uri,
+    missing_google_oauth_settings,
+    settings,
+)
 from backend.database import get_db      # ← changed
 from backend.models.users import User
 from backend.utils.security import (
@@ -25,6 +30,7 @@ from backend.utils.security import (
 from backend.utils.validators import validate_email, validate_password
 
 # NEW: Import Authlib’s OAuth tools
+from authlib.integrations.base_client import MismatchingStateError
 from authlib.integrations.starlette_client import OAuth, OAuthError
 
 logger = logging.getLogger(__name__)
@@ -181,14 +187,87 @@ async def logout(request: Request):
 
 # ========= Google OAuth Endpoints =========
 
+# The page the browser is on when either OAuth route is entered, and the only
+# place either one sends it when the flow does not complete.
+LOGIN_PAGE = "/login.htm"
+
+# Both OAuth routes are TOP-LEVEL BROWSER NAVIGATIONS -- the Google button is a
+# `window.location.href`, and Google itself navigates the browser to the
+# callback. Whatever they return is rendered as a page, so a JSON body is a
+# wall of raw JSON in front of the user; the failing callback showed
+# `{"success":false,"error":"Google OAuth failed"}` with no way back.
+#
+# So a failure redirects to the login page carrying a CODE. A code, never text:
+# nothing Authlib, Google or an exception said is copied into the URL, so a
+# failure cannot put a state value, an authorization code, a token or an email
+# address into the address bar, the browser history or a referrer header.
+# login.htm holds the one sentence each code maps to.
+OAUTH_ERROR_SESSION_EXPIRED = "google_session_expired"
+OAUTH_ERROR_UNAVAILABLE = "google_unavailable"
+OAUTH_ERROR_FAILED = "google_failed"
+
+
+def _back_to_login(code: str) -> RedirectResponse:
+    """Return the browser to the login page with a code login.htm can explain."""
+    return RedirectResponse(url=f"{LOGIN_PAGE}?auth_error={code}", status_code=303)
+
+
+def _clear_google_oauth_state(request: Request) -> None:
+    """Drop this session's leftover Google OAuth state so a retry starts clean.
+
+    Authlib parks the state it generated in the Starlette session under
+    `_state_google_<state>`, and removes it itself only on the SUCCESS path. A
+    failed callback leaves the entry behind, and on Authlib versions that do
+    not prune on the next attempt they accumulate in the session cookie until
+    it is too large to be sent -- at which point every further attempt fails
+    the same way and the user can never get out of it.
+
+    The keys are removed, never read and never logged: a state value is
+    precisely the kind of thing that must not reach a log line.
+    """
+    try:
+        session = request.session
+    except (AssertionError, AttributeError):
+        # No SessionMiddleware on this app; nothing was stored to clear.
+        return
+    for key in [k for k in session if k.startswith("_state_google_")]:
+        session.pop(key, None)
+
+
+def _google_oauth_unavailable():
+    """What both OAuth routes do when Google sign-in is not configured.
+
+    Done INSTEAD of redirecting to Google. Sending an empty client_id got
+    `401 invalid_client -- The OAuth client was not found`, a Google-branded
+    page that names nothing an operator can act on.
+
+    The names of the unset variables go to the log, where an operator can act
+    on them. The browser is simply put back on the login page, which offers the
+    email and password sign-in that does work -- it never sees a status code,
+    a configuration name, or a reason.
+    """
+    missing = missing_google_oauth_settings()
+    logger.error(
+        "Google sign-in is not configured; refusing the request. Unset: %s",
+        ", ".join(missing),
+    )
+    return _back_to_login(OAUTH_ERROR_UNAVAILABLE)
+
+
 @router.get("/login/google")
 async def login_google(request: Request):
-    redirect_uri = request.url_for("auth_via_google")
-    return await oauth.google.authorize_redirect(request, redirect_uri)
+    if not google_oauth_enabled():
+        return _google_oauth_unavailable()
+    # The configured URL, never `request.url_for(...)`: nginx strips the `/api`
+    # prefix before this app sees the request, so a derived callback points at
+    # a path the browser cannot reach. See backend/config.py.
+    return await oauth.google.authorize_redirect(request, google_redirect_uri())
 
 
 @router.get("/auth/google", name="auth_via_google")
 async def auth_via_google(request: Request, db: AsyncSession = Depends(get_db)):
+    if not google_oauth_enabled():
+        return _google_oauth_unavailable()
     try:
         token = await oauth.google.authorize_access_token(request)
         user_info = token["userinfo"]
@@ -229,8 +308,33 @@ async def auth_via_google(request: Request, db: AsyncSession = Depends(get_db)):
         return resp
 
     except OAuthError as e:
-        logger.error(f"Google OAuth error: {e.error}", exc_info=True)
-        return JSONResponse(status_code=400, content={"success": False, "error": "Google OAuth failed"})
+        # Authlib's checks are left exactly as Authlib performs them. Only the
+        # PRESENTATION of a failure changes here: the callback is a browser
+        # navigation, so it must answer with a page the user can act on rather
+        # than the raw JSON it used to render.
+        code = getattr(e, "error", "") or "oauth_error"
+        if isinstance(e, MismatchingStateError) or code == MismatchingStateError.error:
+            # The CSRF check did its job: the state Google handed back is not
+            # one this browser session started. Ordinary causes are a stale
+            # tab, a callback URL replayed from history, a flow begun before
+            # the browser dropped the session cookie, or a second sign-in
+            # started while the first was still open. Not an attack signal on
+            # its own, and not something to weaken -- something to recover
+            # from, by clearing what is left and offering a clean retry.
+            logger.warning(
+                "Google sign-in rejected: the OAuth state did not match this "
+                "session (Authlib CSRF check). Returning the user to the login "
+                "page to start again."
+            )
+            _clear_google_oauth_state(request)
+            return _back_to_login(OAUTH_ERROR_SESSION_EXPIRED)
+
+        # Everything else: the provider's short error code only. Deliberately
+        # NOT `e.description` and NOT a traceback -- those can carry the
+        # authorization code, the state, or the token request that failed.
+        logger.error("Google sign-in failed: %s", code)
+        _clear_google_oauth_state(request)
+        return _back_to_login(OAUTH_ERROR_FAILED)
 
 
 def send_reset_email(email: str, reset_link: str):

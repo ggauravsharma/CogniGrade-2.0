@@ -66,6 +66,29 @@
   </div>
   <script src="authorize.js"></script>
   <script>
+    // A Google sign-in that does not complete sends the browser back here with
+    // `?auth_error=<code>`. The server sends a CODE, never text, so nothing
+    // Authlib or Google said -- and no state value, authorization code or
+    // token -- can be reflected into this page. Every sentence shown lives
+    // here; an unrecognised code falls through to the generic one, and the
+    // message is written with textContent, so a crafted query string is text.
+    (function showGoogleSignInError() {
+      const MESSAGES = {
+        google_session_expired: "Google sign-in session expired. Please try again.",
+        google_unavailable: "Google sign-in is not available. Please sign in with your email and password.",
+        google_failed: "Google sign-in could not be completed. Please try again."
+      };
+      const code = new URLSearchParams(window.location.search).get("auth_error");
+      if (!code) return;
+      const errorMessage = document.getElementById("error-message");
+      if (errorMessage) {
+        errorMessage.textContent = MESSAGES[code] || MESSAGES.google_failed;
+      }
+      // Drop the parameter so a reload, or a later successful sign-in, does not
+      // show a stale failure.
+      window.history.replaceState({}, document.title, window.location.pathname);
+    })();
+
     document.addEventListener("visibilitychange", function() {
       if (document.visibilityState === "visible") {
         authFetch("/check-session")

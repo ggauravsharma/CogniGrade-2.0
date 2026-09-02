@@ -1364,6 +1364,181 @@ aggregation and result generation, all from one instructor action.
 
 ---
 
+### Google sign-in fix — DONE
+
+Found during live UI inspection: the Google button returned
+`401 invalid_client — The OAuth client was not found`. **Two independent
+faults**, either of which alone breaks the flow.
+
+**1. Credentials absent.** `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` were
+unset, and `oauth.register()` passes them through with no validation, so an
+EMPTY client id went to Google. The app started, rendered the button, and said
+nothing until a user clicked it. (Both variables are also blank in the older
+`DEP25-G06-CogniGrade` checkout — Google sign-in has never been configured in
+this project.)
+
+**2. The callback was derived from a rewritten path.** `login_google` used
+`request.url_for("auth_via_google")`. nginx rewrites `^/api/(.*)$ -> /$1`
+before proxying, so the backend never sees the `/api` prefix the browser used
+and generated `http://localhost/auth/google` — which nginx routes to the
+FRONTEND container and 404s. Confirmed from the live `Location` header. This
+fault would have survived adding credentials.
+
+**The fix: state the callback, do not infer it.** New `GOOGLE_REDIRECT_URI`.
+Google requires the redirect URI to match a registered value exactly, so it is
+deployment configuration by nature; stating it also survives TLS termination,
+where a derived URL would claim `http://`. Rejected: routing `/auth/google` in
+nginx (puts OAuth knowledge in the proxy, still wrong under TLS) and
+`root_path="/api"` (changes every `url_for` in the app).
+
+**Enabled only when all three are set.** Partial configuration is the bug, so
+it is now loud: a startup WARNING naming the unset variables, and **503** from
+both OAuth routes instead of a redirect Google rejects. `config.py` gained
+`missing_google_oauth_settings()` / `google_oauth_enabled()` /
+`google_redirect_uri()`, all reading the environment at call time so the
+enabled check and the callback cannot disagree. Names only ever reach the log;
+the browser gets one safe sentence.
+
+**Not fatal, deliberately.** Google sign-in is optional and email/password
+login does not depend on it, so a deployment setting none of the three is
+normal and gets an INFO line.
+
+```
+GOOGLE_CLIENT_ID       from Google Cloud Console (OAuth 2.0 Client ID, Web application)
+GOOGLE_CLIENT_SECRET   same client
+GOOGLE_REDIRECT_URI    docker compose  http://localhost/api/auth/google
+                       backend on 8000 http://localhost:8000/auth/google
+                       behind TLS      https://<domain>/api/auth/google
+```
+
+The same URL must be registered as an Authorised redirect URI on the OAuth
+client, or Google answers `redirect_uri_mismatch`.
+
+- 712 tests (691 + 21). Seven fail against the pre-fix routes. Verified live in
+  the Docker stack: `/api/login/google` and `/api/auth/google` gave a safe
+  refusal and no Google redirect; `POST /api/login` still reached its own
+  validation. **No secret committed; `.env.template` carries names only.**
+  (The refusal was a 503 JSON body at this point. Replaced in the next
+  section — see *Demo-safe authentication entry path*.)
+
+---
+
+### Demo-safe authentication entry path — DONE
+
+Live testing with the credentials configured surfaced three more failures. None
+of them is a wrong grade or a wrong permission; all three are the first thing a
+demo audience sees.
+
+**1. `502 Bad Gateway` after every `docker compose ... up -d --build`.**
+
+nginx resolves a host name written LITERALLY in `proxy_pass` exactly once, when
+the configuration is loaded, and reuses that address for the life of the worker.
+`up -d --build` recreates `portal_backend`, which can come back on a different
+address on the compose network, and nginx went on dialling the old one. Only
+`docker restart portal_nginx` cleared it.
+
+Reproduced deterministically rather than guessed: stop the backend, hold its
+address with a throwaway container on `dep25-g06-cognigrade_internal`, start the
+backend so it has to move. nginx then logged
+
+```
+connect() failed (111: Connection refused) while connecting to upstream,
+upstream: "http://172.19.0.5:8000/check-session"
+```
+
+while the same backend answered `401` normally on its new address from inside
+the nginx container. A plain `up -d --build` reproduced it too: the backend
+moved `.5 -> .6`, nginx (untouched) kept dialling `.8`, and `/api/` was 502.
+
+**Fix: look the upstream up per request.** `resolver 127.0.0.11 valid=10s
+ipv6=off;` plus `set $backend_upstream http://backend:8000;` /
+`proxy_pass $backend_upstream;`, and the same for the frontend. nginx only
+defers resolution when the upstream comes from a VARIABLE, and a variable needs
+an explicit resolver — `127.0.0.11` is Docker's embedded DNS. The `/api` rewrite,
+the headers, and the ports are untouched: nothing new is published to the host.
+Rejected: an `upstream {}` block (resolved once at load, same bug) and adding
+the backend to the host network (undoes internal-only exposure).
+
+Verified: backend forced onto a new address with nginx never restarted, `/api/`
+answered 401 within the first 5s poll and stayed up. **One-time cost:** the
+config is a bind mount, so `up -d --build` alone does not reload it — apply it
+once with `docker compose -p dep25-g06-cognigrade up -d --force-recreate nginx`.
+After that, ordinary rebuilds need no manual nginx restart.
+
+**2. `MismatchingStateError` rendered as raw JSON.**
+
+In a second Chrome profile Google returned to the correct callback and Authlib
+raised `mismatching_state: CSRF Warning! State not equal in request and
+response.` The route caught `OAuthError` and returned
+`{"success":false,"error":"Google OAuth failed"}` — a JSON body, in a top-level
+browser navigation, with no way back.
+
+**The CSRF check is untouched.** It is doing its job; a stale tab, a replayed
+callback URL, a dropped session cookie or a second sign-in started over the
+first all reach it legitimately. Only the presentation changed: both OAuth
+routes now `303` to `/login.htm?auth_error=<code>`.
+
+A **code**, never text. Nothing Authlib, Google or an exception produced is
+copied into the URL, so a failure cannot put a state value, an authorization
+code, a token or an email address into the address bar, the history or a
+referrer. `login.htm` holds the three sentences (`google_session_expired`,
+`google_unavailable`, `google_failed`), writes them with `textContent`, falls
+back to the generic one for anything unrecognised, and clears the parameter with
+`history.replaceState` so a reload does not show a stale failure.
+
+`_clear_google_oauth_state()` drops the session's leftover `_state_google_*`
+entries on failure. Authlib removes them only on the success path; left behind
+they accumulate in the session cookie until it is too big to send, and then
+every later attempt fails identically — a dead end the user cannot escape. The
+keys are removed, never read and never logged.
+
+**3. The unconfigured route was still a raw JSON 503 page.** Same treatment,
+same reason: it is a browser navigation. Both routes now return the browser to
+the login page with `google_unavailable`; the names of the unset variables still
+go to the server log at ERROR, and the browser gets no status code, no
+configuration name and no reason. No feature-flag plumbing and no conditional
+rendering of the button — a server-side redirect was enough.
+
+**Found while verifying, and fixed: the access log carried the credential.**
+uvicorn writes the request line verbatim, so
+
+```
+INFO: "GET /auth/google?state=...&code=4-0Af..." 303 See Other
+```
+
+put a one-use authorization code and the flow's CSRF state in
+`docker logs portal_backend` on EVERY sign-in, successful or not, whatever the
+route itself chose to log. `backend/main.py` now installs
+`RedactSensitiveQuery` on `uvicorn.access` and on root's handlers: a query
+carrying `code`, `state`, `id_token`, `access_token`, `refresh_token` or `token`
+is logged as `?<redacted>`. Route, method and status survive; only the values
+go. Applied by argument shape, not by position, so it does not depend on how a
+given uvicorn version orders its access-line arguments.
+
+Also fixed: `test_partial_configuration_is_also_refused` reloaded
+`backend.config`, which re-runs `load_dotenv()` and put a developer's real
+`.env` back over the variable the test had just removed — it silently asserted
+the opposite of its name on any machine with a populated `.env`. The reload was
+never needed; the helpers read `os.environ` at call time for exactly this
+reason.
+
+```
+nginx/nginx.conf         resolver + variable upstreams
+backend/routers/auth.py  redirect-with-code, state cleanup, safe logging
+backend/main.py          access-log query redaction
+frontend/login.htm       the three sentences, rendered as text
+```
+
+- 733 tests (712 + 21). Live: `up -d --build` left the site and API reachable
+  with no manual nginx restart; a stale callback landed on `/login.htm` showing
+  “Google sign-in session expired. Please try again.” with the Google button
+  ready for a clean retry; `?auth_error=<img onerror=...>` rendered as the
+  generic sentence with zero injected nodes; an unconfigured backend redirected
+  both routes to `google_unavailable`; email/password login unaffected; and the
+  planted state and code values appeared **zero** times in the backend log.
+
+---
+
 ## Authorization model
 
 Two capability ladders, both derived from the real domain model. `is_professor`

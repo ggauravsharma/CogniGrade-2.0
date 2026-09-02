@@ -44,8 +44,58 @@ class Settings:
     # Google Sign In
     GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
     GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+    # The callback Google sends the browser back to, stated explicitly rather
+    # than derived from the incoming request. See GOOGLE_OAUTH_SETTINGS below.
+    GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
 
 
     FRONTEND_BASE_URL = "http://127.0.0.1:8000"
 
 settings = Settings()
+
+
+# ---------------------------------------------------------------------------
+# Google sign-in configuration
+#
+# Three variables, and Google sign-in is enabled only when all three are set.
+# Partial configuration is the failure this exists to stop: with the client id
+# absent the app still started, still offered the button, and still redirected
+# to Google -- which answered `401 invalid_client`, a message that says nothing
+# about which variable is missing.
+#
+# GOOGLE_REDIRECT_URI is not derivable from the request. The bundled nginx
+# rewrites `^/api/(.*)$ -> /$1` before proxying, so FastAPI never sees the
+# `/api` prefix the browser used and `request.url_for()` generates a path that
+# is not externally reachable. Google also requires the redirect URI to match a
+# registered value EXACTLY, so it is deployment configuration by nature, not
+# something to infer -- and stating it survives TLS termination, where a
+# derived URL would claim http://.
+# ---------------------------------------------------------------------------
+
+GOOGLE_OAUTH_SETTINGS = ("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REDIRECT_URI")
+
+
+def missing_google_oauth_settings(env=None):
+    """Names (never values) of the Google sign-in variables that are not set.
+
+    Reads the environment at call time rather than at import, so a caller --
+    or a test -- sees the current environment.
+    """
+    source = os.environ if env is None else env
+    return [name for name in GOOGLE_OAUTH_SETTINGS if not (source.get(name) or "").strip()]
+
+
+def google_oauth_enabled(env=None) -> bool:
+    """True only when every Google sign-in variable is set."""
+    return not missing_google_oauth_settings(env)
+
+
+def google_redirect_uri(env=None):
+    """The configured callback, read from the same place as the enabled check.
+
+    Deliberately not `settings.GOOGLE_REDIRECT_URI`: that is captured at import,
+    so a route reading it while `google_oauth_enabled()` read the live
+    environment could disagree with itself. One source, one answer.
+    """
+    source = os.environ if env is None else env
+    return (source.get("GOOGLE_REDIRECT_URI") or "").strip() or None
