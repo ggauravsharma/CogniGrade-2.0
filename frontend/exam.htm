@@ -2709,19 +2709,28 @@
       // Compare with initial files loaded (assuming initialQuestionFiles is set in loadExam)
       const hasChanged = JSON.stringify(currentQuestionFiles) !== JSON.stringify(initialQuestionFiles);
 
-      // If questions exist and no change, skip extraction
+      // Questions already exist and the files look identical (name and size).
+      // That is a quota guard, not a correctness rule -- and as a silent skip
+      // it made the exam impossible to fix without renaming the paper, because
+      // pressing Process again did nothing at all. Re-processing is now offered
+      // instead of refused; the server replaces the structure in one
+      // transaction, so saying yes is safe and repeatable.
       if (existingQuestions.length > 0 && !hasChanged) {
-        console.log("No changes detected, skipping extraction.");
-        processQpBtn.innerText = "Process";
-        processQpBtn.disabled = false;
-        return;
+        const proceed = confirm(
+          "This question paper has already been processed. Process it again and " +
+          "replace the current question structure?"
+        );
+        if (!proceed) {
+          processQpBtn.innerText = "Process";
+          processQpBtn.disabled = false;
+          return;
+        }
       }
 
-      // If there’s a change or no questions, delete existing and re-extract
-      if (hasChanged && existingQuestions.length > 0) {
-        await authFetch(`/exams/${examId}/questions`, { method: "DELETE" });
-        console.log("Existing questions deleted due to file changes.");
-      }
+      // No delete here any more. /extract-question-labels replaces the exam's
+      // question structure in ONE transaction, so deleting first from the
+      // browser only opened a window where a failed extraction left the exam
+      // with no questions at all.
 
       const formData = new FormData();
       formData.append("exam_id", examId);
@@ -2752,13 +2761,16 @@
           body: formData
         });
         const data = await response.json();
-        if (data.results) {
+        if (response.ok && data.results) {
           processQpBtn.innerText = "Process";
           processQpBtn.disabled = false;
           // Update initialQuestionFiles after successful extraction
           initialQuestionFiles = currentQuestionFiles;
         } else {
-          alert("Error: " + data.error);
+          // 409 is the refusal to restructure an exam that already has student
+          // responses, and it arrives as `detail`. It used to read
+          // "Error: undefined", which told the teacher nothing.
+          alert(data.detail || data.error || "Could not process the question paper.");
           processQpBtn.innerText = "Process";
           processQpBtn.disabled = false;
         }

@@ -452,14 +452,26 @@ async def delete_exam_file(
 async def delete_exam_questions(
     exam_id: int,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user_required)
+    ctx: ExamContext = Depends(require_exam_manager),
 ):
+    """Drop this exam's whole question structure.
+
+    Manager-only. It took `get_current_user_required` alone, so ANY signed-in
+    account could erase any exam's questions -- and `question_responses`
+    cascades on that delete, so it took the students' answers and marks too.
+    The exam is resolved from the path by the dependency, exactly as the other
+    manager-only exam routes do it.
+
+    Normal reprocessing no longer comes through here: `/extract-question-labels`
+    replaces the structure in one transaction. This stays as the explicit
+    "clear it" action.
+    """
     result = await db.execute(select(Question).where(Question.exam_id == exam_id))
     questions = result.scalars().all()
-    
+
     for question in questions:
         await db.delete(question)
-    
+
     await db.commit()
     return {"success": True, "message": "All questions deleted for this exam"}
 

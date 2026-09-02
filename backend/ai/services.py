@@ -27,6 +27,7 @@ from typing import Optional, Sequence, Tuple
 
 from backend.ai.config import TaskSettings, get_task_settings
 from backend.ai.contracts import AITask, FilePart, ProviderRequest, ProviderResponse, TextPart
+from backend.ai.documents import visible_pages
 from backend.ai.errors import ProviderError
 from backend.ai.prompts import (
     GRADING_PROMPT_VERSION,
@@ -230,18 +231,32 @@ async def recognise_marking_scheme_images(
 # document extraction
 # ---------------------------------------------------------------------------
 
+# Both document tasks read an UPLOADED file, and both used to pass that file
+# straight through. A PDF then reached the provider as a PDF, and a PDF shows
+# less than it contains: a paper cut down to five questions still carried the
+# text of the two that had been made invisible, so seven questions were
+# extracted from a five-question paper. `visible_pages` renders the document
+# and the task sees the pages instead. See backend/ai/documents.py.
+
+
 async def extract_question_labels(
     document_path: str, *, exam_id: Optional[int] = None
 ) -> str:
-    """Read the question-label hierarchy out of a question paper."""
+    """Read the question-label hierarchy out of a question paper.
+
+    Reads the paper's VISIBLE pages, which is the paper the person who uploaded
+    it approved. Anything the document carries but does not show is not a
+    question and must not become one.
+    """
     prompt, version = build_label_extraction_prompt()
-    request = ProviderRequest.simple(
-        task=AITask.LABEL_EXTRACTION,
-        prompt=prompt,
-        file_paths=(document_path,),
-        prompt_version=version,
-    )
-    response = await run_task(request, exam_id=exam_id)
+    async with visible_pages(document_path) as page_paths:
+        request = ProviderRequest.simple(
+            task=AITask.LABEL_EXTRACTION,
+            prompt=prompt,
+            file_paths=tuple(page_paths),
+            prompt_version=version,
+        )
+        response = await run_task(request, exam_id=exam_id)
     return response.text
 
 
@@ -251,13 +266,18 @@ async def extract_document_text(
     leaf_labels: Sequence[str] = (),
     exam_id: Optional[int] = None,
 ) -> str:
-    """Read a marking scheme / solution script, guided by known labels."""
+    """Read a marking scheme / solution script, guided by known labels.
+
+    Same rule as the question paper, and for the same reason: hidden text in a
+    marking scheme would reach `ideal_marking_scheme` and be graded against.
+    """
     prompt, version = build_document_extraction_prompt(leaf_labels)
-    request = ProviderRequest.simple(
-        task=AITask.DOCUMENT_EXTRACTION,
-        prompt=prompt,
-        file_paths=(document_path,),
-        prompt_version=version,
-    )
-    response = await run_task(request, exam_id=exam_id)
+    async with visible_pages(document_path) as page_paths:
+        request = ProviderRequest.simple(
+            task=AITask.DOCUMENT_EXTRACTION,
+            prompt=prompt,
+            file_paths=tuple(page_paths),
+            prompt_version=version,
+        )
+        response = await run_task(request, exam_id=exam_id)
     return response.text

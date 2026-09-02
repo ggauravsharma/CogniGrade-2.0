@@ -1539,6 +1539,122 @@ frontend/login.htm       the three sentences, rendered as text
 
 ---
 
+### Visible-document ingestion & question replacement — DONE
+
+A five-question test paper (31, 32, 36, 37, 39) produced **seven** questions on
+`exam.htm`: 33 and 38 appeared as well. Two independent faults, found together.
+Only the first caused the incident.
+
+**1. The AI was reading a document nobody could see.**
+
+The paper had been cut down from a full one, and the cut questions were made
+invisible rather than deleted. Measured on the actual file:
+
+```
+MediaBox = CropBox = TrimBox = (0,0,595,842) on all 4 pages   -- there is no crop
+"33." character box  L=28.2 R=35.1 B=187.5 T=197.5            -- INSIDE the page
+rendered band 184-200pt   min=255  mean=255.0  non-white px=0  ("32." band: 7857)
+native text layer         [31, 32, 33, 36, 37, 38, 39]        -- full text of both
+```
+
+Ingestion sent the uploaded FILE. `extract_question_labels` passed
+`document_path` into `ProviderRequest.simple(file_paths=...)`, and
+`GeminiProvider._inline` reads raw bytes with `mimetypes.guess_type()` -- so the
+provider received `mime_type application/pdf`, all 489563 bytes, and read the
+document's text layer. There was no rasterisation anywhere in ingestion;
+`pypdfium2` was used only by `backend/regions/cropping.py` in the grading path.
+
+The database set matched the TEXT LAYER exactly, not the rendered pages. That is
+the whole finding: not a crop bug, not a hallucination, not stale rows.
+
+**Fix: the task is given the pages, not the file.** New
+`backend/ai/documents.py` renders a document to one image per visible page --
+same library and same scale (2.0) as the region path, deliberately not a second
+constant -- and `services.py` wraps both document-reading tasks in it. Rendering
+collapses everything a page does not show (invisible text, white-on-white,
+covered objects, content outside a crop) into the one representation the
+uploader approved. Applied to the marking scheme too: hidden text there would
+reach `ideal_marking_scheme` and be graded against.
+
+Deliberately NOT a native text-extraction-and-filter step: reading the PDF's own
+text and deciding what is visible would be a second document-understanding
+engine, in the layer that exists so there is only one. **Provider-neutral by
+construction** -- it hands back local file paths, which is what `FilePart` has
+always carried. No route, schema, prompt, persisted format or provider contract
+changed. A document that cannot be rendered raises a NAMED error; there is no
+fallback to sending the file, because that fallback would silently restore the
+bug on the paper least likely to be checked by hand. Cost: ~193 KB/page, so a
+40-page paper is ~7.6 MB against the existing 15 MB inline ceiling, and
+`MAX_RENDERED_PAGES = 60` refuses anything longer by name rather than
+truncating.
+
+**2. Reprocessing appended. It never replaced.**
+
+Not the cause here -- all seven rows were ids 60-66, written 45 ms apart by one
+run, against an exam whose questions had never existed before -- but it would
+have been the cause of the next one. `/extract-question-labels` did `db.add` +
+`commit` + `refresh` per row with no delete, no upsert, and there is no unique
+constraint on `(exam_id, question_number)` in the live schema. The only removal
+lived in the browser, behind a filename-and-size comparison, in a separate
+request: a re-upload matching on name and size skipped extraction entirely, and
+two files in one upload appended to each other.
+
+Now a transactional replace. Every uploaded file is parsed first, into one
+accumulated structure; then, in ONE transaction, the exam's questions are
+deleted and the new set inserted. A failed extraction writes nothing, so the old
+structure and the new one are never both absent. Idempotent: the same paper
+twice gives the same rows. The parse moved to `_parse_question_labels`, so it
+can be tested without a provider, a database or an upload.
+
+**Refused, not destructive, once a student has responses.**
+`question_responses.question_id` cascades on delete, so rebuilding the structure
+of an exam that already has responses would take the responses, their recognised
+text and their marks with it. That is not a re-upload's decision: the route
+answers **409** and changes nothing.
+
+**Also fixed:** `DELETE /exams/{exam_id}/questions` took
+`get_current_user_required` alone, so ANY signed-in account could erase any
+exam's question structure -- and cascade the students' answers and marks away
+with it. Now `require_exam_manager`, like every other manager-only exam route.
+
+**Frontend.** The client-side delete is gone: the server replaces in one
+transaction, so deleting first from the browser only opened a window where a
+failed extraction left the exam with no questions. The "files unchanged, skip"
+heuristic is a quota guard, not a correctness rule, and as a silent skip it made
+a bad extraction unfixable without renaming the paper -- it now offers a
+re-process instead of refusing one. A 409 arrives as `detail` and is shown;
+it used to read "Error: undefined".
+
+```
+backend/ai/documents.py       NEW  render a document to its visible pages
+backend/ai/services.py             both document tasks read pages, not the file
+backend/routers/geminiAPI.py       transactional replace, parser extracted
+backend/routers/exams.py           the destructive delete is manager-only
+frontend/exam.htm                  no client delete, re-process offered, 409 shown
+```
+
+- 762 tests (740 + 22). The fixture is a PDF built byte by byte with a real xref
+  and one line drawn in `3 Tr` (invisible) mode, asserted to reproduce the real
+  paper before anything else is claimed: CropBox equal to MediaBox, the hidden
+  text in the layer, zero ink in its band. Then both document tasks receiving
+  `.png` with PNG magic and never the PDF; page images deleted even when the
+  call raises; `31,32,33 -> 31,32` leaving `31,32`; stale subparts and marks
+  replaced; idempotence; 409 with the mark surviving; a failed run writing
+  nothing; manager-only; an AST guard that only two `Question(...)` constructors
+  exist. **No network, no key, no quota.**
+- Live on exam 4: `before 31 32 33 36 37 38 39` -> `after 31 32 36 37 39`, rows
+  67-71 written in one batch with 60-66 gone, the UI showing neither 33 nor 38,
+  the log line reading `document normalised to 4 visible page image(s)` -- a
+  count, no path and no content -- and no temporary page directory left behind.
+
+**Watch:** question 36's label depth differed between the two runs
+(`36.a.ii.I` / `36.a.ii.II` appeared in the first and not the second). That is
+model variance in how deep it reads the hierarchy, not the fix, but marks are
+attached at the top level and parts drive the crop workflow, so a paper's
+subparts are worth one look before grading.
+
+---
+
 ## Authorization model
 
 Two capability ladders, both derived from the real domain model. `is_professor`

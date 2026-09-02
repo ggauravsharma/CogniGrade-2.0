@@ -10,6 +10,7 @@ import aiofiles  # Added for async file operations
 
 from fastapi import APIRouter, File, UploadFile, Depends, HTTPException, Form
 from fastapi.responses import JSONResponse
+from sqlalchemy import delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
@@ -191,6 +192,71 @@ async def upload_and_extract(
     
     return JSONResponse({"results": results})
 
+def _parse_question_labels(text: str):
+    """Model output -> `(question_number, ordered part labels, max marks)` rows.
+
+    Lifted out of the route body unchanged in behaviour so that the parse can
+    be tested without a provider, a database or an upload. The shape it reads
+    is the one `build_label_extraction_prompt` asks for::
+
+        31 - Max Marks - 3
+        31.a
+        31.a.i
+    """
+    raw_labels = []
+    marks_dict = {}
+
+    for ln in [line.strip() for line in text.splitlines() if line.strip()]:
+        if "Max Marks - " in ln:
+            label_part, marks_part = ln.split("Max Marks -", 1)
+            label = label_part.strip().rstrip("-").strip()
+            try:
+                marks = int(marks_part.strip())
+            except ValueError:
+                marks = 0
+            # only store marks for truly top-level (no dot in label)
+            if "." not in label:
+                marks_dict[label] = marks
+            raw_labels.append(label)
+        else:
+            raw_labels.append(ln)
+
+    full_labels = set()
+    top_questions = set()
+
+    for lbl in raw_labels:
+        parts = lbl.split(".")
+        if parts and len(parts[0]) < 3:
+            top_questions.add(parts[0])
+            for i in range(1, len(parts)):
+                full_labels.add(".".join(parts[: i + 1]))
+
+    def sort_key(s):
+        return [int(p) if p.isdigit() else p for p in s.split(".")]
+
+    ordered = sorted(full_labels, key=sort_key)
+    for qnum in sorted(top_questions, key=lambda x: int(x)):
+        q_labels = [lbl for lbl in ordered if lbl.split(".")[0] == qnum]
+        yield int(qnum), q_labels, marks_dict.get(qnum, 0)
+
+
+async def _exam_has_student_work(exam_id: int, db: AsyncSession) -> bool:
+    """Whether replacing this exam's questions would take student work with it.
+
+    `question_responses.question_id` cascades on delete, so rebuilding the
+    structure of an exam that already has responses would delete the responses,
+    their recognised answer text and their marks. That is not a re-upload's
+    decision to make, so the route refuses instead.
+    """
+    count = await db.scalar(
+        select(func.count())
+        .select_from(QuestionResponse)
+        .join(Question, QuestionResponse.question_id == Question.id)
+        .where(Question.exam_id == exam_id)
+    )
+    return bool(count)
+
+
 @router.post("/extract-question-labels")
 async def extract_question_labels(
     files: List[UploadFile] = File(...),
@@ -200,12 +266,38 @@ async def extract_question_labels(
 ):
     """
     Extract hierarchical question labels from uploaded question papers,
-    build full prefix hierarchy, and insert into Questions.part_labels.
+    build full prefix hierarchy, and REPLACE the exam's question structure.
+
+    Replace, not append. This route used to `db.add` + `commit` one row at a
+    time with no delete, so re-processing a corrected paper left every question
+    the old paper had. The only removal lived in the browser, behind a
+    filename-and-size comparison, in a separate request -- so a paper whose
+    questions had been cut down kept the ones that were cut, and a re-upload
+    that happened to match on name and size skipped extraction entirely. Both
+    files of a two-file upload appended to each other for the same reason.
+
+    Refused rather than destructive once a student has responses: dropping the
+    questions would cascade those away, and marks are not something a
+    re-upload gets to discard. See `_exam_has_student_work`.
     """
-    results = []
     # AUTHORIZATION: exam_id is a form field; label extraction rewrites the
     # exam's question structure and is manager-only.
     await assert_exam_manager(exam_id, current_user, db)
+
+    if await _exam_has_student_work(exam_id, db):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This exam already has student responses, so its question "
+                "structure can no longer be replaced automatically."
+            ),
+        )
+
+    # question_number -> (ordered part labels, max marks). Accumulated across
+    # EVERY uploaded file before anything is written, so the replacement is one
+    # decision about the whole upload rather than one per file.
+    extracted: dict[int, tuple[list[str], int]] = {}
+
     for file in files:
         fid = str(uuid.uuid4())
         file_path = os.path.join(UPLOAD_DIRECTORY, f"{fid}_{file.filename}")
@@ -213,70 +305,47 @@ async def extract_question_labels(
             content = await file.read()
             await f.write(content)
 
-
         text = (await ai_services.extract_question_labels(file_path, exam_id=exam_id)).strip()
 
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        raw_labels = []
-        marks_dict = {}
+        for qnum, labels, marks in _parse_question_labels(text):
+            if qnum in extracted:
+                # Deterministic and idempotent: the first file to define a
+                # question number defines it. A later file cannot silently
+                # rewrite marks a earlier page already established.
+                logger.warning(
+                    "question %s appears in more than one uploaded file; keeping the first",
+                    qnum,
+                )
+                continue
+            extracted[qnum] = (labels, marks)
 
-        for ln in lines:
-            if "Max Marks - " in ln:
-                label_part, marks_part = ln.split("Max Marks -", 1)
-                label = label_part.strip().rstrip("-").strip()
-                try:
-                    marks = int(marks_part.strip())
-                except ValueError:
-                    marks = 0
-                # only store marks for truly top-level (no dot in label)
-                if "." not in label:
-                    marks_dict[label] = marks
-                raw_labels.append(label)
-            else:
-                raw_labels.append(ln)
+    # ONE transaction: the old structure and the new one are never both absent
+    # and never both present. A failure anywhere above this line has written
+    # nothing at all.
+    await db.execute(delete(Question).where(Question.exam_id == exam_id))
+    rows = [
+        Question(
+            exam_id=exam_id,
+            question_number=qnum,
+            text="",
+            ideal_answer=None,
+            ideal_marking_scheme=None,
+            max_marks=marks,
+            part_labels=json.dumps(labels),
+        )
+        for qnum, (labels, marks) in sorted(extracted.items())
+    ]
+    db.add_all(rows)
+    await db.commit()
 
-        full_labels = set()
-        top_questions = set()
-
-        for lbl in raw_labels:
-            parts = lbl.split(".")
-            if parts and len(parts[0]) < 3:
-                top_questions.add(parts[0])
-                for i in range(1, len(parts)):
-                    prefix = ".".join(parts[: i + 1])
-                    full_labels.add(prefix)
-
-        def sort_key(s):
-            return [int(p) if p.isdigit() else p for p in s.split(".")]
-
-        ordered = sorted(full_labels, key=sort_key)
-        top_questions = sorted(top_questions, key=lambda x: int(x))
-
-        for qnum in top_questions:
-            q_labels = [lbl for lbl in ordered if lbl.split(".")[0] == qnum]
-            part_labels_json = json.dumps(q_labels)
-            max_marks = marks_dict.get(qnum, 0)
-
-            q = Question(
-                exam_id=exam_id,
-                question_number=int(qnum),
-                text="",
-                ideal_answer=None,
-                ideal_marking_scheme=None,
-                max_marks=max_marks,
-                part_labels=part_labels_json,
-            )
-            db.add(q)
-            await db.commit()
-            await db.refresh(q)
-
-            results.append({
-                "question_number": q.question_number,
-                "max_marks": q.max_marks,
-                "part_labels": q.part_labels
-            })
-
-    return {"results": results}
+    return {"results": [
+        {
+            "question_number": row.question_number,
+            "max_marks": row.max_marks,
+            "part_labels": row.part_labels,
+        }
+        for row in rows
+    ]}
 
 # @router.post("/extract-question-labels")
 # async def extract_question_labels(
