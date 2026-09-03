@@ -229,9 +229,38 @@ function displayAnnouncements() {
     });
 }
 
-// Handle clicking on exam announcements
-function openExam(examId) {
-    window.location.href = `exam.htm?exam_id=${examId}`;
+// Handle clicking on exam announcements.
+//
+// `exam.htm` is the PROFESSOR's exam workspace: a stage-driven state machine
+// that, depending on the exam's stage, swaps in the manual crop editor or
+// redirects to the manager-only stats page. Sending every role there is what
+// produced the student's "page appears, then jumps somewhere else, then says
+// you are not allowed to view this document type" journey -- the crop editor
+// asks for the marking scheme when the exam sits at stage 3.
+//
+// Students go to their own page instead. `canManageThisClass` is published by
+// courses.htm from the classroom membership it has ALREADY fetched, so this
+// costs no extra request; when it is unset (this script rendered somewhere
+// that did not publish it) the student page is the safe default, because it
+// shows a manager nothing they are not entitled to.
+async function openExam(examId) {
+    let canManage = window.canManageThisClass;
+    if (typeof canManage !== "boolean") {
+        // Never guess. Guessing "manager" drops a student into the professor's
+        // workspace; guessing "student" drops a professor out of theirs. On the
+        // rare load order where the flag is not set yet, ask once.
+        try {
+            const res = await authFetch(`/classes/${classId}`);
+            const data = await res.json();
+            canManage = Boolean(
+                (data.user && data.user.is_professor) || data.user_role === "ta"
+            );
+        } catch (err) {
+            canManage = false;   // least privilege if even that fails
+        }
+    }
+    const target = canManage ? "exam.htm" : "student-edit.htm";
+    window.location.href = `${target}?exam_id=${examId}`;
 }
 
 // Handle clicking on assignment announcements

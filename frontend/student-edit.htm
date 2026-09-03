@@ -8,7 +8,8 @@
   <link rel="stylesheet" href="professor-styles.css">
   <link rel="stylesheet" href="crop-edit.css">
   <style>
-     #earlyAccessMsg, #gradingIncompleteMsg, #awaitingGradingMsg, #prepareScriptMsg{
+     #earlyAccessMsg, #gradingIncompleteMsg, #awaitingGradingMsg, #prepareScriptMsg,
+     #gradingProgressMsg, #finalizingMsg, #resultReadyMsg{
       display:none;
       flex-direction: column;
       height:100%;
@@ -19,10 +20,12 @@
       font-family: 'Poppins', sans-serif;
     }
     #earlyAccessMsg h2, #gradingIncompleteMsg h2,
-    #awaitingGradingMsg h2, #prepareScriptMsg h2{
+    #awaitingGradingMsg h2, #prepareScriptMsg h2,
+    #gradingProgressMsg h2, #finalizingMsg h2, #resultReadyMsg h2{
       margin-bottom: 5;
     }
-    #awaitingGradingMsg p, #prepareScriptMsg p{
+    #awaitingGradingMsg p, #prepareScriptMsg p,
+    #gradingProgressMsg p, #finalizingMsg p, #resultReadyMsg p{
       max-width: 560px;
       margin-left: auto;
       margin-right: auto;
@@ -42,6 +45,18 @@
     #beginPrepareBtn:hover{
       background: #1666d0;
     }
+  </style>
+  <style>
+    /* Minimal, matching the existing section cards. No redesign. */
+    .progress-track {
+      width: 100%; max-width: 420px; height: 10px; margin: 14px auto 6px;
+      background: #e5e7eb; border-radius: 999px; overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%; background: #7c3aed; border-radius: 999px;
+      transition: width .4s ease;
+    }
+    .progress-percent { font-weight: 600; }
   </style>
 </head>
 <body>
@@ -75,6 +90,30 @@
            automatically &mdash; your instructor starts that run.</p>
         <div style="margin-top:18px;">
           <button id="beginPrepareBtn" class="btn-submit">Submit my answer script</button>
+        </div>
+      </section>
+      <!-- Real progress, read from persisted grading state. There is no timer
+           and no estimate here: the numbers come from
+           GET /exams/{id}/my-grading-status, which counts responses carrying a
+           validated mark. Individual scores are deliberately NOT shown while a
+           run is moving -- a partial mark is not a result. -->
+      <section id="gradingProgressMsg">
+        <h2>AI Grading in Progress</h2>
+        <p id="gradingProgressText">Your answer script is being graded.</p>
+        <div class="progress-track" aria-hidden="true">
+          <div id="gradingProgressBar" class="progress-fill" style="width:0%"></div>
+        </div>
+        <p id="gradingProgressPercent" class="progress-percent">0%</p>
+      </section>
+      <section id="finalizingMsg">
+        <h2>Finalising Your Result</h2>
+        <p>All your answers have been graded. Your result is being finalised.</p>
+      </section>
+      <section id="resultReadyMsg">
+        <h2>Grading Complete</h2>
+        <p>Your result is ready.</p>
+        <div style="margin-top:18px;">
+          <button id="viewResultBtn" class="btn-submit">View Result</button>
         </div>
       </section>
       <div class="container" id="container"> 
@@ -142,60 +181,132 @@
       const urlParams = new URLSearchParams(window.location.search);
       return urlParams.get(param);
     }
-    document.addEventListener("DOMContentLoaded", async function() {
-      const examId = getQueryParam('exam_id');
-      await fetchExamStage();
-      console.log("Current Exam Stage:", currentStage);
-      if(currentStage < 6){
-        console.log("HEY");
-        document.getElementById("earlyAccessMsg").style.display = "flex";
-        document.getElementById("container").style.display = "none";
+    // -----------------------------------------------------------------
+    // The student's whole job on this page is: wait, watch, then read the
+    // result. Everything shown here comes from
+    // GET /exams/{id}/my-grading-status, which returns counts and a phase and
+    // nothing else -- no individual mark, no reasoning, no failure code.
+    //
+    // The manual crop editor below is NOT part of this path any more. Automatic
+    // preparation maps the whole answer script into question responses inside
+    // the grading run, so cutting the sheet up by hand is not something a
+    // student has to do to be graded. Its markup and `crop-edit.js` are left in
+    // place as a correction surface; nothing on the normal path opens them.
+    // -----------------------------------------------------------------
+
+    const SECTIONS = [
+      "earlyAccessMsg", "prepareScriptMsg", "awaitingGradingMsg",
+      "gradingProgressMsg", "finalizingMsg", "resultReadyMsg",
+      "gradingIncompleteMsg", "container",
+    ];
+
+    function showOnly(id) {
+      SECTIONS.forEach(function (name) {
+        const el = document.getElementById(name);
+        if (el) el.style.display = (name === id) ? "flex" : "none";
+      });
+    }
+
+    // 4 seconds: fast enough that a run finishing feels live, slow enough that
+    // a page left open overnight is not a load problem. One request is in
+    // flight at a time -- the next is scheduled only after the previous
+    // settles, so a slow response can never stack them up.
+    const POLL_MS = 4000;
+    let pollTimer = null;
+    let stopped = false;
+
+    function stopPolling() {
+      stopped = true;
+      if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+    }
+
+    window.addEventListener("beforeunload", stopPolling);
+
+    function renderPhase(examId, data) {
+      const total = data.total_questions || 0;
+      const graded = data.graded_questions || 0;
+      const percent = data.progress_percent || 0;
+
+      switch (data.phase) {
+        case "not_submitted":
+          showOnly("earlyAccessMsg");
+          return false;
+
+        case "waiting_for_grading":
+          // Covers both "the instructor has not started yet" and "preparation
+          // is running". Nothing persisted separates those two, so this says
+          // the one thing that is true of both rather than guessing.
+          showOnly("awaitingGradingMsg");
+          return true;
+
+        case "grading":
+          showOnly("gradingProgressMsg");
+          document.getElementById("gradingProgressText").textContent =
+            graded + " of " + total + " questions completed";
+          document.getElementById("gradingProgressBar").style.width = percent + "%";
+          document.getElementById("gradingProgressPercent").textContent = percent + "%";
+          return true;
+
+        case "finalizing":
+          showOnly("finalizingMsg");
+          return true;
+
+        case "complete":
+          showOnly("resultReadyMsg");
+          document.getElementById("viewResultBtn").onclick = function () {
+            window.location.href = "scriptPage.htm?exam_id=" + examId;
+          };
+          return false;   // terminal
+
+        case "needs_attention":
+          // One consistent sentence. The reason a question failed -- timeout,
+          // unparseable response, anything else -- is the instructor's to see,
+          // never the student's.
+          showOnly("gradingIncompleteMsg");
+          return false;   // terminal until the instructor acts
+
+        default:
+          showOnly("awaitingGradingMsg");
+          return true;
       }
-      else
-      {
-        const res = await authFetch(`/exams/${examId}/submission_status`);
-        if (!res.ok) {
-          alert("Could not fetch status", await res.text());
-          return;
-        }
-        const { status, prepared } = await res.json();
-        console.log("Submission Status:", status);
-        document.getElementById("earlyAccessMsg").style.display = "none";
-        document.getElementById("gradingIncompleteMsg").style.display = "none";
-        if(status == "pending"){
-          // `pending` covers two very different situations now that grading is
-          // started by the instructor rather than by this page: a script nobody
-          // has submitted yet, and one that is submitted and waiting to be
-          // graded. `prepared` separates them, so a student who has already
-          // done their part is shown a waiting state instead of being sent
-          // back into the preparation workspace.
-          if (prepared) {
-            document.getElementById("container").style.display = "none";
-            document.getElementById("awaitingGradingMsg").style.display = "flex";
-            return;
-          }
-          document.getElementById("container").style.display = "none";
-          document.getElementById("prepareScriptMsg").style.display = "flex";
-          document.getElementById("beginPrepareBtn").addEventListener("click", async () => {
-            document.getElementById("prepareScriptMsg").style.display = "none";
-            document.getElementById("container").style.display = "flex";
-            await initialise_crop_edit(examId);
-          }, { once: true });
-        }else if(status == "graded"){
-          window.location.href = `scriptPage.htm?exam_id=${examId}`;
-        }else if(status == "grading_incomplete"){
-          // Grading ran but at least one question produced no valid mark, so
-          // the recorded total is NOT the student's result. Deliberately does
-          // not open the script page (that presents a final grade) and does not
-          // re-enter the crop flow (the sheet is already submitted).
-          document.getElementById("container").style.display = "none";
-          document.getElementById("gradingIncompleteMsg").style.display = "flex";
-          return;
-        }else{
-          alert("Invalid submission status");
-          return;
-        }
+    }
+
+    async function pollStatus(examId) {
+      if (stopped) return;
+      let res;
+      try {
+        res = await authFetch("/exams/" + examId + "/my-grading-status");
+      } catch (err) {
+        // A transient network blip must not end the watch or shout at the
+        // student; the next tick simply tries again.
+        pollTimer = setTimeout(function () { pollStatus(examId); }, POLL_MS);
+        return;
       }
+
+      if (res.status === 403 || res.status === 404) {
+        // Not this student's exam, or it is gone. Stop rather than hammer it.
+        stopPolling();
+        showOnly("earlyAccessMsg");
+        return;
+      }
+      if (!res.ok) {
+        pollTimer = setTimeout(function () { pollStatus(examId); }, POLL_MS);
+        return;
+      }
+
+      const data = await res.json();
+      const keepPolling = renderPhase(examId, data);
+      if (keepPolling && !stopped) {
+        pollTimer = setTimeout(function () { pollStatus(examId); }, POLL_MS);
+      } else {
+        stopPolling();
+      }
+    }
+
+    document.addEventListener("DOMContentLoaded", function () {
+      const examId = getQueryParam("exam_id");
+      showOnly(null);          // nothing until the first real answer arrives
+      pollStatus(examId);
     });
   </script>
   <script src = "crop-edit.js"></script>

@@ -23,8 +23,10 @@ from backend.auth.policies import (
     assert_submission_access,
     require_announcement_in_classroom,
     require_classroom_manager,
+    require_classroom_owner,
     require_classroom_participant,
 )
+from backend.classrooms.deletion import delete_classroom
 from backend.models.tables import Exam, ExamResult, Query  # Added ExamResult for classwork endpoint
 from backend.grading.aggregation import ExamResultStatus
 
@@ -977,6 +979,52 @@ async def update_announcement(
     except Exception as e:
         logger.error(f"Error updating announcement: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while updating the announcement")
+
+@router.delete("/classes/{class_id}")
+async def delete_class(
+    class_id: int,
+    db: AsyncSession = Depends(get_db),
+    ctx: ClassroomContext = Depends(require_classroom_owner),
+    current_user: User = Depends(get_current_user_required),
+):
+    """Permanently delete one course: its rows, and the files only it owned.
+
+    OWNER ONLY, deliberately narrower than the rest of this router. A TA or a
+    co-teaching professor is a classroom MANAGER and can run the course; nobody
+    but the owner can destroy it. `require_classroom_owner` also answers 404 for
+    a classroom that does not exist and 403 for one the caller cannot touch, so
+    a stranger cannot use this route to discover which class ids are real.
+
+    Repeating the call is safe: the row is gone, so the SECOND request gets a
+    404 from the same dependency rather than doing anything.
+
+    The cascade and the file cleanup live in `backend/classrooms/deletion.py`;
+    this route only authorises, loads and reports.
+    """
+    result = await db.execute(select(Classroom).where(Classroom.id == class_id))
+    classroom = result.scalars().first()
+    if not classroom:
+        raise HTTPException(status_code=404, detail="Class not found")
+
+    try:
+        outcome = await delete_classroom(classroom, db)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting classroom {class_id}: {str(e)}", exc_info=True)
+        # The row is untouched -- the deletion rolled back. The caller gets one
+        # safe sentence; the detail stays in the log.
+        raise HTTPException(
+            status_code=500, detail="The course could not be deleted. Nothing was removed."
+        )
+
+    logger.info(
+        "classroom deleted: classroom_id=%s files_removed=%s files_skipped=%s",
+        outcome.classroom_id, outcome.files_deleted, outcome.files_skipped,
+    )
+    # Counts stay in the log. The client is told it worked, nothing more.
+    return {"success": True, "message": "Course deleted permanently"}
+
 
 @router.get("/classes/{class_id}")
 async def view_class(class_id: int, db: AsyncSession = Depends(get_db), ctx: ClassroomContext = Depends(require_classroom_participant), current_user: User = Depends(get_current_user_required)):

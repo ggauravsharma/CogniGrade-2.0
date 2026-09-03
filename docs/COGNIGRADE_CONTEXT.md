@@ -2337,6 +2337,204 @@ cleared error codes are untouched. The result and the stage finally agree.
 
 ---
 
+### Course deletion — one call, the database's own cascade, and no user touched
+
+**`DELETE /classes/{class_id}`** (`backend/routers/classes.py`), **owner only**.
+One logical operation: the frontend never runs a sequence of deletes, because a
+sequence can stop halfway and a half-deleted course still answers queries while
+its classroom row is gone.
+
+**The database does the deleting, and that was verified rather than assumed.**
+The live PostgreSQL catalog was queried for the real `delete_rule` on every
+foreign key reaching a classroom-owned table; all of them are already `CASCADE`:
+
+```
+classrooms -> announcements, assignments, enrollments, exams, materials,
+              notifications, queries
+assignments -> submissions, materials, notifications, queries
+exams       -> answer_scripts, document_regions, exam_results, materials,
+               notifications, queries, questions
+questions   -> question_responses      (document_regions.question_id is SET NULL,
+answer_scripts / materials -> document_regions   but those rows go via exam_id)
+```
+
+`Classroom`'s relationships are all `passive_deletes=True`, so the ORM does not
+load children into Python -- `db.delete(classroom)` issues one
+`DELETE FROM classrooms` and the database cascades inside one transaction.
+SQLite honours it too (`database.py` sets `PRAGMA foreign_keys`). **No migration
+was needed and none was added.**
+
+**Users are never course-owned.** Every foreign key involving a person points
+FROM a classroom-owned row TO `users.id`, never the reverse, so deleting a
+course cannot reach an account. The owning professor and every enrolled student
+survive, along with all their data in other classrooms.
+
+**Files** (`backend/classrooms/deletion.py`). Paths are collected BEFORE the
+delete -- afterwards nothing is left to read them from -- by walking the same
+foreign keys the cascade walks: `materials.file_path`, `answer_scripts.file_path`,
+`submissions.file_path`, and the JSON image lists in `questions.ms_*_images` and
+`question_responses.ans_*_images`. Nothing is derived from a request value or a
+filename pattern. Removal happens only AFTER the commit succeeds, and each path
+is re-resolved against the upload root, so a stored value that escapes it is
+skipped rather than followed. Cleanup failure is counted and logged **without
+the path** (a filename can name a student) and never turns a completed deletion
+into an error.
+
+`UPLOAD_ROOT` now lives once, in **`backend/storage/paths.py`**;
+`backend/auth/files.py` imports it instead of defining its own. Two definitions
+of a security root drift apart, and deletion needs the same boundary serving
+does. Serving behaviour is unchanged.
+
+**Authorization is deliberately narrower than the rest of the router.**
+`require_classroom_owner`, not `require_classroom_manager`: a TA or co-teaching
+professor can run a course but must not be able to destroy it. A student gets
+403, an outsider 403/404, an anonymous caller 401, and a second delete gets 404
+from the same dependency -- no route can be used to probe which class ids exist.
+A failure returns one safe sentence ("Nothing was removed"); the detail stays in
+the log.
+
+**Frontend:** a `Delete course` item in the existing course-card dropdown on
+`dashboard.htm`, using the project's existing `confirm()` pattern -- no modal
+system was added. It is on the two TEACHING cards only, never on a student's
+enrolled-course card. The warning names what goes (exams, questions, answer
+scripts, marks, results, assignments, announcements, uploaded files) and states
+that student accounts and their work in other courses are not affected. The
+course name is passed through `encodeURIComponent`, so no quote can break out of
+the attribute. Backend text is never rendered: the handler picks its own
+sentence per status.
+
+- **944 tests (923 + 21), all passing.** `test_classroom_deletion.py` uses a
+  two-course world that SHARES its owner and student: the cascade empties every
+  owned table, both users survive, Course B's classroom/exam/question/response/
+  result/material survive and the shared student's marks in B are unchanged to
+  the value. Path safety is tested before anything may delete: a path outside
+  the root, a `../` traversal and an empty value are all refused, a missing file
+  never raises, and only the owned five files are unlinked. Authorization is
+  exercised through the real route (owner 200, student 403, other professor
+  403/404, anonymous 401, repeat 404), and a forced internal failure returns a
+  safe sentence with no traceback.
+
+**Live, on a disposable course** (created for this, deleted through the real
+API; exam 4's course was never touched, no provider call): seeded +1 classroom,
+exam, question, response, result, script, material, enrolment, then
+student `403` -> owner `200` -> repeat `404`. Every count returned to its
+pre-seed value, the synthetic owned file was removed, an unrelated file in the
+same upload root survived, users stayed at 2, and **exam 4 was byte-identical
+before and after** -- marks `[3,3,5,4,4]`, result `19.00 graded` with
+`graded_at` set.
+
+**Cross-course scoping was checked, and no bug was found.** Exam lists filter on
+`classroom_id`, question lists on `exam_id`, and the handlers that look a
+question up by id alone sit behind `require_question_in_exam`, which already
+refuses a question that does not belong to the exam in the path. Nothing was
+changed there.
+
+---
+
+### Student exam flow — own page, real progress, no cropper
+
+**Routing.** `announcements.js:openExam()` sent EVERY role to `exam.htm`, the
+professor's stage-driven workspace. That single line produced the whole reported
+student journey: a page that appears for a second, an automatic jump, and
+`You are not allowed to view this document type.` -- the last of which is a
+CLIENT-side guard in `crop-edit.js`, fired because `exam.htm` at stage 3/4
+injects the crop editor and asks it for the marking scheme.
+
+`openExam` now branches on **classroom membership**, not the global
+`is_professor` flag: manager -> `exam.htm`, everyone else -> `student-edit.htm`.
+The flag (`window.canManageThisClass`) is published by `courses.htm` from the
+`/classes/{id}` response it ALREADY fetches, so the click costs no extra
+request. It is set in `loadClassInfo()` -- which runs on page load -- and not
+only in `loadClasswork()`, which runs only when the Classwork tab is opened and
+would have left the flag undefined at exactly the moment an announcement is
+clickable. If it is somehow still unset, `openExam` resolves membership once
+rather than guessing; guessing either way misroutes somebody.
+
+**The cropper is out of the normal student path.** `student-edit.htm` no longer
+calls `initialise_crop_edit` anywhere. `crop-edit.htm`/`crop-edit.js` and their
+markup are deliberately KEPT, loaded but never shown, as a future manual
+correction surface. Automatic preparation maps the whole script into question
+responses inside the grading run, so Box Cut / Freehand Cut / Question Responses
+are not something a student has to do to be graded.
+
+**Grading stays the instructor's to start, and it is enforced at the API.**
+`POST /exam/{exam_id}/enqueue-processing` is **exam-manager only**
+(`assert_exam_manager`), paired with `assert_student_enrolled_in_exam` so a
+manager may name a student of THIS exam's classroom and nobody else. It was
+`assert_self_or_exam_manager`, which also let a student start their own paper:
+the student UI never offered it, but a hidden button is not an authorization
+boundary and a hand-written POST was accepted. Being `is_professor` somewhere
+grants nothing here -- a professor who manages a different course is refused
+too. A student, an unrelated manager and an anonymous caller are all refused
+before readiness is even considered, so the refusal never reveals whether there
+is a paper to grade, and a refused call queues no task, spends no quota and
+changes no mark or exam stage.
+
+The only frontend caller is `exam.htm`'s per-student roster. The student page
+has exactly one network call -- the read-only status endpoint below -- and no
+way to start a provider call.
+
+**`GET /exams/{exam_id}/my-grading-status`** (`examStats.py`), participant-only
+and pinned to `current_user.id`: there is no student id to pass, so no way to
+ask about anyone else's paper. Returns `phase`, `total_questions`,
+`graded_questions`, `progress_percent`, `result_ready`, `message` -- and nothing
+else. No mark, no reasoning, no failure code, no provider text. A partial mark
+is not a result, and a student watching "Q1 0/3" appear would be reading an
+unaggregated grade as if it were their own.
+
+```
+not_submitted        no answer script and no responses
+waiting_for_grading  script uploaded, no responses yet
+grading              responses exist, not all carry a mark
+finalizing           every EXISTING response carries a mark, no final result yet
+complete             ExamResult status is final          -> result_ready = true
+needs_attention      ExamResult is grading_incomplete    -> "taking longer than expected"
+```
+
+**What counts as graded: `marks_obtained IS NOT NULL`, never truthiness.** A
+genuine **0.00 is a graded question** and counts; a failed question carries NULL
+and does not. Denominator is the exam's question count -- the number the student
+recognises, and it does not move while a run is in flight the way the response
+count does; the percentage is clamped, because an unattempted question gets no
+response row at all. `finalizing` is decided by aggregation's own rule (every
+response that exists is graded), not by reaching 100%.
+
+**Known limit, stated rather than faked.** Between "the script is uploaded" and
+"the first response row appears" nothing persisted separates *waiting for the
+instructor to press Start* from *preparation is running*: `enqueue_processing`
+hands work to Celery and records no job row. Both report
+`waiting_for_grading`. A job-tracking table would be a bigger change than the
+question deserves, and a timer would be a fabricated progress bar.
+
+**Frontend.** `student-edit.htm` polls the endpoint every 4s, one request in
+flight at a time (the next is scheduled only after the previous settles), and
+stops on `complete`, on `needs_attention`, on 403/404, and on page unload. A
+transient network error retries silently instead of alerting.
+`Submitted -> Waiting -> Grading X of Y (bar) -> Finalising -> Grading complete
++ View Result`.
+
+- **963 tests (944 + 19), all passing.** `test_student_grading_status.py` pins
+  every phase, 0/1/3-of-5 counts, a genuine zero and a fractional mark counting
+  as graded, a NULL not counting, another student's marks never appearing as
+  mine, a `student_id` query parameter not selecting anyone else, outsider 403
+  and anonymous 401, an exam with no questions not dividing by zero, the exact
+  response key set, and that no reasoning / answer text / `malformed_json` /
+  `timeout` string can appear in the body. One test asserts that polling creates
+  no rows -- reading progress must never start work.
+
+**Live** (exam 6, no provider call): walked all six phases with synthetic rows
+and restored them; student navigation lands on `student-edit.htm` with the
+cropper hidden and no popup; the 3-of-5 bar renders at 60%; `complete` shows
+`View Result` and stops polling.
+
+**Not implemented, deliberately:** student self-upload of an answer script. The
+professor uploads scripts today, and the existing `/exam/save-files` route
+carries no authorization beyond "logged in", so pointing a student page at it
+would make a pre-existing hole reachable. It needs its own decision and its own
+fix, not a frontend button.
+
+---
+
 ## Authorization model
 
 Two capability ladders, both derived from the real domain model. `is_professor`

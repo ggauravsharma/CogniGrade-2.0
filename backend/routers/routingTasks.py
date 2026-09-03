@@ -11,7 +11,7 @@ from backend.models.tables import Question, QuestionResponse
 from backend.models.users import User
 from backend.utils.security import get_current_user_required
 from backend.auth.policies import (
-    assert_self_or_exam_manager,
+    assert_exam_manager,
     assert_student_enrolled_in_exam,
 )
 from backend.tasks import process_and_grade_exam
@@ -36,9 +36,23 @@ async def enqueue_processing(
     responses. Grading was therefore a side effect of a student finishing the
     crop step, which is the opposite of how the product describes itself.
 
-    `student_id` is optional and is honoured only for exam managers, matching
-    the pattern already used by `/protected-files/exam/{id}/document/{type}`. A
-    student may still start their own run and may not name anyone else.
+    MANAGER ONLY, AND ENFORCED HERE
+    -------------------------------
+    Starting a run spends provider quota and rewrites a student's marks, so who
+    may start one is a product decision, not a UI detail. The professor decides;
+    a student submits, waits and watches.
+
+    This was `assert_self_or_exam_manager`, which also let a student start their
+    own paper. The student UI never offered it -- but a hidden button is not an
+    authorization boundary, and the endpoint answered a hand-written POST just
+    as happily. It is now `assert_exam_manager`: exam-SCOPED, so a professor who
+    manages a different course is refused here too, and being `is_professor`
+    somewhere grants nothing on this exam.
+
+    `student_id` names whose paper to grade. The manager may name any student of
+    THIS exam's classroom and nobody else -- `assert_student_enrolled_in_exam`
+    is the second half, exactly as `require_question_in_exam` pairs with its
+    own authorization.
 
     WHAT READINESS MEANS NOW
     ------------------------
@@ -61,16 +75,13 @@ async def enqueue_processing(
     -- and asking a student to cut their own script up first, which is what the
     old check effectively did, is not the AI-first flow this product describes.
     """
-    ctx = await assert_self_or_exam_manager(
-        exam_id, student_id if student_id is not None else current_user.id, current_user, db
-    )
+    await assert_exam_manager(exam_id, current_user, db)
 
-    if ctx.is_manager:
-        target_student_id = student_id if student_id is not None else current_user.id
-    else:
-        # A student may only ever run their own paper. Naming anyone else was
-        # already refused above; naming yourself explicitly is fine.
-        target_student_id = current_user.id
+    # A manager who names nobody falls through to their own id, which is not a
+    # student of this exam, so the enrolment check below refuses it. That is the
+    # same 403 as before and is deliberate: queueing a run against the caller is
+    # what made the original route wrong.
+    target_student_id = student_id if student_id is not None else current_user.id
 
     await assert_student_enrolled_in_exam(exam_id, target_student_id, current_user, db)
 

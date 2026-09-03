@@ -334,6 +334,16 @@
     .dropdown-item.archive {
       color: #ef4444;
     }
+
+    /* Permanent deletion. Weightier than archive on purpose. */
+    .dropdown-item.danger {
+      color: #b91c1c;
+      font-weight: 600;
+    }
+
+    .dropdown-item.danger:hover {
+      background: #fee2e2;
+    }
     
     /* Other Dashboard Styles (Header, Layout, Modal, etc.) */
     .header-row {
@@ -837,6 +847,43 @@
         alert("Class code copied!");
       }
     }
+    async function deleteCourse(event, classId, encodedName) {
+      // The card itself navigates on click; a menu action must not do both.
+      event.stopPropagation();
+      // Percent-encoded at render time, so no quote can break out of the
+      // attribute and there is nothing here to escape.
+      let courseName = "";
+      try { courseName = decodeURIComponent(encodedName || ""); } catch (e) { courseName = ""; }
+      const label = courseName ? `"${courseName}"` : "this course";
+      const warning =
+        `Permanently delete ${label}?\n\n` +
+        "This removes the course and everything in it — its exams, questions, " +
+        "student answer scripts, marks and results, assignments, announcements " +
+        "and uploaded course files.\n\n" +
+        "Enrolled students and their accounts are not deleted, and their work in " +
+        "your other courses is not affected.\n\n" +
+        "This cannot be undone.";
+      if (!confirm(warning)) return;
+
+      try {
+        const response = await authFetch(`/classes/${classId}`, { method: "DELETE" });
+        if (!response.ok) {
+          // Never render the backend body: show one sentence chosen here.
+          alert(
+            response.status === 403
+              ? "Only the course owner can delete this course."
+              : response.status === 404
+              ? "This course no longer exists."
+              : "The course could not be deleted. Please try again."
+          );
+          return;
+        }
+        loadDashboard();
+      } catch (error) {
+        alert("The course could not be deleted. Please check your connection and try again.");
+      }
+    }
+
     function enterClass(classId) {
       window.location.href = `/courses.htm?class_id=${classId}`;
     }
@@ -1012,6 +1059,10 @@
                       <div class="dropdown-item archive" onclick="/* Archive functionality */">
                         <span class="icon">🗄️</span>
                         <span>Archive Course</span>
+                      </div>
+                      <div class="dropdown-item danger" onclick="deleteCourse(event, ${course.id}, '${encodeURIComponent(course.name || '')}')">
+                        <span class="icon">🗑️</span>
+                        <span>Delete Course</span>
                       </div>
                     </div>
                   </div>
@@ -1189,6 +1240,10 @@
                       <div class="dropdown-item archive" onclick="/* Archive functionality */">
                         <span class="icon">🗄️</span>
                         <span>Archive Course</span>
+                      </div>
+                      <div class="dropdown-item danger" onclick="deleteCourse(event, ${course.id}, '${encodeURIComponent(course.name || '')}')">
+                        <span class="icon">🗑️</span>
+                        <span>Delete Course</span>
                       </div>
                     </div>
                   </div>

@@ -58,9 +58,11 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/protected-files", tags=["protected-files"])
 
-# Everything servable lives under here. Resolved once at import so that a later
-# chdir cannot move the goalposts.
-UPLOAD_ROOT = FsPath("./uploads").resolve()
+# Everything servable lives under here. Defined ONCE, in backend/storage/paths,
+# because deletion needs the same boundary and two definitions of a security
+# root drift apart. Re-exported so this module's existing references still read
+# the same way.
+from backend.storage.paths import UPLOAD_ROOT
 
 # Document types a student is allowed to fetch for an exam they are enrolled in.
 STUDENT_READABLE_DOC_TYPES = {"question_paper"}

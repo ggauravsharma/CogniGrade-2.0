@@ -902,3 +902,142 @@ async def get_student_submission_status(
         "is_final": status in ExamResultStatus.FINAL,
         "prepared": prepared,
     }
+
+
+# ---------------------------------------------------------------------------
+# 12. My grading status (student-facing progress)
+# ---------------------------------------------------------------------------
+
+#: What a student may be told, and nothing else. Every value is derived from
+#: persisted rows -- no timers, no estimates, no interpolation.
+class GradingPhase:
+    NOT_SUBMITTED = "not_submitted"
+    WAITING_FOR_GRADING = "waiting_for_grading"
+    GRADING = "grading"
+    FINALIZING = "finalizing"
+    COMPLETE = "complete"
+    NEEDS_ATTENTION = "needs_attention"
+
+
+#: One safe sentence per phase. Derived from the phase, never from a provider
+#: response, an exception, or a failure code -- the same rule `failure.describe`
+#: follows for the professor-facing side.
+_PHASE_MESSAGES = {
+    GradingPhase.NOT_SUBMITTED:
+        "Your answer script has not been uploaded yet.",
+    GradingPhase.WAITING_FOR_GRADING:
+        "Your answer script has been submitted. Your instructor will start AI grading.",
+    GradingPhase.GRADING: "AI grading is in progress.",
+    GradingPhase.FINALIZING: "Finalising your result.",
+    GradingPhase.COMPLETE: "Grading complete.",
+    GradingPhase.NEEDS_ATTENTION:
+        "Grading is taking longer than expected. Your instructor has been notified.",
+}
+
+
+@router.get("/exams/{exam_id}/my-grading-status")
+async def get_my_grading_status(
+    exam_id: int,
+    db: AsyncSession = Depends(get_db),
+    # Participant, like `submission_status` beside it. The row set below is
+    # pinned to `current_user.id`, so there is no id to pass and therefore no
+    # way to ask about somebody else's paper. A manager wanting the cohort view
+    # already has `/exams/{id}/stats`; this endpoint is deliberately not that.
+    ctx: ExamContext = Depends(require_exam_participant),
+    current_user: User = Depends(get_current_user_required),
+):
+    """How far this student's own paper has got, in counts only.
+
+    WHAT A STUDENT MAY SEE
+    ----------------------
+    A phase, how many questions carry a validated mark, and a percentage.
+    NOT: any individual score, any reasoning, any failure code, any provider
+    text. Partial marks are exactly the thing that must not leak while a run is
+    still moving -- a student watching "Q1 0/3" appear would be reading an
+    unfinished, unaggregated grade as if it were their result.
+
+    WHAT COUNTS AS GRADED
+    ---------------------
+    `marks_obtained IS NOT NULL`, and nothing else. A genuine **0.00 is a
+    grade** and counts; a response whose grading failed carries NULL and does
+    not. Truthiness would silently reclassify every real zero as ungraded,
+    which is the C6 confusion this codebase exists to keep out.
+
+    KNOWN LIMIT, STATED RATHER THAN FAKED
+    -------------------------------------
+    Between "the student's script is uploaded" and "the first QuestionResponse
+    row appears" there is nothing persisted that separates *waiting for the
+    instructor to press Start* from *automatic preparation is running right
+    now*: `enqueue_processing` hands work to Celery and records no job row.
+    Both therefore report `waiting_for_grading`. Inventing a job-tracking table
+    to split them would be a bigger change than the question deserves, and
+    guessing from elapsed time would be a fabricated progress bar.
+    """
+    total_questions = (await db.execute(
+        select(func.count()).select_from(Question).where(Question.exam_id == exam_id)
+    )).scalar_one()
+
+    # Only this caller's responses, joined through the exam's own questions so a
+    # response belonging to another exam can never be counted here.
+    marks = (await db.execute(
+        select(QuestionResponse.marks_obtained)
+        .join(Question, Question.id == QuestionResponse.question_id)
+        .where(
+            Question.exam_id == exam_id,
+            QuestionResponse.student_id == current_user.id,
+        )
+    )).scalars().all()
+    response_count = len(marks)
+    graded_questions = sum(1 for m in marks if m is not None)
+
+    script_exists = bool((await db.execute(
+        select(func.count()).select_from(AnswerScript).where(
+            AnswerScript.exam_id == exam_id,
+            AnswerScript.student_id == current_user.id,
+        )
+    )).scalar_one())
+
+    result_status = (await db.execute(
+        select(ExamResult.status).where(
+            ExamResult.exam_id == exam_id,
+            ExamResult.student_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+
+    # Ordered most-decided first. The persisted ExamResult wins when it exists,
+    # because aggregation has already applied the completeness rule; the row
+    # counts only decide the phases aggregation has not reached yet.
+    if result_status in ExamResultStatus.FINAL:
+        phase = GradingPhase.COMPLETE
+    elif result_status == ExamResultStatus.GRADING_INCOMPLETE:
+        # Aggregation RAN and found a response with no validated mark. That is
+        # a real, settled outcome, not a stage of progress.
+        phase = GradingPhase.NEEDS_ATTENTION
+    elif response_count and graded_questions == response_count:
+        # Every response that exists carries a mark -- aggregation's own rule --
+        # but no final result has been written yet.
+        phase = GradingPhase.FINALIZING
+    elif response_count:
+        phase = GradingPhase.GRADING
+    elif script_exists:
+        phase = GradingPhase.WAITING_FOR_GRADING
+    else:
+        phase = GradingPhase.NOT_SUBMITTED
+
+    # Denominator is the exam's question count: it is the number the student
+    # recognises, and it does not move while a run is in flight the way the
+    # response count does. Clamped because a paper can hold fewer responses
+    # than questions (an unattempted question gets no row at all).
+    if total_questions:
+        progress_percent = min(100, max(0, round(graded_questions * 100 / total_questions)))
+    else:
+        progress_percent = 0
+
+    return {
+        "phase": phase,
+        "total_questions": total_questions,
+        "graded_questions": graded_questions,
+        "progress_percent": progress_percent,
+        "result_ready": phase == GradingPhase.COMPLETE,
+        "message": _PHASE_MESSAGES[phase],
+    }

@@ -127,19 +127,25 @@ async def test_student_cannot_start_grading_for_another_student(client, world, e
     assert enqueued == []
 
 
-async def test_student_can_still_start_their_own_run(client, world, enqueued):
-    """The pre-existing self-service path stays valid."""
+async def test_a_student_cannot_start_their_own_run(client, world, enqueued):
+    """The product decision, enforced at the boundary rather than by the UI.
+
+    A student submits, waits and watches. Starting a run spends provider quota
+    and rewrites marks, so it is the instructor's action. This path USED to
+    return 200 -- the student page never offered it, but a hidden button is not
+    an authorization boundary and a hand-written POST was accepted.
+    """
     r = await client.post(_url(world["exam_a"].id), headers=as_user(world["student_a"]))
-    assert r.status_code == 200, r.text
-    assert enqueued == [(world["exam_a"].id, world["student_a"].id)]
+    assert r.status_code == 403
+    assert enqueued == [], "a refused call must queue nothing"
 
 
-async def test_student_may_name_themselves_explicitly(client, world, enqueued):
+async def test_a_student_naming_themselves_explicitly_is_still_refused(client, world, enqueued):
     r = await client.post(
         _url(world["exam_a"].id, world["student_a"].id), headers=as_user(world["student_a"])
     )
-    assert r.status_code == 200, r.text
-    assert enqueued == [(world["exam_a"].id, world["student_a"].id)]
+    assert r.status_code == 403
+    assert enqueued == []
 
 
 async def test_manager_cannot_target_a_user_who_is_not_a_student_here(client, world, enqueued):
@@ -238,12 +244,17 @@ async def test_an_uploaded_script_with_no_responses_is_accepted(client, db, worl
     assert enqueued == [(world["exam_a"].id, world["student_a"].id)]
 
 
-async def test_the_readiness_rule_applies_to_the_student_path_too(client, db, world, enqueued):
+async def test_a_student_is_refused_before_readiness_is_even_considered(client, db, world, enqueued):
+    """Authorization first: a student gets 403, never a 409 about their paper.
+
+    The refusal must not depend on -- or reveal -- whether there is anything to
+    grade, so emptying the student's rows changes nothing about the answer.
+    """
     await _clear_responses(db, world["exam_a"].id, world["student_a"].id)
     await _clear_scripts(db, world["exam_a"].id, world["student_a"].id)
 
     r = await client.post(_url(world["exam_a"].id), headers=as_user(world["student_a"]))
-    assert r.status_code == 409
+    assert r.status_code == 403
     assert enqueued == []
 
 
@@ -331,3 +342,78 @@ async def test_submission_status_prepared_is_per_student(client, db, world):
     )
     assert a.json()["prepared"] is False
     assert b.json()["prepared"] is True
+
+
+# ---------------------------------------------------------------------------
+# a refused trigger changes nothing at all
+# ---------------------------------------------------------------------------
+
+async def _grading_fingerprint(db, exam_id, student_id):
+    """Marks and failure codes for one student, in a stable order."""
+    found = await db.execute(
+        select(QuestionResponse)
+        .join(Question, Question.id == QuestionResponse.question_id)
+        .where(Question.exam_id == exam_id, QuestionResponse.student_id == student_id)
+        .order_by(QuestionResponse.id)
+    )
+    return [
+        (r.id, r.marks_obtained, r.grading_error_code)
+        for r in found.scalars().all()
+    ]
+
+
+async def test_a_refused_student_call_leaves_grading_state_untouched(
+    client, db, world, enqueued
+):
+    """403 means nothing happened: no job, no rows, no marks, no exam stage."""
+    exam_id, student_id = world["exam_a"].id, world["student_a"].id
+    before = await _grading_fingerprint(db, exam_id, student_id)
+    stage_before = world["exam_a"].exam_stage
+
+    r = await client.post(_url(exam_id), headers=as_user(world["student_a"]))
+
+    assert r.status_code == 403
+    assert enqueued == [], "no Celery task, so no provider call either"
+    db.expire_all()
+    assert await _grading_fingerprint(db, exam_id, student_id) == before
+    await db.refresh(world["exam_a"])
+    assert world["exam_a"].exam_stage == stage_before
+
+
+async def test_a_refused_unrelated_professor_leaves_grading_state_untouched(
+    client, db, world, enqueued
+):
+    exam_id, student_id = world["exam_a"].id, world["student_a"].id
+    before = await _grading_fingerprint(db, exam_id, student_id)
+
+    r = await client.post(_url(exam_id, student_id), headers=as_user(world["other_prof"]))
+
+    assert r.status_code == 403
+    assert enqueued == []
+    db.expire_all()
+    assert await _grading_fingerprint(db, exam_id, student_id) == before
+
+
+async def test_a_refusal_says_nothing_about_the_other_student(client, world, enqueued):
+    """The body must not reveal whether the named student or their paper exists."""
+    real = await client.post(
+        _url(world["exam_a"].id, world["student_b"].id), headers=as_user(world["student_a"])
+    )
+    invented = await client.post(
+        _url(world["exam_a"].id, 999999), headers=as_user(world["student_a"])
+    )
+
+    assert real.status_code == invented.status_code == 403
+    for body in (real.text, invented.text):
+        for leak in ("script", "response", "marks", "graded", "b@x.test"):
+            assert leak not in body.lower()
+    assert enqueued == []
+
+
+async def test_the_manager_path_still_works_after_the_tightening(client, world, enqueued):
+    """The one caller that should work, still does."""
+    r = await client.post(
+        _url(world["exam_a"].id, world["student_a"].id), headers=as_user(world["owner_prof"])
+    )
+    assert r.status_code == 200, r.text
+    assert enqueued == [(world["exam_a"].id, world["student_a"].id)]

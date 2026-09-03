@@ -1163,6 +1163,16 @@
                 const isProfessor = data.user && data.user.is_professor;
                 const isTA = data.user_role === "ta";
 
+                // Published for `announcements.js`, which renders exam
+                // announcements on this same page and must send a student to
+                // the student page rather than the professor's exam workspace.
+                // `user_role` comes from THIS classroom's membership, so it is
+                // a safer signal than the global `is_professor` flag: a
+                // professor who is merely enrolled elsewhere is not a manager
+                // here. Set from the response this page already fetched -- the
+                // announcement click costs no extra request.
+                window.canManageThisClass = Boolean(isProfessor || isTA);
+
                 // Show the add buttons if user is professor or TA
                 if (isProfessor || isTA) {
                     document.getElementById("addAssignmentBtn").style.display = "inline-block";
@@ -1530,6 +1540,15 @@
 
                 const data = await response.json();
                 console.log("Class data received:", data); // Debug log
+
+                // Published for `announcements.js`. This runs on PAGE LOAD,
+                // unlike loadClasswork() which only runs when the Classwork
+                // tab is opened -- an exam announcement is clickable before
+                // that, so the flag has to be set from here as well. Same
+                // response, so no extra request either way.
+                window.canManageThisClass = Boolean(
+                    (data.user && data.user.is_professor) || data.user_role === "ta"
+                );
                 
                 document.getElementById("course-title").textContent = data.name || "Course";
                 document.getElementById("course-subtitle").textContent = data.subject || "";
