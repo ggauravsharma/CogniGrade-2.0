@@ -856,11 +856,27 @@ async def extract_single_answer_text(
     if not qr:
         raise HTTPException(404, "No answer found for this question/exam/user")
 
+    # No crop images on this response. That is the NORMAL case for a response
+    # prepared automatically from the whole answer script -- `answer_text` is
+    # already the recognised answer, so there is nothing here to recognise.
+    #
+    # This guard used to be absent, and the column is NULL on every
+    # auto-prepared row, so `json.loads(None)` raised TypeError -- which the
+    # `json.JSONDecodeError` catch below does NOT cover. The re-evaluation
+    # routes call this AFTER nulling a mark, so the crash left a graded answer
+    # with no mark at all. Checked before decoding, exactly as the batch path
+    # in `process_answer_text_images_logic` already did.
+    if not (qr.ans_text_images or "").strip():
+        return JSONResponse(
+            status_code=200,
+            content={"message": "Text extraction skipped"}
+        )
+
     try:
         img_paths = json.loads(qr.ans_text_images) or []
-    except json.JSONDecodeError:
+    except (TypeError, ValueError):
         raise HTTPException(400, "Invalid image-list format")
-    
+
     if not img_paths or img_paths == []:
         return JSONResponse(
             status_code=200,
@@ -909,9 +925,15 @@ async def process_answer_text_images_logic(exam_id: int, student_id: int, db: As
     # print("\n\n\n\nfetch_all_responses: ", responses, end="\n\n\n\n")
     batch_entries = []
     for qr in responses:
+        if not (qr.ans_text_images or "").strip():
+            # No crop images on this response. That is the NORMAL case for a
+            # response prepared automatically from the whole answer script --
+            # its `answer_text` is already the recognised answer, so there is
+            # nothing here to recognise. Skipped quietly: logging an error per
+            # question would make the AI-first path look broken while working.
+            continue
         try:
             image_list = json.loads(qr.ans_text_images)
-            print("image_list: ", image_list, end="\n\n\n\n")
         except Exception as e:
             logger.error(f"Failed to parse image list for {qr.id}: {e}")
             continue

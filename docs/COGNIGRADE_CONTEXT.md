@@ -1655,6 +1655,688 @@ subparts are worth one look before grading.
 
 ---
 
+### Live database adoption: pre-Alembic -> 0004 — DONE
+
+The reused historical PostgreSQL volume (`dep25-g06-cognigrade_postgres_data`,
+created 2026-08-24) was never under Alembic control, and the newer code hit it:
+`asyncpg.exceptions.UndefinedColumnError: column
+question_responses.grading_error_code does not exist`, which made
+`GET /exams/4/stats` a 500 and left answer-script processing unable to reach
+grading readiness. Not a Celery problem; a schema-version problem.
+
+**The baseline was measured, not assumed.** Revision 0001 was built in a
+disposable `postgres:15` container and its catalog diffed against the live one
+with identical queries: **188 column/index lines, 59 constraints, 16 tables and
+5 enum definitions -- zero difference on every one.** That is what made
+`stamp 0001` truthful rather than a guess, and it is the check to repeat before
+adopting any other legacy deployment.
+
+**Backup first.** `pg_dump -Fc --no-owner --no-privileges` run inside the
+postgres container (so the password never reached a host command line), pulled
+out with `docker cp`, stored OUTSIDE the repository and outside any Git tree.
+Verified three ways: `PGDMP` magic and an exact byte-size match against the
+in-container original, `pg_restore --list` showing all 16 tables with data
+sections, and a real restore into a disposable database whose row counts,
+column types and exam-4 structure diffed to zero against live. `.gitignore`
+does not cover `*.dump`; the backup lives outside the repo, which is what keeps
+it uncommittable.
+
+**Adoption, with writers stopped.** `backend` and `celery_worker` are the only
+services holding database credentials (`frontend` is a static build, `nginx` is
+`nginx:alpine`); both were stopped, `pg_stat_activity` confirmed zero remaining
+connections, then:
+
+```
+alembic -c backend/alembic.ini stamp 0001     # recorded 0001, applied NO DDL
+alembic -c backend/alembic.ini upgrade head   # 0002 -> 0003 -> 0004
+```
+
+run through `docker compose run --rm --no-deps backend`, so the deployment's own
+configuration resolved the URL. The stamp was verified to have changed nothing
+in the schema before the upgrade was allowed to run.
+
+**Result: `alembic_version = 0004`, `current` and `heads` agree, and
+`alembic check` reports "No new upgrade operations detected"** -- head is the
+current ORM schema with no residual drift. 18 tables (17 application +
+`alembic_version`); the one new application table is `document_regions`.
+
+- All six mark columns are now `numeric(7,2)`: `assignments.points_possible`,
+  `exam_results.marks_obtained`, `exams.points_possible`,
+  `question_responses.marks_obtained`, `questions.max_marks` (still NOT NULL),
+  `submissions.grade`.
+- `question_responses.grading_error_code` exists: `text`, nullable, no default.
+- `document_regions` exists: 20 columns, 0 rows, three indexes, and all four
+  foreign keys with the intended rules -- `question_id ON DELETE SET NULL`,
+  the rest CASCADE.
+
+**Data preserved exactly, and proved rather than asserted.** Every aggregate
+count is unchanged (users 2, classrooms 4, enrollments 4, exams 4, questions 57,
+question_responses 39, answer_scripts 3, materials 11, exam_results 0). Mark
+sums went `176 -> 176.00`, `6 -> 6.00`, `299 -> 299.00`. An md5 fingerprint over
+every question row and every response row -- ids, foreign keys and marks, with
+the mark cast back through `::integer::text` -- is **byte-identical before and
+after** (`c30b9d9d...`, `f1ff1058...`), so no individual value moved. Zero
+non-integral values exist, consistent with a widening that cannot round.
+
+**Exam 4 untouched by the migration:** still exactly 31, 32, 36, 37, 39 with
+marks 3/3/5/4/4 (now `3.00` etc.), 1 answer script, 1 enrolled student, and
+still **0 question_responses and 0 exam_results** -- the migration synthesised
+no grading data.
+
+**After restart** the backend logs `Database is under Alembic control; skipping
+create_all` instead of the pre-Alembic warning, with no startup exception, and
+Celery reports ready. `GET /exams/4/stats` returns **200** where it returned 500,
+carrying no driver text, and `questions/parts` returns `max_marks` as `3.0`
+through the `Marks` type. No provider call was made at any point.
+
+**The schema blocker is resolved.** What has NOT been retried yet is the answer
+script itself.
+
+---
+
+### Controlled exam-4 retry after the DB fix — PRODUCT-FLOW BLOCKER
+
+One run of the real product action ("Start AI grading" on `exam.htm`), exam 4,
+one enrolled student, one uploaded answer script.
+
+**Result: `409` before any provider call. Zero Gemini requests, zero Celery
+tasks, zero database rows changed** (pre/post snapshots diffed identical).
+
+```
+POST /api/exam/4/enqueue-processing?student_id=1
+  -> 409 {"detail":"This answer script has no prepared responses to grade yet."}
+UI shows: "This answer script is not ready for grading yet."
+```
+
+**The schema blocker really is gone** -- this 409 is `enqueue_processing`'s own
+readiness gate in `backend/routers/routingTasks.py`, not a driver error. That
+gate is correct and must stay: with zero response rows
+`aggregate_student_result` would finalise vacuously and stamp a fabricated
+`0.0`, which is the C6 failure it exists to prevent.
+
+**`Error: undefined` did NOT reappear.** `startAiGrading` maps 409/403/404 to
+its own copy and renders nothing from the response body. Not reproduced, so NOT
+proven fixed -- it was a symptom of the earlier 500, which no longer happens.
+
+**The real blocker: nothing automatic creates `question_responses`.** The gate
+needs at least one, and every live creator is human-driven:
+
+```
+studentEdit.py:118   POST /exam/{id}/question_response/{doc_type}   the CROP EDITOR
+studentBackend.py:137/277, exams.py:602, examStats.py:336           manual/teacher/query
+```
+
+`student-edit.htm`'s "Submit my answer script" only reveals `#container` and
+hands over to `crop-edit.js` with "Submit All Responses" -- i.e. the student is
+still asked to cut regions before the AI may run. So the AI-first path stops one
+step before the AI.
+
+**The automatic capability is genuinely absent, not merely unrouted.**
+`AITask.SEGMENTATION` is configured `provider: NO_PROVIDER`, so
+`POST /answer-scripts/{id}/segmentation` answers `503
+segmentation_not_configured`; and even with regions stored, nothing converts
+`document_regions` into `question_responses` -- `region_evidence.py` only READS
+them as grading evidence. This is a missing pipeline stage, not a frontend
+routing mistake, and it is the one thing between the current build and the
+automatic flow.
+
+**Expected cost when it does run** (from code, for this 5-question paper):
+recognition batches answer images 5 per call, grading is one call per question
+with a response, `max_retries = 2` (up to 3 calls each), `max_concurrency = 3`.
+So roughly 1 recognition + 5 grading calls minimum, up to ~18 if everything
+retried. `enqueue-processing` is NOT idempotent -- re-running re-grades and
+overwrites marks; the only guard is the button's disabled state.
+
+---
+
+### Automatic answer preparation — DONE (AI-first path unblocked)
+
+The stage between "a script was uploaded" and "there is something per question
+to grade". Without it `enqueue_processing` refused every automatic run and the
+only way forward was the student cutting their own paper up in the crop editor.
+
+**The whole design is one observation:**
+`GradingEvidence.has_student_evidence` is `bool(student_answer_text or
+student_images.has_any)`. A response carrying recognised TEXT is already enough
+for the entire grading pipeline -- so closing the gap needs no segmentation, no
+geometry, no crops, no new persisted format and not one line of grading
+changed. Segmentation stays deliberately unbuilt (`AITask.SEGMENTATION` is
+still `NO_PROVIDER`).
+
+```
+AITask.ANSWER_MAPPING          new task: read a WHOLE script, assign answers to
+                               the exam's EXISTING questions
+ai/prompts/recognition.py      build_answer_mapping_prompt(question_numbers)
+ai/answer_mapping.py    NEW    the contract + deterministic gate. No IO, no DB,
+                               no provider concept -- shaped like ai/segmentation.py
+ai/services.py                 map_answer_script(): ONE call, via visible_pages()
+grading/preparation.py  NEW    the DB-facing stage and its outcome vocabulary
+tasks.py                       preparation runs first, and gates the rest
+routers/routingTasks.py        readiness moved, not weakened
+routers/geminiAPI.py           crop recognition skips a response with no crops
+```
+
+**The exam's questions are authoritative.** The canonical numbers are stated in
+the prompt AND enforced after: a number the model returns that the exam does
+not have is discarded and logged, never created. Exactly the rule the
+hidden-PDF-text incident produced -- a five-question paper must not become
+seven because a model said so.
+
+**Omission is meaningful.** A question with no entry means "not attempted" and
+gets NO row, so grading skips it and aggregation treats it as skipped -- the
+existing semantics, unchanged. An entry with an EMPTY answer is rejected too:
+"attempted but wrote nothing" is not something a mapping pass can assert, and
+accepting it would turn a preparation gap into a zero.
+
+**No fake rows to satisfy a gate.** Creating five empty responses so
+`enqueue_processing` would pass just moves the vacuous-aggregation bug. If
+preparation maps nothing, `_process_and_grade` RETURNS BEFORE AGGREGATING and
+leaves the stage alone -- because `aggregate_student_result` finalises when
+every response that EXISTS carries a mark, which is vacuously true of zero rows
+and would stamp a fabricated `0.0`.
+
+**Readiness moved one level up, it was not relaxed.** The route now refuses
+only when there is nothing to read at all (no responses AND no script); the
+invariant now lives where aggregation actually happens, which is strictly
+stronger than a check at enqueue time.
+
+**Never overwrites.** Preparation is a no-op the moment ANY response exists --
+crop-built, teacher-corrected or already graded. That is what makes it safe to
+call on every run with no unique `(student_id, question_id)` constraint to lean
+on, and it is why legacy exams and the crop editor keep working untouched. No
+schema migration was needed.
+
+- 812 tests (762 + 50). `test_answer_preparation.py` (37) holds the gate and
+  the stage: tolerant number shapes but strict identity, 33/38 discarded, empty
+  and duplicate entries dropped, provider failure / unrenderable script /
+  unusable JSON each writing nothing, an existing response never touched, one
+  call per script, PDFs reaching the provider as PNG pages, and no student text
+  in a log line. `test_offline_auto_pipeline.py` (10) runs the REAL Celery task
+  body with only the vendor call stubbed: upload -> prepare -> grade ->
+  aggregate -> stage, with no crop route called and no `ans_*_images` written.
+- **Live, exam 4, one run:** `409 -> 200 "AI grading started."` **1
+  answer_mapping call** for the whole 4-page script (39.7s, 1 attempt) + 7
+  grading calls across 5 questions. Five responses created for exactly
+  31/32/36/37/39, no duplicates, no phantom 33/38, reference side untouched.
+  Q32/Q36/Q37/Q39 graded 3/3, 5/5, 4/4, 4/4. **Q31 exhausted its 3 attempts and
+  the response failed to parse:** mark stayed `NULL` with
+  `grading_error_code=malformed_json`, siblings unaffected, result
+  `grading_incomplete` with `graded_at` NULL and stage left at
+  `EXAM_STAGE_GRADING` (6). No false finalisation. `/exams/4/stats` returns the
+  neutral code plus "The grading response was not valid JSON." -- no provider
+  text, no traceback. Zero occurrences of any stored answer in the logs.
+
+**Open:** Q31 is the longest answer (829 chars, the multi-part diagram
+question) and is the one whose grading response would not parse three times
+running. Worth one look at whether it is length, the diagram description, or
+just variance before the full paper is attempted.
+
+---
+
+### Q31 `malformed_json` — diagnosed, no parser defect
+
+**The earlier summary of this failure was wrong**, and reading the run's own
+telemetry rather than the persisted code is what corrected it:
+
+```
+12:53:01  provider error, retrying: task=grading category=timeout attempt=1/3
+12:55:02  provider error, retrying: task=grading category=timeout attempt=2/3
+12:56:38  ai_invocation task=grading ... attempts=3 success=True duration_ms=336491
+```
+
+Attempts 1 and 2 were **timeouts**, not malformed responses. Only attempt 3
+returned a body, and only that body failed to decode. Q31's siblings took
+69-109s against a 120s budget; Q31 twice ran the clock out and succeeded on the
+third try at ~95s. Attribution is from timing (question_id=68, grading
+concurrency 3), because the retry line carries no question id.
+
+**`malformed_json` means exactly one thing** (`grading/result.py`): the text
+contained something object-shaped and `json.loads` failed on it. Schema and
+range problems have their own codes -- `wrong_schema`, `score_missing`,
+`score_not_numeric`, `score_not_finite`, `score_negative`, `score_above_max` --
+and the decoder was characterised offline over 48 cases to prove they are not
+being absorbed into it. **No parser defect was found.** It accepts fenced
+blocks, leading prose, `"2.5"` as a string, extra fields, a genuine `0` and
+fractions; it rejects, with the right code each time, unterminated JSON,
+trailing commas, single quotes, NaN/Infinity, negative and above-max scores.
+`not_json` is the one raised code with no professor-facing sentence; it
+degrades to the generic line, which is now asserted rather than assumed.
+
+**The real defect found: the provider's finish reason was thrown away.**
+`response.text` returns the PARTIAL body when generation stops at an output
+limit (verified in the installed google-generativeai 0.8.4 source: it raises
+only when `parts` is empty). So a truncated answer reaches the decoder as
+ordinary invalid JSON and is recorded as `malformed_json` -- the same code a
+model writing nonsense gets. The provider knew which it was; the adapter kept
+neither the reason nor the token counts.
+
+Fixed, diagnostics only, no behaviour change to grading:
+
+```
+ai/contracts.py           FinishReason (complete/truncated/blocked/other/unknown)
+                          + finish_reason, input_tokens, output_tokens on ProviderResponse
+ai/providers/gemini.py    _finish_reason() / _token_counts(); a truncated response
+                          adds a `truncated_response` warning and a WARNING line
+ai/services.py            carries them through run_task
+ai/telemetry.py           logs finish_reason= and output_tokens=
+```
+
+Provider-neutral by construction: the vendor enum is spoken in the adapter and
+nowhere else, and a test walks every non-adapter module asserting no
+`MAX_TOKENS`/`RECITATION`/`SPII` string escapes it. Both helpers are
+exception-proof -- a diagnostic that can fail a working grading call is worse
+than no diagnostic.
+
+**Also corrected: a factually wrong comment.** The adapter said `response_schema`
+"wants a version-specific SDK type", justifying its absence. The pinned 0.8.4
+declares `protos.Schema | Mapping[str, Any] | type | None`, and a plain dict was
+verified locally to convert (no API call). `response_mime_type:
+application/json` IS already a real provider-level JSON mode; constraining the
+SCHEMA as well is available and is the obvious next step, but it changes what
+the model may emit on every graded question, so it is left for a change that can
+be validated against the provider.
+
+**Classification: `PROVIDER_RESPONSE_VARIANCE`, with an `INSUFFICIENT_TELEMETRY`
+caveat now closed.** No deterministic application defect explains Q31; two
+timeouts plus one undecodable body on the paper's longest answer is consistent
+with a slow, verbose generation, but truncation is NOT proven -- and could not
+have been, because the reason was discarded. It can be next time.
+
+- 860 tests (812 + 48). `test_grading_response_contract.py` pins the decoder's
+  accept/reject behaviour case by case, the vendor-to-domain finish-reason
+  translation, exception-proofing, provider neutrality, and one end-to-end
+  truncation through the real adapter with the SDK call stubbed -- asserting the
+  response body never reaches a log line. **Zero provider calls; exam 4 was NOT
+  re-run.**
+
+**Length/diagram is correlation only.** Q31 is the longest mapped answer (829
+chars) and the multi-part diagram question, but `grading_evidence` shows
+`buckets={}` and `files=0` for every question in that run -- no images were
+attached to any grading call, Q31 included. So "diagram-heavy" cannot be the
+mechanism; the reference diagram was never in the request.
+
+---
+
+### Q31 targeted retry — `GRADING_TIMEOUT`, and two corrections
+
+**Correction 1 — the question ids were mis-attributed.** Exam 4's rows are
+`67=Q31, 68=Q32, 69=Q36, 70=Q37, 71=Q39`. The previous note read the first
+run's telemetry against the wrong mapping. Re-derived from the database:
+
+```
+question_id=67  Q31  attempts=1  69.7s   success=True  -> body failed to decode
+question_id=68  Q32  attempts=3  336.5s  success=True  -> graded 3.00
+```
+
+So the two `category=timeout` retries belonged to **Q32**, which then
+succeeded. **Q31's original failure was a single attempt that returned a body
+in ~70s and would not parse.** Both earlier accounts of this were wrong; this
+one comes from the ids in `questions`.
+
+**Correction 2 — never target Q31 by id 68.** That is Q32, already graded.
+
+**The targeted run.** One HTTP operation, `POST /grade-question-with-diagram`
+with `question_id=67`, chosen because it is the only route that reproduces the
+failing path faithfully: it READS the stored `QuestionResponse`, builds evidence
+through `build_region_aware_evidence`, uses `_build_diagram_prompt_parts` and
+`grade_answer_with_parts`, touches no sibling, creates nothing, and does not
+aggregate. Retries apply, so one operation is up to three provider attempts.
+
+```
+14:31:02  evidence built: question_id=67 evidence_source=legacy_crops buckets={} (text only)
+14:33:02  provider error, retrying: category=temporary  attempt=1/3  delay=0.22s   (~120s)
+14:35:02  provider error, retrying: category=timeout    attempt=2/3  delay=1.46s   (~120s)
+14:37:03  ai_invocation task=grading attempts=3 success=False error_category=timeout
+          duration_ms=360382 files=0 question_id=67
+```
+
+**All three attempts hit the 120s wall clock. No response was ever returned**,
+so `finish_reason` and the token counts could not be observed -- they are read
+off a response object, and there was none. The new diagnostics are therefore
+still unexercised in the field; they will report on the first attempt that
+comes back.
+
+**Classification: `GRADING_TIMEOUT`.** Q31's grading call is simply slow. Across
+both runs its siblings finished in 69-109s against a 120s budget, and Q31 has
+now spent 70s (returning unparseable output) and then 3 x 120s returning
+nothing. It is the paper's longest mapped answer (829 chars) and the request is
+TEXT ONLY -- `files=0`, `buckets={}`, no images on any grading call -- so the
+budget, not the payload, is what it keeps hitting.
+
+**Nothing else moved.** The only change in the whole database is Q31's
+`grading_error_code`: `malformed_json` -> `timeout`. The siblings' fingerprint
+(marks, error codes, reasoning, answer lengths) is byte-identical; no duplicate
+responses, no new questions, no Q33/Q38, no reference-side contamination, no
+remapping (`ans_text_images` still NULL). Exam stage stays 6, result stays
+`grading_incomplete` at 16.00 with `graded_at` unset -- correct, and the route
+does not aggregate.
+
+**Cost: 1 HTTP operation = 3 provider attempts, 2 retries, 0 recognition or
+mapping calls, 0 sibling grading calls.**
+
+**Defect found here, FIXED later** (see *Reliability wrap-up* below): `POST /exam/{id}/question/{qid}/student/{sid}/reevaluate`
+cannot be used on an automatically prepared response. It calls
+`extract_single_answer_text`, which does `json.loads(qr.ans_text_images)` and
+guards only `json.JSONDecodeError`; an auto-prepared row has that column NULL,
+so `json.loads(None)` raises `TypeError` and the route 500s -- after it has
+already nulled `marks_obtained` and committed. For Q31 nothing was lost (the
+mark was already NULL), but on a GRADED question that route would clear the
+mark and then die before restoring it. It was avoided for exactly this reason.
+
+---
+
+### Q31 single-attempt diagnostic — `GRADING_TIMEOUT` is WRONG, it is malformed JSON
+
+**One provider attempt, no retries, a 180s budget — and it answered in 16
+seconds.** That overturns the previous section's classification.
+
+Configuration supported the whole diagnostic with no code change.
+`get_task_settings` resolves `CG_AI__<TASK>__<FIELD>`, and its override list
+already contains both `timeout_seconds` and `max_retries`; `max_retries` has no
+clamp (only `max_concurrency` does), and `run_with_retries` computes
+`total = max(0, max_retries) + 1`, so `0` really means one attempt. The
+overrides were injected as a compose file kept OUTSIDE the repository and the
+backend recreated with it; `.env` was never touched (`load_dotenv()` defaults to
+`override=False`, so process environment wins anyway). The running backend was
+made to print its effective settings BEFORE the call: grading
+`timeout=180.0 retries=0`, every other task unchanged.
+
+```
+07:09:27  grading_evidence question_id=67 evidence_source=legacy_crops buckets={} (text only)
+07:09:44  ai_invocation task=grading attempts=1 success=True error_category=- files=0
+          duration_ms=16055 question_id=67
+07:09:44  grading failed: code=malformed_json question_id=67
+          detail=response was not valid JSON: Extra data: line 1 column 407 (char 406)
+```
+
+**`attempts=1`, 16.1s, `success=True`.** The provider returned a complete body
+well inside a budget it had previously spent 120s failing to meet three times
+running. Q31 is not slow. The earlier 120s walls were provider-side latency
+variance on that day, not a property of this question, and
+**`GRADING_TIMEOUT` should not be carried forward as the diagnosis.**
+
+**"Extra data" is the whole finding.** The raw body was 407 characters. A
+complete JSON object ends at char 406 and exactly ONE further non-whitespace
+character follows it. `json.loads` reports that as `Extra data`; a response cut
+off at an output limit cannot produce it — truncation raises `Unterminated
+string` or `Expecting value` on an object that never closed. So the response was
+COMPLETE and carried one stray trailing character. Output budget and schema size
+are not implicated, and 407 characters is nowhere near any token ceiling.
+
+**Where the parser lets it through.** `_extract_json_object`
+(`backend/grading/result.py`) strips a fenced block only when the text STARTS
+with a fence. This body starts with `{`, so the function returns the entire
+stripped text unchanged and the `_JSON_OBJECT` regex fallback — which would have
+matched just the object and dropped the trailing character — is never reached.
+That asymmetry is the narrow defect. **Deliberately not fixed in this
+diagnostic**, and it is a parser-precedence fix, not a loosening: the object is
+still validated strictly afterwards.
+
+**Diagnostics still unexercised.** `finish_reason` and the token counts could
+not be reported, and this time NOT because no response arrived. The running
+image was built 2026-09-02, before those changes were written; the container has
+no `finish_reason` in `ai/telemetry.py`, no `input_tokens` in `ai/contracts.py`
+and no `_token_counts` in `providers/gemini.py`. Reading them costs an image
+rebuild plus one more provider call. The `Extra data` position is conclusive on
+its own, so that call was not spent.
+
+**Cost: 1 HTTP operation = exactly 1 Gemini call.**
+
+**Nothing else moved.** The only database change is Q31's `grading_error_code`:
+`timeout` -> `malformed_json`. Marks stayed NULL — no fabricated zero. The four
+siblings' fingerprints (marks, error codes, reasoning, answer text, image
+columns) are byte-identical before and after: Q32 3.00, Q36 5.00, Q37 4.00,
+Q39 4.00. Five responses, no duplicates, no phantom 33/38, `ans_text_images`
+still NULL (no remapping), exam stage 6, result `grading_incomplete` at 16.00
+with `graded_at` unset. Grading configuration was restored to `timeout=120.0
+retries=2` and verified from inside the running backend.
+
+**Confirmed ids** (re-read from `questions` again this run):
+`67=Q31, 68=Q32, 69=Q36, 70=Q37, 71=Q39`. Q31's response row is id 40.
+
+---
+
+### Q31 parser fix — structural JSON boundary, and Q31 graded 3.00
+
+**The `malformed_json` was a parser-boundary defect, not a provider defect.**
+The single-attempt diagnostic above showed a complete body in 16.1s that
+`json.loads` refused with `Extra data: line 1 column 407 (char 406)`. That error
+is only producible by a body that CLOSED — truncation raises `Unterminated
+string` or `Expecting value` on an object that never ended — so the provider had
+returned a complete grading object followed by one stray character.
+
+**The old control flow could never reach its own fallback.**
+`_extract_json_object` stripped a leading fence, then:
+
+```
+if stripped.startswith("{"):  return stripped        # <- whole text, stray char and all
+match = _JSON_OBJECT.search(stripped)                # <- unreachable for those bodies
+```
+
+The regex fallback that would have isolated the object only ran when the text
+did NOT start with an object. Every body that needed it took the early return.
+
+**The fix is a boundary fix, not a loosening.** `json.JSONDecoder.raw_decode`
+consumes exactly ONE complete JSON value from a given index and reports where it
+ended; that end position is what separates "a complete object with something
+harmless after it" from "a broken object". No regex brace-matching — a greedy
+pattern runs across nested objects, a lazy one stops inside them, and both are
+blind to braces inside strings. **No score is ever read out of prose.** The
+decoded object still goes through the unchanged strict schema / numeric /
+finite / non-negative / max-marks validation.
+
+```
+backend/grading/result.py   _JSON_OBJECT + _extract_json_object  ->
+                            _DECODER, _object_starts, _decode_first_object,
+                            _contains_another_object, _decode_json_object
+backend/grading/failure.py  + "ambiguous_json" professor-facing sentence
+```
+
+**Trailing-data policy.** Accepted: whitespace, a fenced block, prose before the
+object, and harmless non-JSON material after it. Refused as `ambiguous_json`: a
+second DECODABLE JSON OBJECT anywhere after the first, because two structured
+payloads make the response ambiguous and picking one would be a guess. The
+ambiguity check looks for objects only — a trailing sentence such as "Total: 3
+marks" contains a perfectly decodable JSON *number*, and rejecting on that would
+throw a valid grade away over ordinary prose. Codes are otherwise unchanged: a
+broken first object is still `malformed_json`, no object-looking start at all is
+still `not_json`.
+
+- **910 tests (860 + 50), all passing.** `test_trailing_data.py` holds the
+  contract: the live SHAPE (complete object + one stray character) accepted,
+  trailing prose accepted, trailing prose containing a bare number accepted,
+  nested objects and braces inside string values accepted (a regex would have
+  broken all of these), genuine zero and 0.5/1.5/2.25 preserved through trailing
+  data, truncation still `malformed_json`, two objects rejected as
+  `ambiguous_json`, and no failure message quoting the provider body. One
+  pre-existing characterisation assertion in `test_grading_response_contract.py`
+  pinned the defect (`... "extra": "junk"} garbage` -> `malformed_json`) and was
+  deliberately flipped to the accepted case.
+
+**Live retest, Q31, one attempt.** Backend and celery worker rebuilt from the
+working tree first, so container and source agree (this had NOT been true during
+the previous diagnostic — the image predated the telemetry work).
+
+```
+07:24:54  ai_invocation task=grading attempts=1 success=True error_category=-
+          duration_ms=8098 files=0 finish_reason=complete output_tokens=66
+          question_id=67
+```
+
+**Q31 now grades 3.00 / 3.00, `grading_error_code` cleared to NULL.** This is
+also the first time the finish-reason and token diagnostics have reported from
+the field: `finish_reason=complete`, `output_tokens=66` — no truncation, and far
+below any output ceiling, which independently confirms the earlier reading.
+
+**Stated honestly:** this particular body parsed cleanly, so the live run does
+not prove trailing material was present this time. What it proves is that Q31
+grades. The parser fix is verified against the exact failure shape offline; the
+body was deliberately not inspected.
+
+**Cost: 1 HTTP operation = exactly 1 Gemini call.** Grading configuration was
+restored to `timeout=120.0 retries=2` and verified from inside the running
+backend.
+
+**Siblings untouched:** Q32/Q36/Q37/Q39 fingerprints byte-identical across the
+whole task (3.00 / 5.00 / 4.00 / 4.00). Five responses, no duplicates, no
+phantom 33/38, `ans_text_images` still NULL (no remapping).
+
+**NOT finalised, and correctly so.** All five responses now carry marks, but
+`/grade-question-with-diagram` does not aggregate: `exam_results` still reads
+16.00 / `grading_incomplete` / `graded_at` NULL, and exam stage is still 6. The
+supported finalisation path is `POST /exam/{exam_id}/add-result`
+(manager-only) -> `add_exam_result_internal` -> `aggregate_student_result`,
+which recomputes the total from the response rows and stamps `graded_at` only
+when every existing response carries a validated mark. Fully response-graded is
+not the same as finalised, and the result must come from that path rather than
+be written by hand.
+
+---
+
+### Exam 4 finalisation — result is final at 19.00/19.00, exam_stage is not
+
+**The full AI-first path is now closed end to end for exam 4 / student 1.** All
+five responses graded (Q31 3.00, Q32 3.00, Q36 5.00, Q37 4.00, Q39 4.00 = 19.00
+of 19.00), then the supported aggregation path was invoked ONCE. **No provider
+call, no regrade, no remap.**
+
+**The route, verified from source before calling it.** `POST /exam/{exam_id}/add-result`
+(externally `/api/exam/4/add-result`; the router carries no prefix and nginx
+rewrites `^/api/(.*)$`). `student_id` is a **Form field, not JSON**. Authorised
+by `require_exam_manager` plus `get_current_user_required`. It delegates to
+`add_exam_result_internal`, which reads the exam's `Question` ids and the
+student's `QuestionResponse` rows, calls `aggregate_student_result`, and writes
+exactly ONE `ExamResult` row. **It never touches a QuestionResponse, and it
+never writes a mark** -- it only totals what grading already stored.
+
+```
+FINALIZE 200  complete=true  is_final=true  status=graded  graded_count=5
+              marks_obtained=19.0  ungraded_question_ids=[]
+              graded_at=2026-09-03T07:30:17Z
+```
+
+Database after: `exam_results` id 1 -> `marks_obtained=19.00`, `status=graded`,
+`graded_at` set. One result row, five response rows, and **all five response
+fingerprints byte-identical before and after** -- aggregation aggregated and
+changed nothing else.
+
+**Completeness is decided, not assumed.** `aggregate_student_result` marks a
+result complete when every response that EXISTS carries a non-NULL mark; a
+question with no row at all is reported separately and does not block, so a
+genuinely unattempted question cannot make an exam permanently unfinalisable.
+`status` is then `graded` / `grading_incomplete` and `exam_result_is_final`
+reads `status in ExamResultStatus.FINAL`, which is `("graded",)`. C6 holds:
+`marks_obtained == 0` counts as a grade, only `None` is absent, and nothing is
+cast to int so fractional marks total exactly. Held by
+`test_exam_aggregation.py` (23 passing): zero is a grade, a single missing mark
+blocks finalisation, a missing mark is not counted as zero, fractional marks are
+not truncated, and a finalised result can be DEMOTED by a later failure.
+
+**Read contracts verified live, backend-side, not from the UI:**
+
+```
+GET /exams/4/stats              status=graded is_final=true total_marks=19.0
+   (manager)                    percentage=100.0 grading_failures=[]
+                                grading_progress=1.0 excluded_from_distribution=0
+                                distribution puts the student in the 19.0 bucket
+GET /exams/4/submission_status  status=graded is_final=true prepared=true
+   (the student's own session)
+GET /exam/4/student-evaluation/1  5 rows, marks summing to 19.0, every
+                                  grading_error_code NULL, Q31 3.0/3.0
+```
+
+No NULL-as-zero anywhere: the 19.00 is derived from the stored
+`QuestionResponse` marks, and `exams.points_possible` is 19.00, matching
+`sum(questions.max_marks)`.
+
+**GAP, found and deliberately not patched: `exam_stage` stays 6.**
+`add_exam_result_internal` does not touch the stage; the ONLY place stage 7
+(`EXAM_STAGE_GRADED`) is written is `tasks._process_and_grade`, which calls
+`add_exam_result_internal` then `exam_result_is_final` then `set_exam_stage`.
+Finalising through the route alone therefore leaves a correct, final
+`ExamResult` beside an exam still reading `EXAM_STAGE_GRADING`. Nothing that
+reports the RESULT is wrong -- stats, submission status and evaluation all read
+from `ExamResult`/`QuestionResponse` and all say graded -- but any surface that
+reads `GET /exams/{id}/stage` will still say grading. The supported writer is
+`POST /exams/{exam_id}/stage` (manager-only, `exam_stage` as a query
+parameter). This is the same exam-wide-vs-per-student mismatch already noted in
+`tasks.py`, surfaced here as a concrete consequence rather than a theory. It
+was NOT set by hand: a stage written manually would be a claim the aggregation
+did not make.
+
+---
+
+### Reliability wrap-up — re-evaluation can no longer destroy a mark, stage follows result
+
+**Bug 1 — `/reevaluate` erased grades.** All three re-evaluation routes opened
+with `marks_obtained = None` + `commit()`, then called
+`extract_single_answer_text`, which did `json.loads(qr.ans_text_images)` guarded
+only by `json.JSONDecodeError`. Every automatically prepared row has that column
+NULL, so `json.loads(None)` raised **`TypeError`** -- a different exception --
+which escaped past the restore branch. A correctly graded answer was left with
+no mark and the professor got a 500. Exam 4's five responses were all in exactly
+that shape. Reproduced in a test against the pre-fix code before fixing.
+
+Two layers, because one was not enough:
+
+```
+geminiAPI.extract_single_answer_text   NULL/blank ans_text_images now returns
+                                       "Text extraction skipped" BEFORE decoding,
+                                       matching what the batch path already did;
+                                       the decode catch widened to (TypeError, ValueError)
+examStats._reevaluate_one_response NEW  one helper, used by all three routes
+```
+
+**The rule is now: nothing is cleared until a replacement is validated.** The
+helper snapshots mark, reason and failure code, runs extraction + grading inside
+`try`, writes the new grade only on `status == "graded"`, and restores all three
+fields verbatim on every failure path -- returned failure *or* raised exception.
+Restoring the failure code too matters: the inner grading route persists its own
+`grading_error_code`, so without it a valid mark could end up beside a stale
+failure code. Semantics unchanged: a genuine 0 is a valid replacement (the test
+is the status string, never truthiness of the score), fractional marks pass
+through, a failure never writes a score, and the professor gets the safe
+`describe(code)` sentence -- never provider text.
+
+The three bulk/`all_students` routes were rewired to the same helper rather than
+left exposed; that was a substitution, not a redesign.
+
+**Bug 2 — a graded result beside a "grading" exam.** `add_exam_result_internal`
+finalised the RESULT but never touched `exam_stage`; only
+`tasks._process_and_grade` wrote stage 7. Finalising through the supported route
+therefore left `status=graded` with `graded_at` set next to an exam still
+reporting stage 6. The stage now follows the aggregation's own verdict, in the
+same place the result is written:
+
+```
+if aggregation.complete:            -> EXAM_STAGE_GRADED
+elif exam.exam_stage == GRADED:     -> EXAM_STAGE_GRADING   (demotion only)
+```
+
+Promotion is impossible for an incomplete run, and the demotion is deliberately
+narrow -- only an exam already marked Graded moves back, so a paper that has not
+reached grading is not dragged forward to stage 6. Still exam-wide while the job
+is per-student (unchanged, see `tasks.py`).
+
+- **923 tests (910 + 13), all passing.** `test_reevaluation_safety.py` holds
+  both fixes: re-evaluating a NULL-`ans_text_images` row does not crash, a
+  returned failure keeps the previous mark, a RAISED exception keeps it too
+  (the regression itself), success replaces mark/reason and clears the code, a
+  genuine 0 is a valid new grade and a stored 0 survives a failure, a fractional
+  mark survives, no provider text reaches the message; and for the stage: a
+  final result reaches GRADED, a zero total still reaches GRADED, an incomplete
+  result never does and is not dragged forward, a later failure demotes only
+  from GRADED, and a fractional total finalises exactly.
+
+**Live, exam 4, no provider call.** Backend and worker rebuilt from the working
+tree, both fixes confirmed present in the container. `POST /exam/4/add-result`
+invoked once: `complete=true is_final=true marks_obtained=19.0 graded_count=5`,
+and the database now reads **`exam_results` 19.00 / `graded` / `graded_at` set
+AND `exams.exam_stage = 7`.** The five response marks (3/3/5/4/4) and their
+cleared error codes are untouched. The result and the stage finally agree.
+
+---
+
 ## Authorization model
 
 Two capability ladders, both derived from the real domain model. `is_professor`

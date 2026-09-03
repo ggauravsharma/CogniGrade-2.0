@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
 from backend.database import get_db
+from backend.models.files import AnswerScript
 from backend.models.tables import Question, QuestionResponse
 from backend.models.users import User
 from backend.utils.security import get_current_user_required
@@ -39,17 +40,26 @@ async def enqueue_processing(
     the pattern already used by `/protected-files/exam/{id}/document/{type}`. A
     student may still start their own run and may not name anyone else.
 
-    WHY THE READINESS CHECK IS NOT OPTIONAL
-    ---------------------------------------
+    WHAT READINESS MEANS NOW
+    ------------------------
     `aggregate_student_result` finalises a result when every response that
     EXISTS carries a mark -- a question with no response row means the student
     skipped it, which must not block finalisation forever. With ZERO response
-    rows that rule is vacuously satisfied, so a run for a student whose script
-    has never been prepared would aggregate to `0.0`, stamp `graded`, and set
-    `graded_at`: a fabricated final zero, which is precisely the distinction C6
-    exists to protect. The old flow could not reach that state because the only
-    trigger was the crop submit that creates the rows. Moving the trigger to a
-    manager makes it reachable, so it is refused here instead.
+    rows that rule is vacuously satisfied, so a run for a student whose paper
+    was never prepared would aggregate to `0.0`, stamp `graded`, and set
+    `graded_at`: a fabricated final zero, exactly the distinction C6 exists to
+    protect.
+
+    That invariant is untouched; it has moved to where aggregation actually
+    happens. `_process_and_grade` now prepares responses from the uploaded
+    script first and RETURNS BEFORE AGGREGATING if preparation produced
+    nothing, so zero responses still cannot become a final zero.
+
+    What this route refuses is therefore narrower and more honest: a run with
+    nothing to read at all. No responses AND no uploaded script means no
+    automatic stage could produce anything, so there is no point queueing a job
+    -- and asking a student to cut their own script up first, which is what the
+    old check effectively did, is not the AI-first flow this product describes.
     """
     ctx = await assert_self_or_exam_manager(
         exam_id, student_id if student_id is not None else current_user.id, current_user, db
@@ -74,10 +84,28 @@ async def enqueue_processing(
         )
     )
     if not prepared.scalar():
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="This answer script has no prepared responses to grade yet.",
+        # No responses yet is no longer a refusal: the job prepares them from
+        # the uploaded script itself (see backend/grading/preparation.py). What
+        # is still refused is a run with NOTHING to read -- there is no paper,
+        # so there is nothing an automatic stage could turn into responses.
+        #
+        # The invariant the old check protected has not been relaxed, it has
+        # moved to where aggregation actually happens: `_process_and_grade`
+        # returns before aggregating unless preparation left something to grade,
+        # so zero responses can still never become a fabricated 0.0.
+        script = await db.execute(
+            select(func.count())
+            .select_from(AnswerScript)
+            .where(
+                AnswerScript.exam_id == exam_id,
+                AnswerScript.student_id == target_student_id,
+            )
         )
+        if not script.scalar():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This student has no uploaded answer script to grade yet.",
+            )
 
     process_and_grade_exam.delay(exam_id, target_student_id)
     return {

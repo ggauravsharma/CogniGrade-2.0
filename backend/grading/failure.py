@@ -60,6 +60,9 @@ FAILURE_MESSAGES: Dict[str, str] = {
     "empty_response": "The grading model returned no usable text.",
     "malformed_json": "The grading response was not valid JSON.",
     "wrong_schema": "The grading response did not have the expected fields.",
+    #: Two structured payloads came back and choosing between them would be a
+    #: guess. Refusing is what keeps a mark from being picked arbitrarily.
+    "ambiguous_json": "The grading response contained more than one result.",
     "score_missing": "The grading response contained no score.",
     "score_not_numeric": "The grading response contained a score that is not a number.",
     "score_not_finite": "The grading response contained a score that is not a finite number.",

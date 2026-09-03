@@ -42,7 +42,13 @@ from typing import Any, List, Optional, Sequence, Tuple
 import google.generativeai as genai
 
 from backend.ai.config import TaskSettings
-from backend.ai.contracts import FilePart, ProviderRequest, ProviderResponse, TextPart
+from backend.ai.contracts import (
+    FilePart,
+    FinishReason,
+    ProviderRequest,
+    ProviderResponse,
+    TextPart,
+)
 from backend.ai.errors import (
     ProviderAuthenticationError,
     ProviderError,
@@ -313,12 +319,23 @@ class GeminiProvider:
     def _generation_config(self, settings: TaskSettings, request: ProviderRequest) -> dict:
         """Provider-specific knobs, assembled here and nowhere else.
 
-        `response_mime_type` is passed as a plain string: the pinned
-        google-generativeai 0.8.4 accepts that, whereas `response_schema` wants
-        a version-specific SDK type. The strict decoder in
-        `backend.grading.result` is what actually guarantees a valid result, so
-        a provider that ignores the hint still yields either a valid grade or an
-        explicit failure -- never a silent None.
+        `response_mime_type` is a real provider-level JSON mode, not a wording
+        choice in the prompt: `expects_json` on the task or the request turns it
+        on here.
+
+        `response_schema` is NOT set, and the reason recorded here previously --
+        that it "wants a version-specific SDK type" -- is wrong for the pinned
+        google-generativeai 0.8.4, whose GenerationConfig declares
+        `protos.Schema | Mapping[str, Any] | type | None`; a plain dict is
+        accepted (verified locally against the installed SDK, no API call).
+        Constraining the shape as well as the mime type is therefore available
+        and is the obvious next step -- it is left for a change that can be
+        validated against the provider, because it alters what the model is
+        allowed to emit on every graded question.
+
+        Either way the strict decoder in `backend.grading.result` is what
+        guarantees a valid result, so a provider that ignores the hint still
+        yields a valid grade or an explicit failure -- never a silent None.
         """
         config = {"temperature": settings.temperature}
         if request.expects_json or settings.expects_json:
@@ -346,6 +363,12 @@ class GeminiProvider:
 
         `response.text` RAISES on a blocked or empty candidate rather than
         returning None, which used to surface as an opaque 500.
+
+        Note what it does NOT do: when generation stopped at an output limit
+        but produced some text, `parts` is non-empty and this returns the
+        PARTIAL body quite happily. That is why `_finish_reason` exists -- the
+        truncation is invisible here and would otherwise reach the grading
+        decoder as ordinary invalid JSON.
         """
         try:
             text = response.text
@@ -356,6 +379,60 @@ class GeminiProvider:
                 cause=exc,
             )
         return text or ""
+
+    @staticmethod
+    def _finish_reason(response) -> str:
+        """Translate this provider's stop reason into the application's own.
+
+        The one place a vendor's enum is spoken. Nothing above the adapter sees
+        `MAX_TOKENS` or `RECITATION`; it sees `FinishReason.TRUNCATED` or
+        `FinishReason.BLOCKED`, which are the distinctions that change what
+        CogniGrade should do.
+
+        Never raises. A diagnostic that can take down a successful grading call
+        is worse than no diagnostic, so an unreadable reason is `UNKNOWN`.
+        """
+        try:
+            candidates = getattr(response, "candidates", None) or []
+            if not candidates:
+                return FinishReason.UNKNOWN
+            raw = getattr(candidates[0], "finish_reason", None)
+            if raw is None:
+                return FinishReason.UNKNOWN
+            # `.name` on the SDK enum, else whatever str() gives, upper-cased.
+            name = str(getattr(raw, "name", raw)).rsplit(".", 1)[-1].upper()
+        except Exception:  # noqa: BLE001
+            return FinishReason.UNKNOWN
+
+        if name == "STOP":
+            return FinishReason.COMPLETE
+        if name == "MAX_TOKENS":
+            return FinishReason.TRUNCATED
+        if name in ("SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII"):
+            return FinishReason.BLOCKED
+        if name in ("FINISH_REASON_UNSPECIFIED", "0"):
+            return FinishReason.UNKNOWN
+        return FinishReason.OTHER
+
+    @staticmethod
+    def _token_counts(response):
+        """`(input, output)` token counts when the provider reports them.
+
+        Counts only. A number cannot carry a student's answer, which is why
+        this is safe to log where the response body never will be.
+        """
+        try:
+            usage = getattr(response, "usage_metadata", None)
+            if usage is None:
+                return None, None
+            prompt = getattr(usage, "prompt_token_count", None)
+            output = getattr(usage, "candidates_token_count", None)
+            return (
+                int(prompt) if prompt is not None else None,
+                int(output) if output is not None else None,
+            )
+        except Exception:  # noqa: BLE001
+            return None, None
 
     async def run_text_task(
         self,
@@ -400,6 +477,19 @@ class GeminiProvider:
                 raise _classify(exc)
 
             text = self._response_text(response)
+            finish_reason = self._finish_reason(response)
+            input_tokens, output_tokens = self._token_counts(response)
+            if finish_reason == FinishReason.TRUNCATED:
+                # Loud, and carried on the response rather than swallowed: this
+                # is the difference between "the model wrote something invalid"
+                # and "we cut the model off mid-sentence", and the caller's
+                # decoder cannot tell them apart from the text alone.
+                warnings = list(warnings) + ["truncated_response"]
+                logger.warning(
+                    "provider response was truncated at an output limit: "
+                    "task=%s model=%s output_tokens=%s",
+                    request.task, settings.model, output_tokens,
+                )
             return ProviderResponse(
                 text=text,
                 provider=PROVIDER_NAME,
@@ -409,6 +499,9 @@ class GeminiProvider:
                 duration_ms=int((time.monotonic() - started) * 1000),
                 uploaded_file_count=len(handles),
                 warnings=tuple(warnings),
+                finish_reason=finish_reason,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
             )
         finally:
             # Runs on success, on provider failure, and on timeout. This is the

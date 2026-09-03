@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 from celery import Celery
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -7,9 +8,12 @@ from backend.models.users import User
 from backend.routers.geminiAPI import process_answer_text_images_logic, grade_exam_logic
 from backend.routers.examStats import add_exam_result_internal, exam_result_is_final
 from backend.routers.exams import EXAM_STAGE_GRADED, EXAM_STAGE_GRADING, set_exam_stage
+from backend.grading.preparation import prepare_student_responses
 import os
 from dotenv import load_dotenv
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 # Use environment variable for broker URL, with a fallback for non-Docker local dev
 broker_url = os.getenv("CELERY_BROKER_URL", "amqp://guest:guest@localhost:5672//")
@@ -67,6 +71,24 @@ async def _process_and_grade(exam_id: int, student_id: int):
     decision rather than a bug fix.
     """
     async with AsyncSessionLocal() as db:
+        # Preparation first, and it is a no-op the moment any response exists --
+        # so a paper prepared by the crop editor, by a teacher, or by an earlier
+        # run takes exactly the path it always did.
+        prepared = await prepare_student_responses(exam_id, student_id, db)
+        if not prepared.ready:
+            # NOTHING TO GRADE, so stop before aggregation rather than after it.
+            # `aggregate_student_result` finalises when every response that
+            # EXISTS carries a mark; with zero rows that is vacuously true and
+            # it would stamp `graded` with a fabricated 0.0. The stage is left
+            # alone too: this paper never reached grading, and saying it did
+            # would be the same lie one level up.
+            logger.error(
+                "grading not started: preparation produced nothing. "
+                "exam_id=%s status=%s",
+                exam_id, prepared.status,
+            )
+            return
+
         await process_answer_text_images_logic(exam_id, student_id, db)
         await grade_exam_logic(exam_id, student_id, db)
         await add_exam_result_internal(exam_id, student_id, db)

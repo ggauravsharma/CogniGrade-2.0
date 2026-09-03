@@ -104,6 +104,12 @@ _TASK_DEFAULTS: Dict[str, Dict[str, object]] = {
     # twelve simultaneous calls. They now go through the same bounded helper as
     # grading, so the concurrency that existed is capped rather than removed.
     AITask.ANSWER_RECOGNITION: {"timeout_seconds": 120.0, "max_concurrency": 3},
+    # One call reads the WHOLE script, so it is long and there is nothing to
+    # run in parallel with it. Strict JSON, because its output decides which
+    # questions exist for this student and is validated field by field.
+    AITask.ANSWER_MAPPING: {
+        "expects_json": True, "timeout_seconds": 180.0, "max_concurrency": 1,
+    },
     AITask.MARKING_SCHEME_RECOGNITION: {"timeout_seconds": 120.0, "max_concurrency": 3},
     # Segmentation returns a structured region list, so it asks for JSON. One
     # page per call and sequential for now: no production provider is wired up

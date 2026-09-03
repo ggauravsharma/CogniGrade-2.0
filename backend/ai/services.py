@@ -31,6 +31,7 @@ from backend.ai.documents import visible_pages
 from backend.ai.errors import ProviderError
 from backend.ai.prompts import (
     GRADING_PROMPT_VERSION,
+    build_answer_mapping_prompt,
     build_answer_recognition_prompt,
     build_batch_answer_recognition_prompt,
     build_document_extraction_prompt,
@@ -93,12 +94,20 @@ async def run_task(
         attempts=attempts, success=True,
         file_count=len(request.file_paths), exam_id=exam_id,
         student_id=student_id, question_id=question_id,
+        # Why generation stopped, and how much it produced. A truncated
+        # response succeeds HERE and fails in the decoder, so without these two
+        # the log says `success=True` and the mark says `malformed_json` with
+        # nothing connecting them.
+        finish_reason=response.finish_reason,
+        output_tokens=response.output_tokens,
     )
     return ProviderResponse(
         text=response.text, provider=response.provider, model=response.model,
         task=response.task, prompt_version=response.prompt_version,
         attempts=attempts, duration_ms=response.duration_ms,
         uploaded_file_count=response.uploaded_file_count, warnings=response.warnings,
+        finish_reason=response.finish_reason,
+        input_tokens=response.input_tokens, output_tokens=response.output_tokens,
     )
 
 
@@ -204,6 +213,40 @@ async def recognise_answer_images(
     response = await run_task(
         request, exam_id=exam_id, student_id=student_id, question_id=question_id
     )
+    return response.text
+
+
+async def map_answer_script(
+    script_path: str,
+    *,
+    question_numbers: Sequence[int],
+    exam_id: Optional[int] = None,
+    student_id: Optional[int] = None,
+) -> str:
+    """Read a WHOLE answer script and assign its answers to known questions.
+
+    ONE provider call for the whole script: every visible page goes into a
+    single request, because assigning an answer to a question needs the pages
+    read together -- an answer running from the bottom of one page to the top
+    of the next is the normal case, not the exception. Per-page calls would
+    also multiply a scarce quota by the page count for no benefit.
+
+    Goes through `visible_pages` for the same reason document extraction does:
+    the script must be understood as the pages a reader sees, never as a file
+    whose text layer can carry content the page does not show.
+
+    Returns the raw response. Validation against the exam's own question
+    numbers is `backend/ai/answer_mapping.py`'s job, and it is not optional.
+    """
+    prompt, version = build_answer_mapping_prompt(question_numbers)
+    async with visible_pages(script_path) as page_paths:
+        request = ProviderRequest.simple(
+            task=AITask.ANSWER_MAPPING,
+            prompt=prompt,
+            file_paths=tuple(page_paths),
+            prompt_version=version,
+        )
+        response = await run_task(request, exam_id=exam_id, student_id=student_id)
     return response.text
 
 

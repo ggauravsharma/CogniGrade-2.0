@@ -14,6 +14,12 @@ import asyncio
 import time
 
 import pytest
+
+from backend.grading.preparation import (
+    NO_ANSWERS_MAPPED,
+    PREPARED,
+    PreparationOutcome,
+)
 from sqlalchemy import select
 
 from backend.ai.concurrency import Outcome, run_bounded
@@ -578,6 +584,12 @@ async def test_aggregation_runs_only_after_every_question_is_graded(monkeypatch)
 
     calls = []
 
+    async def _prepare(exam_id, student_id, db):
+        # Preparation now runs before anything else and decides whether the
+        # rest runs at all, so it belongs in the recorded order.
+        calls.append("prepare")
+        return PreparationOutcome(status=PREPARED, created=3)
+
     async def _recognise(exam_id, student_id, db):
         calls.append("recognise")
 
@@ -606,6 +618,7 @@ async def test_aggregation_runs_only_after_every_question_is_graded(monkeypatch)
         async def __aexit__(self, *a):
             return False
 
+    monkeypatch.setattr(tasks, "prepare_student_responses", _prepare)
     monkeypatch.setattr(tasks, "process_answer_text_images_logic", _recognise)
     monkeypatch.setattr(tasks, "grade_exam_logic", _grade)
     monkeypatch.setattr(tasks, "add_exam_result_internal", _aggregate)
@@ -616,8 +629,12 @@ async def test_aggregation_runs_only_after_every_question_is_graded(monkeypatch)
     await tasks._process_and_grade(1, 2)
 
     assert calls == [
-        "recognise", "grade_start", "grade_end", "aggregate", "check_final", "stage",
+        "prepare", "recognise", "grade_start", "grade_end",
+        "aggregate", "check_final", "stage",
     ]
+    assert calls.index("prepare") < calls.index("grade_start"), (
+        "grading started before the paper was prepared"
+    )
     assert calls.index("grade_end") < calls.index("aggregate"), (
         "the exam result was computed while grading was still running"
     )
@@ -642,6 +659,9 @@ async def test_an_incomplete_result_does_not_reach_the_graded_stage(monkeypatch)
     async def _noop(*a, **kw):
         return None
 
+    async def _prepare(exam_id, student_id, db):
+        return PreparationOutcome(status=PREPARED, created=1)
+
     async def _not_final(exam_id, student_id, db):
         return False
 
@@ -655,6 +675,7 @@ async def test_an_incomplete_result_does_not_reach_the_graded_stage(monkeypatch)
         async def __aexit__(self, *a):
             return False
 
+    monkeypatch.setattr(tasks, "prepare_student_responses", _prepare)
     monkeypatch.setattr(tasks, "process_answer_text_images_logic", _noop)
     monkeypatch.setattr(tasks, "grade_exam_logic", _noop)
     monkeypatch.setattr(tasks, "add_exam_result_internal", _noop)
@@ -666,6 +687,59 @@ async def test_an_incomplete_result_does_not_reach_the_graded_stage(monkeypatch)
 
     assert stages == [tasks.EXAM_STAGE_GRADING]
     assert tasks.EXAM_STAGE_GRADED not in stages
+
+
+@pytest.mark.asyncio
+async def test_nothing_prepared_stops_before_aggregation(monkeypatch):
+    """The vacuous-zero trap, guarded where aggregation actually happens.
+
+    `aggregate_student_result` finalises when every response that EXISTS
+    carries a mark, which is vacuously true of zero responses. The readiness
+    check used to sit in the route; now the route lets an unprepared paper
+    through so preparation can run inside the job, so THIS is the guard.
+    """
+    import backend.tasks as tasks
+
+    calls = []
+
+    async def _prepare(exam_id, student_id, db):
+        calls.append("prepare")
+        return PreparationOutcome(status=NO_ANSWERS_MAPPED)
+
+    async def _record(name):
+        calls.append(name)
+
+    async def _recognise(exam_id, student_id, db):
+        calls.append("recognise")
+
+    async def _grade(exam_id, student_id, db):
+        calls.append("grade")
+
+    async def _aggregate(exam_id, student_id, db):
+        calls.append("aggregate")
+
+    async def _stage(exam_id, stage, db):
+        calls.append("stage")
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    monkeypatch.setattr(tasks, "prepare_student_responses", _prepare)
+    monkeypatch.setattr(tasks, "process_answer_text_images_logic", _recognise)
+    monkeypatch.setattr(tasks, "grade_exam_logic", _grade)
+    monkeypatch.setattr(tasks, "add_exam_result_internal", _aggregate)
+    monkeypatch.setattr(tasks, "set_exam_stage", _stage)
+    monkeypatch.setattr(tasks, "AsyncSessionLocal", lambda: _Session())
+
+    await tasks._process_and_grade(1, 2)
+
+    assert calls == ["prepare"], "the job continued with nothing to grade"
+    assert "aggregate" not in calls, "an empty paper reached aggregation"
+    assert "stage" not in calls, "the stage moved on a paper never graded"
 
 
 def test_the_concurrency_primitive_holds_no_module_level_loop_state():

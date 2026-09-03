@@ -188,31 +188,117 @@ def build_grading_result(
     return GradingResult(score=value, reason=reason_text, max_marks=limit)
 
 
-_JSON_OBJECT = re.compile(r"\{.*\}", re.DOTALL)
+#: One decoder instance, reused. `raw_decode` is the standard library's own
+#: structural parser: it consumes exactly ONE complete JSON value starting at a
+#: given index and reports where that value ended. That end position is the
+#: whole fix -- it is what lets this module tell "a complete grading object with
+#: something harmless after it" apart from "a broken object", which a regex
+#: cannot do without re-implementing JSON.
+_DECODER = json.JSONDecoder()
 
 
-def _extract_json_object(text: str) -> str:
-    """Recover the JSON object from a response that may carry wrapping.
+def _object_starts(text: str):
+    """Every index where a JSON object could begin.
 
-    With `response_mime_type="application/json"` the body should already be
-    bare JSON. This tolerates a fenced block or a stray sentence around it,
-    because a provider that quietly ignores the mime-type request should
-    degrade to a parse we can still validate strictly -- not to a silent None.
-    It does NOT tolerate absent JSON.
+    Deliberately not a regex. A greedy brace pattern runs across nested
+    objects and a lazy one stops inside them, and both are blind to braces
+    inside strings, so a regex can only ever guess at the boundary; the
+    decoder knows it exactly.
+    """
+    index = text.find("{")
+    while index != -1:
+        yield index
+        index = text.find("{", index + 1)
+
+
+def _decode_first_object(text: str):
+    """Decode the FIRST complete JSON object in `text`.
+
+    Returns `(payload, end_index, None)` on success, or `(None, None, error)`
+    where `error` is the decoder's failure on the first object-looking start --
+    the most informative one, since later starts are usually braces inside the
+    same broken text.
+    """
+    first_error = None
+    for start in _object_starts(text):
+        try:
+            payload, end = _DECODER.raw_decode(text, start)
+        except ValueError as exc:
+            if first_error is None:
+                first_error = exc
+            continue
+        return payload, end, None
+    return None, None, first_error
+
+
+def _contains_another_object(text: str) -> bool:
+    """True when `text` holds a second decodable JSON OBJECT.
+
+    Objects only, on purpose. A trailing sentence such as "Total: 3 marks"
+    contains a perfectly decodable JSON *number*, and rejecting on that would
+    throw away a valid grade over ordinary prose. A second `{...}` is different:
+    it is a second structured payload, and choosing between two of them is a
+    guess this module must never make.
+    """
+    for start in _object_starts(text):
+        try:
+            _DECODER.raw_decode(text, start)
+        except ValueError:
+            continue
+        return True
+    return False
+
+
+def _decode_json_object(text: str) -> Mapping:
+    """Recover the ONE grading object from a response that may carry wrapping.
+
+    WHY THIS EXISTS
+    ---------------
+    Live exam-4 Q31 returned, inside 16 seconds and with a successful finish, a
+    407-character body: a complete JSON object followed by one stray character.
+    The previous implementation returned the whole text unchanged whenever it
+    started with `{` and handed that to `json.loads`, which answered
+    `Extra data: line 1 column 407 (char 406)`. The regex fallback that would
+    have isolated the object was unreachable on exactly the bodies that needed
+    it -- it only ran when the text did NOT start with an object.
+
+    WHAT IS TOLERATED, AND WHAT IS NOT
+    ----------------------------------
+    Tolerated: surrounding whitespace, a fenced block, prose before the object,
+    and harmless non-JSON material after it. Refused: a second JSON object
+    anywhere after the first, because two structured payloads make the response
+    ambiguous and picking one would be a guess.
+
+    This is a boundary fix, not a loosening. Whatever comes back still goes
+    through the same strict schema, numeric, finite, non-negative and
+    max-marks validation as before; nothing here reads a score.
     """
     stripped = text.strip()
     if stripped.startswith("```"):
         # ```json ... ```  ->  ...
         stripped = re.sub(r"^```[a-zA-Z]*\s*", "", stripped)
         stripped = re.sub(r"\s*```$", "", stripped).strip()
-    if stripped.startswith("{"):
-        return stripped
-    match = _JSON_OBJECT.search(stripped)
-    if match:
-        return match.group(0)
-    raise GradingResponseError(
-        "not_json", "response did not contain a JSON object", raw=text
-    )
+
+    payload, end, error = _decode_first_object(stripped)
+    if payload is None:
+        if error is None:
+            # No object-looking start at all: prose, a bare scalar, an array of
+            # scalars. Distinct from a broken object, and it keeps its own code.
+            raise GradingResponseError(
+                "not_json", "response did not contain a JSON object", raw=text
+            )
+        raise GradingResponseError(
+            "malformed_json", f"response was not valid JSON: {error}", raw=text
+        )
+
+    remainder = stripped[end:]
+    if remainder.strip() and _contains_another_object(remainder):
+        raise GradingResponseError(
+            "ambiguous_json",
+            "response contained more than one JSON object",
+            raw=text,
+        )
+    return payload
 
 
 def parse_grading_response(
@@ -227,13 +313,7 @@ def parse_grading_response(
     if raw_text is None or not str(raw_text).strip():
         raise GradingResponseError("empty_response", "provider returned an empty response")
 
-    payload_text = _extract_json_object(str(raw_text))
-    try:
-        payload = json.loads(payload_text)
-    except (TypeError, ValueError) as exc:
-        raise GradingResponseError(
-            "malformed_json", f"response was not valid JSON: {exc}", raw=raw_text
-        )
+    payload = _decode_json_object(str(raw_text))
 
     if not isinstance(payload, Mapping):
         raise GradingResponseError(

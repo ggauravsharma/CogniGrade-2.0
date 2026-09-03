@@ -18,7 +18,10 @@ from backend.grading.aggregation import (
     aggregate_student_result,
     log_incomplete,
 )
-from backend.grading.failure import GradingFailure, describe
+from backend.grading.failure import GradingFailure, describe, UNEXPECTED_ERROR
+from backend.routers.exams import (
+    EXAM_STAGE_GRADED, EXAM_STAGE_GRADING, set_exam_stage,
+)
 from backend.auth.policies import (
     ExamContext,
     require_exam_manager,
@@ -28,9 +31,11 @@ from backend.auth.policies import (
     require_self_or_exam_manager,
 )
 from backend.routers.geminiAPI import grade_question, grade_question_with_diagram, extract_single_answer_text
+import logging
 import math
 import re
 
+logger = logging.getLogger(__name__)
 router = APIRouter(tags=["exam-stats"])
 
 @router.get("/exams/{exam_id}/stats")
@@ -354,6 +359,109 @@ async def update_student_response(
 # ---------------------------------------------------------------------------
 # 5. Send for Re-evaluation (Reset marks, re-grade, and update ExamResult)
 # ---------------------------------------------------------------------------
+async def _reevaluate_one_response(
+    *, exam_id: int, question: Question, student_id: int, response: QuestionResponse,
+    db: AsyncSession, current_user: User,
+) -> dict:
+    """Re-grade ONE response without ever putting its existing mark at risk.
+
+    THE BUG THIS REPLACES
+    ---------------------
+    All three re-evaluation routes opened with::
+
+        previous_marks = response.marks_obtained
+        response.marks_obtained = None
+        response.reasoning = "Sent for re-evaluation"
+        await db.commit()                      # <- mark already gone, on disk
+
+    and only restored `previous_marks` if the grading call RETURNED a failure
+    dict. Anything that RAISED in between -- and `extract_single_answer_text`
+    raised `TypeError` on every automatically prepared response, because its
+    `ans_text_images` is NULL -- escaped past the restore, leaving a correctly
+    graded answer with `marks_obtained = NULL` and a 500 for the professor.
+    Aggregation then read that NULL as "not graded" and un-finalised the exam.
+
+    THE RULE NOW
+    ------------
+    Nothing is cleared up front. The previous mark, reason and failure code stay
+    exactly as they were until a REPLACEMENT has been produced and validated,
+    and are written back verbatim on every failure path -- returned failure or
+    raised exception. So a re-evaluation can improve a mark or leave it alone;
+    it can no longer destroy one.
+
+    Grading semantics are unchanged: a genuine 0 is a valid replacement (the
+    check is `status == "graded"`, never truthiness of the score), fractional
+    marks pass through untouched, and a failure never writes a score.
+    """
+    previous_marks = response.marks_obtained
+    previous_reasoning = response.reasoning
+    previous_error_code = response.grading_error_code
+
+    def _restore() -> None:
+        """Put the row back exactly as it was found.
+
+        The inner grading route persists on its own -- `_persist_and_report`
+        writes a mark, `_record_grading_failure` writes a code -- so after a
+        failed attempt the row may carry a stale code beside a still-valid
+        mark. Restoring all three fields keeps the invariant that a validated
+        mark and a failure code are mutually exclusive.
+        """
+        response.marks_obtained = previous_marks
+        response.reasoning = previous_reasoning
+        response.grading_error_code = previous_error_code
+
+    try:
+        # Auto-prepared responses have no crops; this is a no-op for them.
+        await extract_single_answer_text({
+            "exam_id": exam_id,
+            "student_id": student_id,
+            "question_id": question.id,
+        }, db, current_user)
+
+        result = await grade_question_with_diagram({
+            "exam_id": exam_id,
+            "student_id": student_id,
+            "question_id": question.id,
+            "ideal_answer": question.ideal_answer,
+            "marking_scheme": question.ideal_marking_scheme,
+        }, db, current_user)
+    except HTTPException as exc:
+        _restore()
+        await db.commit()
+        # `exc.detail` is this application's own text, never a provider body.
+        logger.warning(
+            "re-evaluation aborted, previous mark kept: question_id=%s student_id=%s status=%s",
+            question.id, student_id, exc.status_code,
+        )
+        return {"status": "reevaluation_failed", "error_code": "reevaluation_unavailable",
+                "grade": previous_marks}
+    except Exception:
+        _restore()
+        await db.commit()
+        # Logged with ids only; the traceback stays in the log, never in a body.
+        logger.exception(
+            "re-evaluation raised, previous mark kept: question_id=%s student_id=%s",
+            question.id, student_id,
+        )
+        return {"status": "reevaluation_failed", "error_code": UNEXPECTED_ERROR,
+                "grade": previous_marks}
+
+    if result.get("status") == "graded":
+        response.marks_obtained = result.get("grade")
+        response.reasoning = result.get("reasoning")
+        response.grading_error_code = None
+        await db.commit()
+        return {"status": "graded", "grade": response.marks_obtained}
+
+    # A returned failure. The mark was never cleared, so there is nothing to
+    # rescue -- only the stale state the inner route may have written.
+    _restore()
+    await db.commit()
+    return {"status": "reevaluation_failed",
+            "error_code": result.get("error_code"),
+            "grade": previous_marks}
+
+
 @router.post("/exam/{exam_id}/question/{question_id}/student/{student_id}/reevaluate")
 async def send_for_reevaluation(
     exam_id: int,
@@ -363,7 +471,6 @@ async def send_for_reevaluation(
     ctx: ExamContext = Depends(require_question_in_exam),
     current_user: User = Depends(get_current_user_required)
 ):  
-    print("CALLED")
     result = await db.execute(select(QuestionResponse).where(
         QuestionResponse.question_id == question_id,
         QuestionResponse.student_id == student_id
@@ -371,40 +478,25 @@ async def send_for_reevaluation(
     response = result.scalars().first()
     if not response:
         raise HTTPException(status_code=404, detail="Response not found")
-    previous_marks = response.marks_obtained
-    response.marks_obtained = None
-    response.reasoning = "Sent for re-evaluation"
-    await db.commit()
+
     result = await db.execute(select(Question).where(Question.id == question_id))
     question = result.scalars().first()
-    await extract_single_answer_text({
-        "exam_id": exam_id,
-        "student_id": student_id,
-        "question_id": question_id,
-    }, db, current_user)
-    result = await grade_question_with_diagram({
-        "exam_id": exam_id,
-        "student_id": student_id,
-        "question_id": question_id,
-        "ideal_answer": question.ideal_answer,
-        "marking_scheme": question.ideal_marking_scheme
-    }, db, current_user)
-    if result.get("status") == "graded":
-        response.marks_obtained = result.get("grade")
-        response.reasoning = result.get("reasoning")
-        response.grading_error_code = None
-    else:
-        # Provider failure: restore the mark this route nulled before
-        # re-grading, so a failed re-evaluation is non-destructive rather than
-        # leaving a NULL that aggregation would later count as zero.
-        response.marks_obtained = previous_marks
-        response.reasoning = (
-            f"Re-evaluation failed to produce a valid grade "
-            f"({result.get('error_code', 'unknown')}). Previous marks restored."
-        )
-    await db.commit()
-    await add_exam_result_internal(exam_id, student_id, db) #, current_user)
-    return {"message": "Sent for re-evaluation and exam result updated"}
+    if not question:
+        raise HTTPException(status_code=404, detail="Question not found")
+
+    outcome = await _reevaluate_one_response(
+        exam_id=exam_id, question=question, student_id=student_id,
+        response=response, db=db, current_user=current_user,
+    )
+    await add_exam_result_internal(exam_id, student_id, db)
+
+    if outcome["status"] == "graded":
+        return {"message": "Re-evaluated and exam result updated", "status": "graded"}
+    # A safe sentence derived from the code, never the provider's own text.
+    return {
+        "message": describe(outcome.get("error_code")) + " The previous mark was kept.",
+        "status": "reevaluation_failed",
+    }
 
 
 @router.post("/exam/{exam_id}/student/{student_id}/reevaluate_all_questions")
@@ -439,40 +531,11 @@ async def send_all_for_reevaluation(
                 detail=f"Response not found for question {question.id}"
             )
 
-        # 2b. mark it as pending re‑evaluation
-        previous_marks = response.marks_obtained
-        response.marks_obtained = None
-        response.reasoning = "Sent for re-evaluation"
-        await db.commit()
-
-        # 2c. re‑extract answer text
-        await extract_single_answer_text({
-            "exam_id": exam_id,
-            "student_id": student_id,
-            "question_id": question.id,
-        }, db, current_user)
-
-        # 2d. re‑grade with diagram support
-        grade = await grade_question_with_diagram({
-            "exam_id": exam_id,
-            "student_id": student_id,
-            "question_id": question.id,
-            "ideal_answer": question.ideal_answer,
-            "marking_scheme": question.ideal_marking_scheme
-        }, db, current_user)
-
-        # 2e. update with the new grade, only if the provider produced one
-        if grade.get("status") == "graded":
-            response.marks_obtained = grade.get("grade")
-            response.reasoning = grade.get("reasoning")
-            response.grading_error_code = None
-        else:
-            response.marks_obtained = previous_marks
-            response.reasoning = (
-                f"Re-evaluation failed to produce a valid grade "
-                f"({grade.get('error_code', 'unknown')}). Previous marks restored."
-            )
-        await db.commit()
+        # Re-grade, never putting the existing mark at risk.
+        await _reevaluate_one_response(
+            exam_id=exam_id, question=question, student_id=student_id,
+            response=response, db=db, current_user=current_user,
+        )
 
     # 3. update the overall exam result once all questions are done
     await add_exam_result_internal(exam_id, student_id, db)
@@ -527,39 +590,11 @@ async def reevaluate_question_for_all_students(
         if not response:
             continue  # Skip if no response exists
 
-        # 3b. Mark for re-evaluation
-        previous_marks = response.marks_obtained
-        response.marks_obtained = None
-        response.reasoning = "Sent for re-evaluation"
-        await db.commit()
-
-        # 3c. Re-extract and grade
-        await extract_single_answer_text({
-            "exam_id": exam_id,
-            "student_id": student_id,
-            "question_id": question_id,
-        }, db, current_user)
-
-        grade = await grade_question_with_diagram({
-            "exam_id": exam_id,
-            "student_id": student_id,
-            "question_id": question_id,
-            "ideal_answer": question.ideal_answer,
-            "marking_scheme": question.ideal_marking_scheme
-        }, db, current_user)
-
-        # 3d. Save results, only if the provider produced a valid grade
-        if grade.get("status") == "graded":
-            response.marks_obtained = grade.get("grade")
-            response.reasoning = grade.get("reasoning")
-            response.grading_error_code = None
-        else:
-            response.marks_obtained = previous_marks
-            response.reasoning = (
-                f"Re-evaluation failed to produce a valid grade "
-                f"({grade.get('error_code', 'unknown')}). Previous marks restored."
-            )
-        await db.commit()
+        # Re-grade, never putting the existing mark at risk.
+        await _reevaluate_one_response(
+            exam_id=exam_id, question=question, student_id=student_id,
+            response=response, db=db, current_user=current_user,
+        )
 
         # 3e. Update exam result for student
         await add_exam_result_internal(exam_id, student_id, db)
@@ -748,6 +783,25 @@ async def add_exam_result_internal(exam_id: int, student_id: int, db: AsyncSessi
     
     await db.commit()
     await db.refresh(exam_result)
+
+    # The RESULT and the exam-wide STAGE must not disagree. Until now only
+    # `tasks._process_and_grade` wrote the Graded stage, so finalising through
+    # this path left a genuinely final result beside an exam still reporting
+    # "grading" -- the same two-records-disagree failure the conditional stage
+    # in `tasks.py` was introduced to stop, reappearing on the direct route.
+    #
+    # Promotion is driven by the aggregation's own verdict, never by a caller:
+    # an incomplete run can never reach Graded. The demotion is deliberately
+    # narrow -- only an exam already marked Graded is moved back, so a paper
+    # that has not reached grading yet is not dragged forward to stage 6.
+    #
+    # STILL EXAM-WIDE, and this job is per-student (see `tasks.py`): across
+    # several students the stage reflects whoever ran last. Unchanged here.
+    if aggregation.complete:
+        await set_exam_stage(exam_id, EXAM_STAGE_GRADED, db)
+    elif exam.exam_stage == EXAM_STAGE_GRADED:
+        await set_exam_stage(exam_id, EXAM_STAGE_GRADING, db)
+
     return JSONResponse({
         "success": True,
         "result": {

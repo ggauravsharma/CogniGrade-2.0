@@ -12,12 +12,17 @@ Two things have to hold for that to be safe, and both are tested here:
 
   1. Naming a student must grant nothing. A manager may act on their own exam's
      students and no one else; a student may act only on themselves.
-  2. A run must be refused for a script with no prepared responses. That is not
-     tidiness: `aggregate_student_result` finalises when every response that
-     EXISTS carries a mark, which is vacuously true of zero responses, so such a
-     run would stamp `graded` with a total of 0.0 and set `graded_at` -- a
-     fabricated final zero, the exact thing C6 exists to prevent. The old flow
-     could not reach that state; moving the trigger makes it reachable.
+  2. A run must be refused when there is NOTHING to read: no prepared responses
+     AND no uploaded answer script. Zero responses alone is no longer a
+     refusal -- `_process_and_grade` prepares them from the script itself (see
+     backend/grading/preparation.py), which is what makes the flow AI-first
+     instead of dependent on a student cutting their own paper up.
+
+     The invariant the old check protected is untouched; it lives where
+     aggregation happens. `aggregate_student_result` finalises when every
+     response that EXISTS carries a mark, vacuously true of zero responses, so
+     the task RETURNS BEFORE AGGREGATING unless preparation left something to
+     grade. `test_offline_auto_pipeline.py` holds that end.
 """
 
 from __future__ import annotations
@@ -181,6 +186,20 @@ async def test_unknown_exam_is_404(client, world, enqueued):
 # the readiness guard  (C6)
 # ---------------------------------------------------------------------------
 
+async def _clear_scripts(db, exam_id, student_id):
+    """Remove the uploaded script too, so there is genuinely nothing to read."""
+    from backend.models.files import AnswerScript
+
+    found = await db.execute(
+        select(AnswerScript).where(
+            AnswerScript.exam_id == exam_id, AnswerScript.student_id == student_id
+        )
+    )
+    for row in found.scalars().all():
+        await db.delete(row)
+    await db.commit()
+
+
 async def _clear_responses(db, exam_id, student_id):
     found = await db.execute(
         select(QuestionResponse)
@@ -192,23 +211,36 @@ async def _clear_responses(db, exam_id, student_id):
     await db.commit()
 
 
-async def test_a_script_with_nothing_prepared_is_refused(client, db, world, enqueued):
-    """Without this, an empty paper would aggregate to a FINAL zero.
+async def test_nothing_to_read_at_all_is_refused(client, db, world, enqueued):
+    """No responses AND no script: no automatic stage could produce anything."""
+    await _clear_responses(db, world["exam_a"].id, world["student_a"].id)
+    await _clear_scripts(db, world["exam_a"].id, world["student_a"].id)
 
-    `aggregate_student_result` treats "every response that exists carries a
-    mark" as complete, and that is vacuously true when no response exists.
+    r = await client.post(
+        _url(world["exam_a"].id, world["student_a"].id), headers=as_user(world["owner_prof"])
+    )
+    assert r.status_code == 409, "a student with no paper at all must be refused"
+    assert enqueued == [], "and must not reach Celery at all"
+
+
+async def test_an_uploaded_script_with_no_responses_is_accepted(client, db, world, enqueued):
+    """The AI-first change: preparation happens IN the job, not before it.
+
+    This was a 409, and that 409 is what forced a student through the crop
+    editor before the AI was allowed to look at their paper.
     """
     await _clear_responses(db, world["exam_a"].id, world["student_a"].id)
 
     r = await client.post(
         _url(world["exam_a"].id, world["student_a"].id), headers=as_user(world["owner_prof"])
     )
-    assert r.status_code == 409, "an unprepared script must not enter the pipeline"
-    assert enqueued == [], "and must not reach Celery at all"
+    assert r.status_code == 200, r.text
+    assert enqueued == [(world["exam_a"].id, world["student_a"].id)]
 
 
-async def test_the_readiness_guard_applies_to_the_student_path_too(client, db, world, enqueued):
+async def test_the_readiness_rule_applies_to_the_student_path_too(client, db, world, enqueued):
     await _clear_responses(db, world["exam_a"].id, world["student_a"].id)
+    await _clear_scripts(db, world["exam_a"].id, world["student_a"].id)
 
     r = await client.post(_url(world["exam_a"].id), headers=as_user(world["student_a"]))
     assert r.status_code == 409
@@ -216,8 +248,9 @@ async def test_the_readiness_guard_applies_to_the_student_path_too(client, db, w
 
 
 async def test_readiness_is_judged_per_student(client, db, world, enqueued):
-    """Clearing one student's work must not block the other's run."""
+    """Emptying one student must not block the other's run."""
     await _clear_responses(db, world["exam_a"].id, world["student_a"].id)
+    await _clear_scripts(db, world["exam_a"].id, world["student_a"].id)
 
     blocked = await client.post(
         _url(world["exam_a"].id, world["student_a"].id), headers=as_user(world["owner_prof"])
@@ -233,7 +266,25 @@ async def test_readiness_is_judged_per_student(client, db, world, enqueued):
 async def test_readiness_does_not_count_another_exams_responses(client, db, world, enqueued):
     """The count is scoped to this exam, so work elsewhere cannot unblock it."""
     await _clear_responses(db, world["exam_a"].id, world["student_a"].id)
+    await _clear_scripts(db, world["exam_a"].id, world["student_a"].id)
     db.add(QuestionResponse(question_id=world["q_other"].id, student_id=world["student_a"].id))
+    await db.commit()
+
+    r = await client.post(
+        _url(world["exam_a"].id, world["student_a"].id), headers=as_user(world["owner_prof"])
+    )
+    assert r.status_code == 409
+    assert enqueued == []
+
+
+async def test_a_script_for_another_exam_does_not_unblock_this_one(client, db, world, enqueued):
+    """The script check is scoped to this exam and this student, like the rest."""
+    from backend.models.files import AnswerScript
+
+    await _clear_responses(db, world["exam_a"].id, world["student_a"].id)
+    await _clear_scripts(db, world["exam_a"].id, world["student_a"].id)
+    db.add(AnswerScript(title="elsewhere.pdf", file_path="/tmp/elsewhere.pdf",
+                        exam_id=world["exam_b"].id, student_id=world["student_a"].id))
     await db.commit()
 
     r = await client.post(

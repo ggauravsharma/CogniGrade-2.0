@@ -32,6 +32,12 @@ class AITask:
     LABEL_EXTRACTION = "label_extraction"
     #: Read a student's handwritten answer images.
     ANSWER_RECOGNITION = "answer_recognition"
+    #: Read a WHOLE answer script and say which of the exam's existing
+    #: questions each answer belongs to. The stage between "a script was
+    #: uploaded" and "there is something per question to grade", which the
+    #: product previously had no automatic path for -- a student had to cut the
+    #: script up by hand before the AI was allowed to run.
+    ANSWER_MAPPING = "answer_mapping"
     #: Read marking-scheme images.
     MARKING_SCHEME_RECOGNITION = "marking_scheme_recognition"
     #: Award a mark for one answer.
@@ -45,10 +51,35 @@ class AITask:
         DOCUMENT_EXTRACTION,
         LABEL_EXTRACTION,
         ANSWER_RECOGNITION,
+        ANSWER_MAPPING,
         MARKING_SCHEME_RECOGNITION,
         GRADING,
         SEGMENTATION,
     )
+
+
+class FinishReason:
+    """Why a provider stopped generating, named for the concept not the vendor.
+
+    Small on purpose. These are the distinctions that change what CogniGrade
+    should DO about a failure -- a truncated response is a request-shape
+    problem, a blocked one is a content problem, and a malformed complete one
+    is model variance. Anything finer is a vendor's taxonomy and belongs in
+    the adapter that speaks it.
+    """
+
+    #: The model finished on its own terms.
+    COMPLETE = "complete"
+    #: An output limit cut the response off. The text that came back is partial.
+    TRUNCATED = "truncated"
+    #: Safety, policy or recitation stopped it.
+    BLOCKED = "blocked"
+    #: The provider gave a reason this application does not model.
+    OTHER = "other"
+    #: The provider gave no reason, or it could not be read.
+    UNKNOWN = "unknown"
+
+    ALL = (COMPLETE, TRUNCATED, BLOCKED, OTHER, UNKNOWN)
 
 
 @dataclass(frozen=True)
@@ -139,3 +170,18 @@ class ProviderResponse:
     #: caller sees this.
     uploaded_file_count: int = 0
     warnings: Sequence[str] = field(default_factory=tuple)
+    #: WHY generation stopped, in this application's own vocabulary -- see
+    #: `FinishReason`. Every generative provider has this concept and every one
+    #: names it differently, so the adapter translates and nothing above the
+    #: adapter learns a vendor's spelling.
+    #:
+    #: It exists because it was thrown away. A response that stops at an output
+    #: limit still returns its partial text, so a truncated answer reaches the
+    #: strict grading decoder as invalid JSON and is recorded as
+    #: `malformed_json` -- indistinguishable from a model that simply wrote
+    #: something malformed. The provider knew which it was; we did not keep it.
+    finish_reason: Optional[str] = None
+    #: Tokens the provider reported for this call, when it reports them. Only
+    #: counts: a token count cannot carry a student's answer.
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
