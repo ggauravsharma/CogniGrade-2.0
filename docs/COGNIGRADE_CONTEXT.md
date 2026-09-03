@@ -2535,6 +2535,69 @@ fix, not a frontend button.
 
 ---
 
+### Professor processing — the proxy was the shorter of the two, not the server
+
+**The false failure.** `/extract-text` and `/extract-question-labels` are
+SYNCHRONOUS: the browser holds the request open while the model reads a
+document. nginx declared no `proxy_read_timeout`, so it used its **60s**
+default, gave up, and answered **504 with an HTML page**. The frontend called
+`response.json()` on that HTML, the parser threw, and the throw landed in the
+same `catch` as a dropped connection --
+`alert("Error connecting to server.")`. Meanwhile FastAPI carried on and
+committed the extraction. The one thing the professor was told was the one
+thing that had not happened.
+
+**nginx now matches the backend's own budget, derived not guessed.** For one
+file: `timeout_seconds = 180`, `max_retries = 2` -> 3 attempts, each wrapped in
+`asyncio.wait_for(budget + 5)`, with full-jitter backoff of <=1s then <=2s --
+**3 x 185 + 3 = 558s**. `proxy_read_timeout` / `proxy_send_timeout` are **600s**:
+covers it with margin, and stops there, because a proxy that waits an hour
+hides a hung worker. **No AI timeout or retry value was changed.** A section
+holding several files can still exceed it, which is exactly why the frontend
+now reports a gateway timeout as "still processing" rather than as a failure.
+Held by `test_deployment_config.py`, which recomputes the budget from
+`ai/config.py` and fails if the proxy ever becomes the shorter one again.
+
+**One classifier, three honest outcomes** (`requestProcessing` in `exam.htm`):
+
+```
+network   the request never completed        -> "Unable to reach the server."
+timeout   408/502/503/504, or a 200 whose    -> "Processing is taking longer than
+          body is not JSON                      expected. Please check the current
+                                                status before trying again."
+failed    a real API error                   -> a 4xx `detail`, else
+                                                "Processing failed."
+```
+
+A body is parsed ONLY when its content-type claims JSON, so an HTML error page
+is never handed to the parser. A 4xx `detail` is shown verbatim because those
+sentences are written by this application's own routes and are the only thing
+that tells a professor what to correct; a **5xx body is never echoed**.
+
+**A required step that failed now stops the run.** `extractTextForSection` and
+`extractQuestionLabels` THROW instead of alerting and returning normally.
+`submitExam` awaits them and reaches `setStage(6)` only after every step
+returned; the question-paper click handler reaches `setStage(1)` the same way.
+So a failed or unknown extraction can no longer leave the exam moved forward
+with nothing behind it. `openModal` and the per-file re-extract are leaf
+actions -- nothing waits on them -- so they report and stop there.
+
+**Deferred deliberately:** converting extraction to a background job with a
+polling endpoint. That is the better long-term shape and is not what a first
+reliable demo needs; the synchronous path is now honest instead of hidden.
+Also still open, and untouched here: `exam.htm` WRITES the stage on page load
+(`setStage` posts before it renders).
+
+- **971 tests (967 + 4)**, plus 15 Node assertions in
+  `backend/tests/test_processing_error_handling.js` covering the 504-HTML path,
+  no-parse-attempt, no body leaked, transport failure, 4xx detail shown, 5xx
+  suppressed, and the control-flow guarantees. **Live:** nginx recreated and
+  `nginx -T` confirms 600s; a stubbed 504 in the running page produced the
+  truthful sentence with no HTML leak, the required step rejected, and
+  `setStage` was never called. Zero provider calls.
+
+---
+
 ## Authorization model
 
 Two capability ladders, both derived from the real domain model. `is_professor`

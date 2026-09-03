@@ -890,3 +890,85 @@ def test_the_redaction_is_installed_on_the_access_logger():
 
     filters = logging.getLogger("uvicorn.access").filters
     assert any(f.__class__.__name__ == "RedactSensitiveQuery" for f in filters)
+
+
+# ---------------------------------------------------------------------------
+# nginx must not be shorter than the work it proxies
+# ---------------------------------------------------------------------------
+#
+# Document extraction is SYNCHRONOUS: the browser holds the request open while
+# the model reads a question paper. nginx's default `proxy_read_timeout` is 60s,
+# well under the backend's own configured budget, so nginx cut the connection
+# and answered 504 -- and the professor was told the server could not be
+# reached while FastAPI carried on and committed the extraction.
+
+
+def _proxy_budget_seconds() -> float:
+    """The backend's OWN worst case for one extraction request, from config.
+
+    Derived, not guessed, so this test fails if the AI budget is ever raised
+    past what the proxy allows instead of silently reintroducing the mismatch.
+    """
+    from backend.ai.config import get_task_settings
+    from backend.ai.contracts import AITask
+
+    worst = 0.0
+    for task in (AITask.DOCUMENT_EXTRACTION, AITask.LABEL_EXTRACTION):
+        s = get_task_settings(task)
+        attempts = max(0, s.max_retries) + 1
+        # providers/gemini.py wraps each attempt in wait_for(budget + 5).
+        per_attempt = s.timeout_seconds + 5
+        # ai/retry.py: full-jitter backoff, capped per step, between attempts.
+        backoff = sum(
+            min(s.retry_base_delay * (2 ** i), s.retry_max_delay)
+            for i in range(attempts - 1)
+        )
+        worst = max(worst, attempts * per_attempt + backoff)
+    return worst
+
+
+def _nginx_conf() -> str:
+    return (REPO_ROOT / "nginx" / "nginx.conf").read_text(encoding="utf-8", errors="replace")
+
+
+def test_nginx_declares_a_proxy_read_timeout_at_all():
+    """Relying on the 60s default is what produced the false failure."""
+    assert "proxy_read_timeout" in _nginx_conf()
+
+
+def test_the_proxy_timeout_covers_the_configured_extraction_budget():
+    import re
+
+    conf = _nginx_conf()
+    match = re.search(r"proxy_read_timeout\s+(\d+)s\s*;", conf)
+    assert match, "proxy_read_timeout must be declared in seconds"
+    configured = int(match.group(1))
+
+    assert configured >= _proxy_budget_seconds(), (
+        "nginx would give up before the backend's own retry budget is spent, "
+        "which is the mismatch that reported a successful extraction as a "
+        "connection failure"
+    )
+    # Bounded on purpose: a proxy that waits for an hour hides a hung worker.
+    assert configured <= 900, "an unbounded-looking proxy timeout hides real hangs"
+
+
+def test_the_send_timeout_matches_the_read_timeout():
+    import re
+
+    conf = _nginx_conf()
+    read = re.search(r"proxy_read_timeout\s+(\d+)s\s*;", conf)
+    send = re.search(r"proxy_send_timeout\s+(\d+)s\s*;", conf)
+    assert read and send, "both directions need a declared timeout"
+    assert int(send.group(1)) == int(read.group(1))
+
+
+def test_the_ai_timeout_policy_itself_is_unchanged():
+    """This phase aligned the PROXY, not the provider budget."""
+    from backend.ai.config import get_task_settings
+    from backend.ai.contracts import AITask
+
+    for task in (AITask.DOCUMENT_EXTRACTION, AITask.LABEL_EXTRACTION):
+        s = get_task_settings(task)
+        assert s.timeout_seconds == 180.0
+        assert s.max_retries == 2

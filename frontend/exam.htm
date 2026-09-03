@@ -909,6 +909,110 @@
   <script src="load-components.js"></script>
   <script src="authorize.js"></script>
   <script>
+
+    /*
+      =======================================
+      Processing requests: one place that decides what went wrong
+      =======================================
+
+      Every long processing call used to end in
+
+          catch (error) { alert("Error connecting to server."); }
+
+      which was wrong twice over. The server was usually reachable -- nginx had
+      given up on a SYNCHRONOUS extraction and answered 504 with an HTML page,
+      and `response.json()` threw on that HTML, landing in the same catch as a
+      genuinely dropped connection. So the one thing the professor was told was
+      the one thing that had not happened, while the backend went on to finish
+      and commit the work.
+
+      Three outcomes are now distinguished, because they need different actions:
+
+        network   the request never completed      -> retry is safe
+        timeout   the gateway gave up; the backend MAY still be working
+                  -> do not claim failure, tell them to check the state
+        failed    the API answered with a real error -> retry after fixing it
+
+      Nothing from a 5xx body is ever displayed. A 4xx `detail` IS displayed,
+      because those strings are written by this application's own routes ("No
+      question files to process", "Invalid file type provided") and are the
+      only thing that can tell a professor what to correct. Provider text,
+      tracebacks and file paths never reach either path.
+    */
+
+    const PROCESSING_MESSAGES = {
+      network: "Unable to reach the server. Please try again.",
+      timeout: "Processing is taking longer than expected. " +
+               "Please check the current status before trying again.",
+      failed: "Processing failed. Please try again.",
+    };
+
+    class ProcessingError extends Error {
+      constructor(message, category) {
+        super(message);
+        this.name = "ProcessingError";
+        this.category = category;
+      }
+    }
+
+    /** Parse a body ONLY when it claims to be JSON. Never throws. */
+    async function readJsonBody(response) {
+      const type = (response.headers.get("content-type") || "").toLowerCase();
+      if (!type.includes("json")) return null;
+      try {
+        return await response.json();
+      } catch (err) {
+        return null;
+      }
+    }
+
+    function processingFailureFor(status, data) {
+      // The proxy gave up, or the backend was unreachable behind it. The work
+      // may well have finished; saying it failed would be a guess.
+      if (status === 408 || status === 502 || status === 503 || status === 504) {
+        return new ProcessingError(PROCESSING_MESSAGES.timeout, "timeout");
+      }
+      // Never echo a 5xx body: that is where an unexpected internal message
+      // would surface.
+      if (status >= 500) {
+        return new ProcessingError(PROCESSING_MESSAGES.failed, "failed");
+      }
+      const detail = data && (data.detail || data.error);
+      const safe = (typeof detail === "string" && detail.trim()) ? detail.trim() : null;
+      return new ProcessingError(safe || PROCESSING_MESSAGES.failed, "failed");
+    }
+
+    /**
+     * Run one processing request and return its parsed JSON.
+     * Throws `ProcessingError` with a message that is already safe to show.
+     */
+    async function requestProcessing(url, options) {
+      let response;
+      try {
+        response = await authFetch(url, options);
+      } catch (err) {
+        // A real transport failure: DNS, connection reset, offline. This is
+        // the ONLY case that is genuinely "cannot reach the server".
+        throw new ProcessingError(PROCESSING_MESSAGES.network, "network");
+      }
+
+      const data = await readJsonBody(response);
+      if (!response.ok) throw processingFailureFor(response.status, data);
+      if (data === null) {
+        // 200 with a body this app did not write -- a proxy interstitial, or a
+        // truncated response. The outcome is unknown, so it is reported as one.
+        throw new ProcessingError(PROCESSING_MESSAGES.timeout, "timeout");
+      }
+      return data;
+    }
+
+    /** The safe sentence for anything thrown out of a processing step. */
+    function processingMessage(err) {
+      return (err instanceof ProcessingError && err.message)
+        ? err.message
+        : PROCESSING_MESSAGES.failed;
+    }
+
     /* 
       =======================================
       Global JS variables & data structures
@@ -1370,10 +1474,17 @@
         }
 
         // await processStudentAnswers(examId); // Commented out as per requirement
+        //
+        // Reached ONLY if every step above returned. Each required step now
+        // throws on failure, so a run that did not finish can no longer stamp
+        // the exam as processed on its way out.
         await setStage(6); // Set to final stage (6) after processing
       } catch (err) {
+        // One classified sentence. The old prefix concatenated whatever
+        // `err.message` happened to be, which for a gateway timeout was a JSON
+        // parser complaint about an HTML page.
         console.error("Error processing files:", err);
-        alert("An error occurred during processing: " + err.message);
+        alert(processingMessage(err));
       } finally {
         submitBtn.disabled = false;
         submitBtn.innerHTML = originalBtnText;
@@ -1944,24 +2055,25 @@
       extractBtn.innerText = "EXTRACTING...";
       extractBtn.disabled = true;
       try {
-        const response = await authFetch("/extract-text", {
+        const data = await requestProcessing("/extract-text", {
           method: "POST",
           body: formData
         });
-        const data = await response.json();
-        if (data.results) {
-          window.extractedTexts[section] = data.results;
-          extractBtn.innerText = "VIEW EXTRACTED TEXT";
-          extractBtn.disabled = false;
-        } else {
-          alert("Error: " + data.error);
-          extractBtn.innerText = "EXTRACT TEXT";
-          extractBtn.disabled = false;
+        if (!data.results) {
+          // A 200 without results is still a failed step, not a quiet no-op.
+          throw new ProcessingError(PROCESSING_MESSAGES.failed, "failed");
         }
-      } catch (error) {
-        console.error(error);
-        alert("Error connecting to server.");
+        window.extractedTexts[section] = data.results;
+        extractBtn.innerText = "VIEW EXTRACTED TEXT";
+      } catch (err) {
+        // THROWS instead of alerting. This used to swallow the failure and
+        // return normally, so `submitExam` carried on to save files, process
+        // the question paper and advance the stage as though the text had been
+        // extracted. A required step that did not happen must stop the run;
+        // the caller decides what to tell the professor.
         extractBtn.innerText = "EXTRACT TEXT";
+        throw err;
+      } finally {
         extractBtn.disabled = false;
       }
     }
@@ -1969,7 +2081,13 @@
     function openModal(section) {
       var extractBtn = document.getElementById("viewExtracted" + section);
       if (extractBtn.innerText === "EXTRACT TEXT") {
-        extractTextForSection(section);
+        // Standalone use: nothing depends on it, so report and stop here.
+        // `extractTextForSection` now throws, and an unhandled rejection would
+        // leave the professor with no message at all.
+        extractTextForSection(section).catch(err => {
+          console.error(err);
+          alert(processingMessage(err));
+        });
       } else if (extractBtn.innerText === "VIEW EXTRACTED TEXT") {
         var modifyModal = document.getElementById("modifyModal");
         if (modifyModal.style.display === "block") {
@@ -2149,22 +2267,20 @@
             }
           }        
           try {
-            const response = await authFetch("/extract-text", {
+            const data = await requestProcessing("/extract-text", {
               method: "POST",
               body: formData
             });
-            const data = await response.json();
-            if (data.results) {
-              file.extractedText = data.results[0].text;
-              extractBtn.textContent = "RE-EXTRACT TEXT";
-              viewBtn.disabled = false;
-            } else {
-              alert("Error: " + data.error);
-              extractBtn.textContent = "EXTRACT TEXT";
-            }
+            if (!data.results) throw new ProcessingError(PROCESSING_MESSAGES.failed, "failed");
+            file.extractedText = data.results[0].text;
+            extractBtn.textContent = "RE-EXTRACT TEXT";
+            viewBtn.disabled = false;
           } catch (err) {
+            // Re-extracting one file is a leaf action -- nothing is waiting on
+            // it -- so it reports here instead of throwing. The message is the
+            // classified one, never a raw body.
             console.error(err);
-            alert("Error connecting to server.");
+            alert(processingMessage(err));
             extractBtn.textContent = "EXTRACT TEXT";
           }
           extractBtn.disabled = false;
@@ -2657,8 +2773,10 @@
         saveAllFiles();
         await setStage(1);
       } catch (err) {
+        // `setStage(1)` sits above this inside the same try, so a failed
+        // extraction stops before the exam moves forward.
         console.error(err);
-        showAlert(err.message || 'Unexpected error', 'danger');
+        showAlert(processingMessage(err), 'danger');
       } finally {
         processQpBtn.disabled = false;
         processQpBtn.innerText = 'Process';
@@ -2756,27 +2874,27 @@
       }
 
       try {
-        const response = await authFetch("/extract-question-labels", {
+        const data = await requestProcessing("/extract-question-labels", {
           method: "POST",
           body: formData
         });
-        const data = await response.json();
-        if (response.ok && data.results) {
-          processQpBtn.innerText = "Process";
-          processQpBtn.disabled = false;
-          // Update initialQuestionFiles after successful extraction
-          initialQuestionFiles = currentQuestionFiles;
-        } else {
-          // 409 is the refusal to restructure an exam that already has student
-          // responses, and it arrives as `detail`. It used to read
-          // "Error: undefined", which told the teacher nothing.
-          alert(data.detail || data.error || "Could not process the question paper.");
-          processQpBtn.innerText = "Process";
-          processQpBtn.disabled = false;
+        if (!data.results) {
+          throw new ProcessingError("Could not process the question paper.", "failed");
         }
-      } catch (error) {
-        console.error(error);
-        alert("Error connecting to server.");
+        // Update initialQuestionFiles after successful extraction
+        initialQuestionFiles = currentQuestionFiles;
+      } catch (err) {
+        // THROWS. The click handler wraps this call and only advances the
+        // stage after it returns, so a failed extraction must not come back
+        // looking like a success -- that is how a 504 used to end with the
+        // exam moved forward and no question structure behind it.
+        //
+        // 409, the refusal to restructure an exam that already has student
+        // responses, arrives as `detail` and is surfaced verbatim by
+        // `requestProcessing`: it is this application's own sentence and the
+        // only thing that tells the professor what to do.
+        throw err;
+      } finally {
         processQpBtn.innerText = "Process";
         processQpBtn.disabled = false;
       }
