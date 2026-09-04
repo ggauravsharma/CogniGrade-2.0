@@ -1478,7 +1478,7 @@
         // Reached ONLY if every step above returned. Each required step now
         // throws on failure, so a run that did not finish can no longer stamp
         // the exam as processed on its way out.
-        await setStage(6); // Set to final stage (6) after processing
+        await advanceStage(6); // a real transition: every step above returned
       } catch (err) {
         // One classified sentence. The old prefix concatenated whatever
         // `err.message` happened to be, which for a gateway timeout was a JSON
@@ -2504,7 +2504,8 @@
     document.addEventListener('DOMContentLoaded', async () => {
         const examId = getQueryParam('exam_id');
         await fetchExamStage(examId);
-        await setStage(currentStage);
+        // RENDER, never advance. Opening this page is not a workflow action.
+        await renderStage(currentStage);
     });
 
     const uploadQuestions = document.getElementById('upload-questions');
@@ -2519,9 +2520,29 @@
     const backBtn = document.getElementById('backBtn');
     const submitMsg = document.getElementById('submitMsg');
  
-    async function setStage(stage) {
-        const examId = getQueryParam('exam_id');
+    /* ---------------------------------------------------------------------
+       Rendering a stage and CHANGING one are different things.
+
+       There used to be a single `setStage`, and the page called it on load:
+       read the stage, then hand it straight back to `postExamStage`. Opening
+       or refreshing this page therefore WROTE the exam stage. For a student it
+       was a 403 the catch swallowed; for a professor it rewrote the same value
+       on every visit, so the stage column recorded page views rather than
+       workflow progress.
+
+       `renderStage` shows a stage and writes nothing. `advanceStage` is the
+       only thing that moves the exam forward, and it is called only from a
+       handler whose operation has already succeeded.
+       --------------------------------------------------------------------- */
+
+    /** Move the exam to `stage`, then show it. Only after a real success. */
+    async function advanceStage(stage) {
         await postExamStage(stage);
+        await renderStage(stage);
+    }
+
+    async function renderStage(stage) {
+        const examId = getQueryParam('exam_id');
         currentStage = stage;
         doc_stage = getDocStage(currentStage);
         console.log("Document Stage: ", doc_stage);
@@ -2563,24 +2584,26 @@
             backBtn.style.display = 'block';
             finalUploadSection.classList.add('active');
         } else if (stage === 3 || stage === 4) {
-            const res = await fetch('crop-edit.htm');
-            const html = await res.text();
-            cropEditSection.innerHTML = html;
-            await initialise_crop_edit(examId);
-            const observer = new MutationObserver(() => {
-              const btn = cropEditSection.querySelector('#submit-btn');
-              if (btn) {
-                btn.addEventListener('click', async () => {
-                  await setStage(5);
-                });
-                observer.disconnect();
-              }
-            });
-            observer.observe(cropEditSection, { childList: true, subtree: true });
-            cropEditSection.style.display = 'block';
-            cropEditSection.classList.add('active');
+            // LEGACY STAGES. These used to inject crop-edit.htm and make the
+            // professor cut the marking scheme into regions before the exam
+            // could move on. That step wrote `question.ms_*_images`, which are
+            // OPTIONAL reference images: the automatic pipeline grades from
+            // `question.ideal_marking_scheme`, the TEXT that
+            // `processMarkingScheme` extracts from the uploaded document. The
+            // live exam that graded end to end had every `ms_*_images` column
+            // NULL, so nothing here was required to produce a mark.
+            //
+            // New exams no longer stop here -- document processing goes
+            // straight to 5. An exam already sitting at 3 or 4 renders the
+            // student-script step instead of a cropping workspace, and is NOT
+            // rewritten to 5 on sight; the next real transition moves it.
+            //
+            // crop-edit.htm and crop-edit.js stay in the repository as manual
+            // correction tooling. They simply have no normal-flow entry point.
+            uploadStudent.style.display = 'block';
+            finalBtnRow.style.display = 'flex';
             backBtn.style.display = 'block';
-            // Observer code remains unchanged
+            uploadStudent.classList.add('active');
         } else if (stage === 5) {
             uploadStudent.style.display = 'block';
             finalBtnRow.style.display = 'flex';
@@ -2594,25 +2617,12 @@
             window.location.href = `exam-stats.htm?exam_id=${examId}`;
         }
 
-        // Handle back button positioning
-        if (stage === 3 || stage === 4) {
-            // Only attempt move if crop-edit section exists
-            const topControls = cropEditSection?.querySelector('#top-controls');
-            
-            if (topControls) {
-              const container = topControls.querySelector('.back-btn-container');
-              if (container && !container.contains(backBtn)) {
-                  // Clone maintains event listeners
-                  container.appendChild(backBtn);
-                  originalContainer.style.display = 'none';
-              }
-            }
-        } else {
-            // Restore original button state
-            originalContainer.style.display = 'block';
-            if (!originalContainer.contains(backBtn)) {
-                originalContainer.appendChild(backBtn);
-            }
+        // The back button used to be moved into the cropper's own toolbar on
+        // stages 3 and 4. Nothing injects that toolbar any more, so it always
+        // stays where the page put it.
+        originalContainer.style.display = 'block';
+        if (!originalContainer.contains(backBtn)) {
+            originalContainer.appendChild(backBtn);
         }
 
     }
@@ -2748,7 +2758,7 @@
     document.getElementById('backBtn').addEventListener('click', async () => {
       console.log("Back button clicked");
       if (currentStage > 0) {
-        await setStage(currentStage - 1);
+        await advanceStage(currentStage - 1);
       }
     });
 
@@ -2771,9 +2781,9 @@
         await loadQuestions(examId);
         // document.getElementById('save-all-btn').addEventListener('click', () => saveAllChanges(examId));
         saveAllFiles();
-        await setStage(1);
+        await advanceStage(1);
       } catch (err) {
-        // `setStage(1)` sits above this inside the same try, so a failed
+        // `advanceStage(1)` sits above this inside the same try, so a failed
         // extraction stops before the exam moves forward.
         console.error(err);
         showAlert(processingMessage(err), 'danger');
@@ -2785,7 +2795,7 @@
 
     document.getElementById('questionLabelsDone').addEventListener('click', async () => {
       await saveAllChanges(getQueryParam('exam_id'))
-      await setStage(2);
+      await advanceStage(2);
     });
 
     document.getElementById('finalProcessBtn').addEventListener('click', async () => {
@@ -2796,11 +2806,12 @@
         return;
       }
       await saveAllFiles();
-      const examId = getQueryParam('exam_id');
-      const res = await fetch('crop-edit.htm');
-      const html = await res.text();
-      cropEditSection.innerHTML = html;
-      await setStage(markingUploaded ? 3 : 5);    // LATER MAKE THIS 3 : 4
+      // Reference material is saved; the next thing the professor needs is
+      // student scripts. This used to send an exam WITH a marking scheme to
+      // stage 3 and preload the crop editor, so uploading a marking scheme was
+      // punished with a manual cropping session. The scheme's TEXT is what
+      // grading reads, and `submitExam` extracts it a step later.
+      await advanceStage(5);
       
     });
 

@@ -2598,6 +2598,82 @@ Also still open, and untouched here: `exam.htm` WRITES the stage on page load
 
 ---
 
+### Professor stage machine — rendering is read-only, and the cropper left the path
+
+**Opening the page used to write the database.** `exam.htm` loaded with
+`fetchExamStage()` -> `setStage(currentStage)`, and `setStage` POSTed before it
+rendered. A refresh therefore rewrote `exam_stage`: a swallowed 403 for a
+student, a pointless same-value write for a professor. The column recorded page
+views rather than workflow progress.
+
+Split in two, and the names now say which is which:
+
+```
+renderStage(stage)   shows a stage. Writes NOTHING.
+advanceStage(stage)  posts the stage, then renders it.
+                     Called only from a handler whose operation succeeded.
+```
+
+Page load calls `renderStage`. Every transition -- question paper processed
+(1), labels saved (2), reference material saved (5), submit finished (6), the
+back button -- calls `advanceStage`. There is now exactly ONE `postExamStage`
+call site in the page, and a test asserts it.
+
+**Stages 3 and 4 no longer force the crop editor.** They used to fetch
+`crop-edit.htm`, inject it and run `initialise_crop_edit`, so uploading a
+marking scheme was answered with a manual cropping session (Box Cut / Freehand
+Cut / Edit Order) before the exam could move on -- `finalProcessBtn` sent an
+exam WITH a marking scheme to stage 3 on purpose.
+
+**What that step actually did, checked before removing it:** it POSTs to
+`/exam/{id}/question_response/marking_scheme`, which writes
+`question.ms_text_images / ms_table_images / ms_diagram_images` -- reference
+IMAGES. Grading does not need them: the reference side comes from
+`question.ideal_marking_scheme`, the TEXT that `processMarkingScheme` extracts
+from the uploaded document, and the exam that graded end to end had every
+`ms_*_images` column NULL while its `ideal_marking_scheme` was populated. The
+crops are optional enrichment, not a required stage.
+
+So `finalProcessBtn` now advances straight to 5 (student scripts). An exam
+already sitting at 3 or 4 RENDERS the student-script step instead of a cropping
+workspace, and is deliberately not rewritten to 5 on sight -- rendering stays
+read-only; the next real transition moves it. Stage 4 was already unreachable
+(`markingUploaded ? 3 : 5`).
+
+**The cropper is kept.** `crop-edit.htm`, `crop-edit.js` and the
+`question_response/{document_type}` route are untouched and still write
+`ms_*_images`. They are **manual/fallback correction functionality -- not
+required for normal automatic grading** -- and simply have no normal-flow entry
+point. `exam.htm` no longer references `initialise_crop_edit` at all.
+
+**Normal professor flow:** dashboard -> course -> exam -> upload question paper
+-> process -> label questions -> upload marking scheme/reference -> process ->
+student scripts -> submit/process -> grading roster with `Start AI grading` ->
+`exam-stats.htm`. No manual region selection anywhere in it.
+
+- **18 static assertions** in `backend/tests/test_exam_stage_navigation.js`:
+  load renders and never posts, `renderStage` contains no write, exactly one
+  `postExamStage` call site, `setStage` gone, each transition sits after its
+  operation and before the catch, no stage fetches or injects the cropper, no
+  Box Cut/Freehand Cut/Edit Order in the professor page, the cropper files and
+  the backend route still exist, and the student route/progress are unchanged.
+  Backend suite unchanged at **971 passed** (this phase is frontend-only).
+  `test_processing_error_handling.js` asserted on `setStage(1)` / `setStage(6)`
+  by name and went red on the rename; its four assertion strings now read
+  `advanceStage`, and it is back to **15 passed**. No behaviour changed with it.
+- **Live:** two loads of `exam.htm?exam_id=6` produced **2 GET /exams/6/stage
+  and 0 POST** -- the write on render is gone. Stage 5 rendered the
+  student-script step with no cropper injected and no Box Cut in the DOM; no
+  console errors; the student branch still lands on `student-edit.htm` with the
+  cropper hidden. Exam 6 unchanged (stage 5, 1 script, 0 responses). Zero
+  provider calls.
+
+**Still deferred:** the `exam_stage` model itself is unchanged -- same numbers,
+different frontend interpretation. Whether `solution_script` is still a
+meaningful third document is an open question, not touched here.
+
+---
+
 ## Authorization model
 
 Two capability ladders, both derived from the real domain model. `is_professor`

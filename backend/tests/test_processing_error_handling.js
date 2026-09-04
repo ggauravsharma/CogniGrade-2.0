@@ -198,10 +198,10 @@ test("submitExam advances the stage only after every step returned", () => {
   const html = fs.readFileSync(EXAM_HTML, "utf8");
   const start = html.indexOf("async function submitExam()");
   const body = html.slice(start, html.indexOf("async function processQuestionPaper", start));
-  const stageAt = body.indexOf("await setStage(6)");
+  const stageAt = body.indexOf("await advanceStage(6)");
   const catchAt = body.indexOf("} catch (err)");
   assert.ok(stageAt > 0 && catchAt > stageAt,
-    "setStage(6) must sit inside the try, before the catch, so a throw skips it");
+    "advanceStage(6) must sit inside the try, before the catch, so a throw skips it");
   assert.ok(body.includes('await extractTextForSection("Questions")'),
     "the required step is awaited, so its rejection unwinds submitExam");
 });
@@ -211,10 +211,10 @@ test("the question-paper click handler advances only on success", () => {
   const start = html.indexOf("document.getElementById('processQpBtn').addEventListener");
   const body = html.slice(start, start + 2000);
   const callAt = body.indexOf("await extractQuestionLabels()");
-  const stageAt = body.indexOf("await setStage(1)");
+  const stageAt = body.indexOf("await advanceStage(1)");
   const catchAt = body.indexOf("} catch (err)");
   assert.ok(callAt > 0 && stageAt > callAt && catchAt > stageAt,
-    "setStage(1) must follow the extraction inside the same try");
+    "advanceStage(1) must follow the extraction inside the same try");
 });
 
 test("no blanket connection message survives anywhere in the page", () => {
